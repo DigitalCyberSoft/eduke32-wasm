@@ -25,6 +25,7 @@ Prepared for public release: 03/28/2005 - Charlie Wiederhold, 3D Realms
 //-------------------------------------------------------------------------
 
 #include "duke3d.h"
+#include "soundefs.h"  // DUKE_KILLED2 (desync alert sound)
 
 char g_szfirstSyncMsg[MAX_SYNC_TYPES][60];
 
@@ -186,11 +187,8 @@ static char Sync_Random(void)
     updatecrc(crc, g_globalRandom);
     updatecrc(crc, (g_globalRandom >> 8));
 
-    updatecrc(crc, g_random.global);
-    updatecrc(crc, (g_random.global >> 8));
-
-    updatecrc(crc, g_random.playerweapon);
-    updatecrc(crc, (g_random.playerweapon >> 8));
+    // [NetDuke32 port] netduke32's separate g_random stream (global/playerweapon)
+    // does not exist in this tree; randomseed above is this tree's sole RNG state.
 
     return ((char) crc & 255);
 }

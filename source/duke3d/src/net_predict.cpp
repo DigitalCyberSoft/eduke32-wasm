@@ -13,8 +13,9 @@ int32_t predicted_Numsprites;
 int16_t predicted_tailspritefree;
 
 actor_t  backupActor;
-int32_t      backupSeed;
-randomseed_t backupRandom;
+int32_t  backupSeed;
+// [NetDuke32 port] netduke32's separate g_random stream does not exist in this
+// tree; randomseed (backupSeed) is the sole RNG state to save/restore.
 
 static void Net_ProcessPrediction(void)
 {
@@ -69,7 +70,7 @@ static void Net_ResetPredictionData(void)
         else if (aGameVars[i].flags & GAMEVAR_PERACTOR)
             Bmemcpy(predicted_pValues[i], original_pValues[i], sizeof(intptr_t) * MAXSPRITES);
         else
-            predicted_lValue[i] = aGameVars[i].lValue;
+            predicted_lValue[i] = aGameVars[i].global;  // [port] this tree's gamevar scalar is .global (netduke32: .lValue)
     }
 }
 
@@ -229,7 +230,7 @@ void Net_SwapPredictedLinkedLists(void)
             continue;
 
         if (!(aGameVars[i].flags & (GAMEVAR_PERPLAYER | GAMEVAR_PERACTOR)))
-            std::swap(aGameVars[i].lValue, predicted_lValue[i]);
+            std::swap(aGameVars[i].global, predicted_lValue[i]);  // [port] .global == netduke32 .lValue
     }
 }
 
@@ -247,7 +248,6 @@ void Net_DoPrediction(int state)
     // Backup data
     backupActor  = actor[pSpriteNum];
     backupSeed   = randomseed;
-    backupRandom = g_random;
 
     // Change to predicted sprite/actor
     sprite[pSpriteNum].cstat &= ~257;
@@ -270,7 +270,6 @@ void Net_DoPrediction(int state)
     actor[pSpriteNum] = backupActor;
 
     randomseed = backupSeed;
-    g_random   = backupRandom;
 
     oldnet_predicting = PREDICTSTATE_OFF;
 }

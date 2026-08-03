@@ -17,6 +17,12 @@
 # define ALL_PLAYERS(i) i = 0; i != -1; i = G_GetNextPlayer(i)
 #endif
 
+// netduke32's gametext(x, y, str, shade, orient) -> this tree's 8-arg gametext_
+// (our tree's stock gametext is a 3-arg convenience macro). TU-local so the rest
+// of the engine is unaffected. Used by the "waiting for players" sync screen.
+#undef gametext
+#define gametext(x, y, t, s, o) gametext_((x) << 16, (y) << 16, (t), (s), 0, (o), 0, 0)
+
 #define TIMERUPDATESIZ 32
 
 // quickExit: set when the user force-quits (ctrl-alt-del / crash). Not present
@@ -34,6 +40,45 @@ signed char multiwho, multipos, multiwhat, multiflag;
 #ifndef M_DMFLAGS_TEST
 # define M_DMFLAGS_TEST(x) (ud.m_dmflags & (x))
 #endif
+
+// ---------------------------------------------------------------------------
+// Deferred peripheral MP features.
+//
+// Per the port scope, netduke32's HUD-text / savegame / RTS subsystem
+// refactors are intentionally NOT ported (that is the excluded 1019-commit
+// non-network refactor). The netcode CORE (input FIFO, master/slave exchange,
+// prediction, sync CRC, INIT_SETTINGS/NEW_GAME/PING/EOL) is fully ported; the
+// handlers below depend on those unported subsystems and are deferred.
+//
+// Every deferred site logs LOUDLY (once) via NETDUKE32_MP_TODO and then takes
+// the safe/aborting path -- never a silent no-op, never a fake-success return.
+// Deferred backlog: (1) chat/vote typing UI, (2) LOAD_GAME relay,
+// (3) RTS taunt-over-net, (4) player-color validation + renamed ud.config.
+// ---------------------------------------------------------------------------
+#define NETDUKE32_MP_TODO(what)                                                            \
+    do {                                                                                   \
+        static bool warned_ = false;                                                       \
+        if (!warned_) { warned_ = true;                                                    \
+            LOG_F(ERROR, "MP: %s not yet ported (NetDuke32 port); feature disabled", what);\
+        }                                                                                  \
+    } while (0)
+
+// (4) Player-color validation lives in netduke32's screens/HUD subsystem.
+// Deferred: log and pass the raw color through unvalidated.
+static int playerColor_getValidPal(int color)
+{
+    NETDUKE32_MP_TODO("player-color validation");
+    return color;
+}
+
+// (1) In-engine chat typing box lives in netduke32's HUD-text subsystem; the
+// transport track carries lobby chat instead. Deferred: cancel (return -1),
+// never a fake success.
+static int Net_EnterText(int /*x*/, int /*y*/, char * /*t*/, int /*dalen*/, int /*c*/)
+{
+    NETDUKE32_MP_TODO("chat typing UI");
+    return -1;
+}
 
 // ---------------------------------------------------------------------------
 // Transport seam. The netcode never talks to enet/UDP/sockets directly; every
@@ -734,17 +779,10 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     }
                     case PACKET_TYPE_RTS:
                     {
-                        if (rts_numlumps == 0)
-                            continue;
-
-                        // [NetDuke32 port] this tree has no separate ud.config.FXDevice
-                        // (SDL sound is always present); the SoundToggle gate above suffices.
-                        if (ud.config.SoundToggle == 0 || ud.lockout == 1 || !(ud.config.VoiceToggle & 4))
-                            break;
-
-                        rtsptr = (char*)RTS_GetSound(packbuf[1] - 1);
-                        FX_Play3D(rtsptr, RTS_SoundLength(packbuf[1] - 1), FX_ONESHOT, 0, 0, 1, 255, fix16_one, -packbuf[1]);
-                        g_RTSPlaying = 7;
+                        // (3) DEFERRED: RTS taunt-over-net. Playback depends on
+                        // rts_numlumps / g_RTSPlaying, which are file-private in this
+                        // tree's RTS subsystem (not ported). Drop the taunt loudly.
+                        NETDUKE32_MP_TODO("RTS taunt-over-net");
                         break;
                     }
                     case PACKET_TYPE_MENU_LEVEL_QUIT:
@@ -861,12 +899,10 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     }
                     case PACKET_TYPE_LOAD_GAME:
                     {
-                        multiflag = 2;
-                        multiwhat = 0;
-                        multiwho = packbuf[2]; //other: need to send in m/s mode because of possible re-transmit
-                        multipos = packbuf[1];
-                        G_LoadPlayer(multipos);
-                        multiflag = 0;
+                        // (2) DEFERRED: LOAD_GAME network relay. This tree's G_LoadPlayer
+                        // takes a savebrief_t&, not netduke32's int slot -- a savegame-API
+                        // divergence (not ported). Ignore the relayed load loudly.
+                        NETDUKE32_MP_TODO("LOAD_GAME network relay");
                         break;
                     }
                 }
@@ -1197,14 +1233,10 @@ void Net_EnterMessage(void)
                 }
 
                 G_AddUserQuote(recbuf);
-                quotebot += 8;
-                l = G_GameTextLen(USERQUOTE_LEFTOFFSET,OSD_StripColors(tempbuf,recbuf));
-                while (l > (ud.config.ScreenWidth - USERQUOTE_RIGHTOFFSET))
-                {
-                    l -= (ud.config.ScreenWidth - USERQUOTE_RIGHTOFFSET);
-                    quotebot += 8;
-                }
-                quotebotgoal = quotebot;
+                // (1) DEFERRED: on-screen chat quote scroll. quotebot/quotebotgoal/
+                // G_GameTextLen live in netduke32's HUD-text subsystem (not ported).
+                // The chat message itself was already sent over the wire above.
+                NETDUKE32_MP_TODO("chat quote scroll");
             }
             else if (g_chatPlayer >= 0)
             {
@@ -1219,32 +1251,10 @@ void Net_EnterMessage(void)
         }
         else if (g_chatPlayer == -1)
         {
-            j = 50;
-            gametext(320>>1,j,"SEND MESSAGE TO...",0,2+8+16);
-            j += 8;
-            TRAVERSE_CONNECT(i)
-            {
-                if (i == myconnectindex)
-                {
-                    minitextshade((320>>1)-40+1,j+1,"A/ENTER - ALL",26,0,2+8+16);
-                    minitext((320>>1)-40,j,"A/ENTER - ALL",0,2+8+16);
-                    j += 7;
-                }
-                else
-                {
-                    Bsprintf(buf,"      %d - %s",i+1,g_player[i].user_name);
-                    minitextshade((320>>1)-40-6+1,j+1,buf,26,0,2+8+16);
-                    minitext((320>>1)-40-6,j,buf,0,2+8+16);
-                    j += 7;
-                }
-            }
-            minitextshade((320>>1)-40-4+1,j+1,"    ESC - Abort",26,0,2+8+16);
-            minitext((320>>1)-40-4,j,"    ESC - Abort",0,2+8+16);
-            j += 7;
-
-            if (ud.screen_size > 0) j = 200-45;
-            else j = 200-8;
-            mpgametext(j,typebuf,0,2+8+16);
+            // (1) DEFERRED: on-screen "SEND MESSAGE TO..." recipient list rendering
+            // (gametext/minitext/mpgametext at drifted signatures; HUD-text subsystem
+            // not ported). Recipient selection via the keyboard below still functions.
+            NETDUKE32_MP_TODO("chat recipient-select UI");
 
             if (KB_KeyWaiting())
             {
@@ -1520,7 +1530,9 @@ void Net_Disconnect(bool showScores)
         if (playerswhenstarted > 1 && g_player[myconnectindex].ps->gm & MODE_GAME && GTFLAGS(GAMETYPE_SCORESHEET))
         {
             G_BonusScreen(1);
-            videoSetGameMode(ud.config.ScreenMode, ud.config.ScreenWidth, ud.config.ScreenHeight, ud.config.ScreenBPP, ud.detail);
+            // [NetDuke32 port] this tree keeps screen mode in ud.setup.* (config->setup
+            // rename); matches G_BonusScreen's restore call elsewhere in game.cpp.
+            videoSetGameMode(ud.setup.fullscreen, ud.setup.xdim, ud.setup.ydim, ud.setup.bpp, ud.detail);
         }
     }
 
