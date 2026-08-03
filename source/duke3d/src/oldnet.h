@@ -50,6 +50,33 @@ extern int movefifoplc;
 extern int g_networkBroadcastMode;
 extern int botNameSeed;
 
+// ---------------------------------------------------------------------------
+// Snapshot-netcode compatibility shims.
+//
+// This tree's game code was written against mainline's client/server SNAPSHOT
+// netcode (network.h). Under NETDUKE32 that header is replaced by this lockstep
+// netcode, so we map the snapshot symbols the game code still references onto
+// lockstep equivalents. In the game files (everything except the excluded
+// network.cpp) g_netServer/g_netClient are used purely as truthiness -- all
+// enet/pointer member access lived in network.cpp -- so these macros suffice.
+// ---------------------------------------------------------------------------
+#ifdef __GNUC__
+# define EDUKE32_UNUSED __attribute__((unused))
+#else
+# define EDUKE32_UNUSED
+#endif
+
+// Lockstep role predicates: "am I the master/authoritative peer" and "am I a
+// non-master peer". (In the snapshot model these were ENetHost* handles.)
+#define g_netServer (numplayers > 1 && myconnectindex == connecthead)
+#define g_netClient (numplayers > 1 && myconnectindex != connecthead)
+
+// Snapshot per-sprite network tracking has no lockstep equivalent (the sim is
+// deterministic and replays identically on every peer); no-op, exactly as under
+// mainline's NETCODE_DISABLE.
+#define Net_InsertSprite(...) ((void)0)
+#define Net_DeleteSprite(...) ((void)0)
+
 OLDNET_EXTERN input_t netInput;
 
 OLDNET_EXTERN bool oldnet_gotinitialsettings; // True if we got PACKET_TYPE_INIT_SETTINGS from the host.
