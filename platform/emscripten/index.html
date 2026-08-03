@@ -13,7 +13,10 @@
 <style>
   :root { --duke-yellow:#f2c400; --duke-red:#c0281c; }
   html, body { margin:0; height:100%; background:#000; overflow:hidden; font-family:"Trebuchet MS",Verdana,sans-serif; }
-  #canvas { display:block; width:100vw; height:100vh; image-rendering:pixelated; outline:none; background:#000; }
+  /* Center the 4:3 game surface; the black page background shows through as the
+     left/right (or top/bottom) margins. Canvas display size is set by fitCanvas(). */
+  body { display:flex; align-items:center; justify-content:center; }
+  #canvas { display:block; image-rendering:pixelated; outline:none; background:#000; }
   #loader {
     position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
     background:radial-gradient(120% 120% at 50% 30%, #241a12 0%, #0a0805 70%, #000 100%);
@@ -52,6 +55,29 @@
   function hideLoader(){ if (hidden) return; hidden = true; loaderEl.classList.add('hidden');
                          setTimeout(function(){ loaderEl.style.display='none'; }, 700); }
 
+  // --- Aspect ratio: render at 4:3 and pillarbox the canvas with side margins ---
+  var ASPECT = 4 / 3;
+  function renderBox() {
+    var W = window.innerWidth || 1280, H = window.innerHeight || 720, w, h;
+    if (W / H > ASPECT) { h = H; w = Math.round(h * ASPECT); }   // window wider than 4:3 -> bars L/R
+    else                { w = W; h = Math.round(w / ASPECT); }   // window taller than 4:3 -> bars top/bottom
+    return { w: w & ~1, h: h & ~1 };
+  }
+  function fitCanvas() {
+    var c = document.getElementById('canvas'), b = renderBox();
+    // Only write when changed so the MutationObserver below cannot loop.
+    if (c.style.width  !== b.w + 'px') c.style.width  = b.w + 'px';
+    if (c.style.height !== b.h + 'px') c.style.height = b.h + 'px';
+  }
+  // Emscripten's SDL reads screen.width/height (the physical screen) as the render
+  // resolution, so a browser window smaller than the screen renders at screen size
+  // and gets squished into the window (wrong aspect). Report our 4:3 render box
+  // instead, so the engine renders at the correct ratio; the page pillarboxes it.
+  try {
+    Object.defineProperty(window.screen, 'width',  { configurable: true, get: function(){ return renderBox().w; } });
+    Object.defineProperty(window.screen, 'height', { configurable: true, get: function(){ return renderBox().h; } });
+  } catch (e) {}
+
   var Module = {
     canvas: (function(){ var c = document.getElementById('canvas');
       c.addEventListener('webglcontextlost', function(e){ alert('WebGL context lost.'); e.preventDefault(); }, false);
@@ -67,14 +93,15 @@
     monitorRunDependencies: function (left) {
       if (left === 0) { setPct(100); statusEl.textContent = 'Starting…'; }
     },
-    onRuntimeInitialized: function () { started = true; setTimeout(hideLoader, 400); },
+    onRuntimeInitialized: function () { started = true; fitCanvas(); setTimeout(hideLoader, 400); },
     printErr: function (t) { console.error(t); },
     preRun: [function () {
-      // Render windowed at the window size; the engine re-renders on resize.
+      // Windowed at the 4:3 render box. The screen override above makes the engine
+      // render at this resolution; fitCanvas() centers it with side margins.
       try {
-        var w = (window.innerWidth  || 1280) & ~1, h = (window.innerHeight || 720) & ~1;
+        var b = renderBox();
         Module.FS.writeFile('/eduke32.cfg',
-          '[Screen Setup]\nScreenMode = 0\nScreenWidth = ' + w + '\nScreenHeight = ' + h + '\nScreenBPP = 8\n');
+          '[Screen Setup]\nScreenMode = 0\nScreenWidth = ' + b.w + '\nScreenHeight = ' + b.h + '\nScreenBPP = 8\n');
       } catch (e) {}
     }]
   };
@@ -93,6 +120,13 @@
   document.getElementById('canvas').addEventListener('click', function () {
     if (document.pointerLockElement !== this) this.requestPointerLock();
   });
+
+  // Keep the 4:3 letterbox: on resize, and whenever SDL sets the canvas backing
+  // size/style at video-mode init, re-apply the centered display size.
+  fitCanvas();
+  window.addEventListener('resize', fitCanvas);
+  new MutationObserver(fitCanvas).observe(document.getElementById('canvas'),
+    { attributes: true, attributeFilter: ['width', 'height', 'style'] });
 </script>
 <script src="eduke32.js"></script>
 </body>
