@@ -50,18 +50,12 @@ signed char multiwho, multipos, multiwhat, multiflag;
 // prediction, sync CRC, INIT_SETTINGS/NEW_GAME/PING/EOL) is fully ported; the
 // handlers below depend on those unported subsystems and are deferred.
 //
-// Every deferred site logs LOUDLY (once) via NETDUKE32_MP_TODO and then takes
-// the safe/aborting path -- never a silent no-op, never a fake-success return.
-// Deferred backlog: (1) chat/vote typing UI, (2) LOAD_GAME relay,
-// (3) RTS taunt-over-net, (4) player-color validation + renamed ud.config.
+// Every deferred site logs LOUDLY (once) via NETDUKE32_MP_TODO (defined in
+// oldnet.h so game files can use it too) and then takes the safe/aborting path
+// -- never a silent no-op, never a fake-success return. Deferred backlog:
+// (1) chat/vote typing UI, (2) LOAD_GAME relay, (3) RTS taunt-over-net,
+// (4) player-color validation + renamed ud.config.
 // ---------------------------------------------------------------------------
-#define NETDUKE32_MP_TODO(what)                                                            \
-    do {                                                                                   \
-        static bool warned_ = false;                                                       \
-        if (!warned_) { warned_ = true;                                                    \
-            LOG_F(ERROR, "MP: %s not yet ported (NetDuke32 port); feature disabled", what);\
-        }                                                                                  \
-    } while (0)
 
 // (4) Player-color validation lives in netduke32's screens/HUD subsystem.
 // Deferred: log and pass the raw color through unvalidated.
@@ -975,6 +969,14 @@ void Net_SetLocalIndex(int slot)
     myconnectindex = screenpeek = slot;
     g_player[slot].connected    = 1;
     Net_RebuildConnectChain();
+}
+
+// Snapshot netcode sent a combined "client info" packet on join; the lockstep
+// model sends name + options as its own reliable packets.
+void Net_SendClientInfo(void)
+{
+    Net_SendPlayerName();
+    Net_SendPlayerOptions();
 }
 
 void Net_SendQuit(void)

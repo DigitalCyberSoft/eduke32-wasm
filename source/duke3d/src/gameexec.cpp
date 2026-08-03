@@ -3360,7 +3360,11 @@ breakfor:
                 dispatch();
 
             vInstruction(CON_IFMULTIPLAYER):
+#ifdef NETDUKE32
+                branch((g_netServer | g_netClient | (ud.multimode > 1)));  // master/slave predicates are bool here
+#else
                 branch(((g_netServer != nullptr) | (g_netClient != nullptr) | (ud.multimode > 1)));
+#endif
                 dispatch();
 
             vInstruction(CON_IFOUTSIDE):

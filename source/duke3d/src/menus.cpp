@@ -4105,9 +4105,13 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
         // master does whatever it wants
         if (g_netServer)
         {
+#ifdef NETDUKE32
+            Net_SendNewGame(0);  // lockstep: host broadcasts NEW_GAME to guests
+#else
             Net_FillNewGame(&pendingnewgame, 1);
             Net_StartNewGame();
             Net_SendNewGame(1, NULL);
+#endif
         }
         else if (voting == -1)
         {

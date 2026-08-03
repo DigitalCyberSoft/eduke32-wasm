@@ -868,6 +868,7 @@ static void G_PrintFPS(void)
             }
 
             // lag meter
+#ifndef NETDUKE32
             if (g_netClientPeer)
             {
                 chars = Bsprintf(tempbuf, "%d +- %d ms", (g_netClientPeer->lastRoundTripTime + g_netClientPeer->roundTripTime)/2,
@@ -876,6 +877,10 @@ static void G_PrintFPS(void)
                 printext256(windowxy2.x-(chars<<(3-x))+1, windowxy1.y+30+2+FPS_YOFFSET, 0, -1, tempbuf, x);
                 printext256(windowxy2.x-(chars<<(3-x)), windowxy1.y+30+1+FPS_YOFFSET, FPS_COLOR(g_netClientPeer->lastRoundTripTime > 200), -1, tempbuf, x);
             }
+#else
+            // [NetDuke32 port] snapshot lag meter used ENetPeer RTT; lockstep RTT is
+            // in g_player[].ping (Net_SendPing). TODO(netcode): re-add lag meter from that.
+#endif
         }
 
         if (cumulativeFrameDelay >= 1000.0)

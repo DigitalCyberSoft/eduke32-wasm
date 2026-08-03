@@ -380,7 +380,11 @@ void G_CheckCommandLine(int32_t argc, char const * const * argv)
                 {
                     if (argc > i+1)
                     {
+#ifdef NETDUKE32
+                        NETDUKE32_MP_TODO("-connect CLI (browser transport owns connection)");
+#else
                         Net_Connect(argv[i+1]);
+#endif
                         g_noSetup = g_noLogo = TRUE;
                         i++;
                     }

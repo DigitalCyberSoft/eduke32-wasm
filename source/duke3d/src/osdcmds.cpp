@@ -1210,9 +1210,12 @@ static int osdcmd_connect(osdcmdptr_t parm)
 {
     if (parm->numparms != 1)
         return OSDCMD_SHOWHELP;
-
+#ifdef NETDUKE32
+    NETDUKE32_MP_TODO("console 'connect' (browser transport owns connection)");
+#else
     Net_Connect(parm->parms[0]);
     G_BackToMenu();
+#endif
     return OSDCMD_OK;
 }
 
@@ -1230,6 +1233,11 @@ static int osdcmd_password(osdcmdptr_t parm)
 
 static int osdcmd_listplayers(osdcmdptr_t parm)
 {
+#ifdef NETDUKE32
+    (void)parm;
+    NETDUKE32_MP_TODO("console 'listplayers' (snapshot ENetPeer table not in lockstep)");
+    return OSDCMD_OK;
+#else
     ENetPeer *currentPeer;
     char ipaddr[32];
 
@@ -1256,6 +1264,7 @@ static int osdcmd_listplayers(osdcmdptr_t parm)
     }
 
     return OSDCMD_OK;
+#endif
 }
 
 #if 0

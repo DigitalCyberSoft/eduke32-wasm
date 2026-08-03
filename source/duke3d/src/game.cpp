@@ -313,8 +313,8 @@ void app_exit(int returnCode)
     //    mco_yield(mco_running());
     //}
 
-#ifndef NETCODE_DISABLE
-    enet_deinitialize();
+#if !defined(NETCODE_DISABLE) && !defined(NETDUKE32)
+    enet_deinitialize();  // lockstep: the transport owns its own lifecycle
 #endif
     if (returnCode != EXIT_SUCCESS)
         Bexit(returnCode);
@@ -1356,7 +1356,8 @@ int32_t A_InsertSprite(int16_t whatsect,int32_t s_x,int32_t s_y,int32_t s_z,int1
 
     int32_t newSprite;
 
-#ifdef NETCODE_DISABLE
+#if defined(NETCODE_DISABLE) || defined(NETDUKE32)
+    // Lockstep sim is deterministic on every peer -> no networked sprite tracking.
     newSprite = insertsprite(whatsect, s_ss);
 #else
     newSprite = Net_InsertSprite(whatsect, s_ss);
@@ -4898,10 +4899,14 @@ void G_HandleLocalKeys(void)
 
                 tempbuf[ridiculeNum++] = myconnectindex;
 
+#ifdef NETDUKE32
+                NETDUKE32_MP_TODO("in-engine taunt/ridicule send");
+#else
                 if (g_netClient)
                     enet_peer_send(g_netClientPeer, CHAN_CHAT, enet_packet_create(&tempbuf[0], ridiculeNum, 0));
                 else if (g_netServer)
                     enet_host_broadcast(g_netServer, CHAN_CHAT, enet_packet_create(&tempbuf[0], ridiculeNum, 0));
+#endif
 #endif
                 pus = NUMPAGES;
                 pub = NUMPAGES;
@@ -4919,10 +4924,14 @@ void G_HandleLocalKeys(void)
                     tempbuf[1] = ridiculeNum;
                     tempbuf[2] = myconnectindex;
 
+#ifdef NETDUKE32
+                    NETDUKE32_MP_TODO("in-engine RTS taunt send");
+#else
                     if (g_netClient)
                         enet_peer_send(g_netClientPeer, CHAN_CHAT, enet_packet_create(&tempbuf[0], 3, 0));
                     else if (g_netServer)
                         enet_host_broadcast(g_netServer, CHAN_CHAT, enet_packet_create(&tempbuf[0], 3, 0));
+#endif
                 }
 #endif
                 pus = NUMPAGES;
@@ -6620,7 +6629,7 @@ int app_main(int argc, char const* const* argv)
     }
 #endif
 
-#ifndef NETCODE_DISABLE
+#if !defined(NETCODE_DISABLE) && !defined(NETDUKE32)
     if (enet_initialize() != 0)
         LOG_F(ERROR, "An error occurred while initializing ENet.");
 #endif
@@ -6772,7 +6781,9 @@ int app_main(int argc, char const* const* argv)
     if (g_scriptDebug)
         LOG_F(INFO, "CON compiler debug mode enabled (level %d).",g_scriptDebug);
 
-#ifndef NETCODE_DISABLE
+#if !defined(NETCODE_DISABLE) && !defined(NETDUKE32)
+    // Snapshot dedicated-server listen socket. Under lockstep the browser
+    // transport establishes connections (STAR listen-server); no enet host here.
     if (g_networkMode == NET_SERVER || g_networkMode == NET_DEDICATED_SERVER)
     {
         ENetAddress address = { ENET_HOST_ANY, g_netPort, 0 };

@@ -4091,7 +4091,7 @@ void P_FragPlayer(int playerNum)
         if (pPlayer->dead_flag == 0)
             pPlayer->dead_flag++;
 
-#ifndef NETCODE_DISABLE
+#if !defined(NETCODE_DISABLE) && !defined(NETDUKE32)  // lockstep: frags are deterministic on every peer; no broadcast needed
         if (g_netServer)
         {
             // this packet might not be needed anymore with the new snapshot code

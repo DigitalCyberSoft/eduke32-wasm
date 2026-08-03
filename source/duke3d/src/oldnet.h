@@ -100,9 +100,39 @@ extern uint16_t g_netPort;
 #define PACKET_MESSAGE PACKET_TYPE_MESSAGE
 #define PACKET_RTS     PACKET_TYPE_RTS
 
-// Vote senders -> lockstep equivalents (oldnet.cpp).
-#define Net_SendMapVoteInitiate Net_InitiateVote
-#define Net_SendMapVoteCancel   Net_CancelVote
+// Vote senders -> lockstep equivalents (oldnet.cpp). Variadic to absorb the
+// snapshot signatures' args (e.g. Net_SendMapVoteCancel(failed)).
+#define Net_SendMapVoteInitiate(...) Net_InitiateVote()
+#define Net_SendMapVoteCancel(...)   Net_CancelVote()
+
+// Loud one-shot marker for deferred peripheral MP features. Never a silent
+// no-op: each deferred site logs once at ERROR. Game files use it too.
+#define NETDUKE32_MP_TODO(what)                                                            \
+    do {                                                                                   \
+        static bool warned_ = false;                                                       \
+        if (!warned_) { warned_ = true;                                                    \
+            LOG_F(ERROR, "MP: %s not yet ported (NetDuke32 port); feature disabled", what);\
+        }                                                                                  \
+    } while (0)
+
+// Snapshot client/server state-sync entry points the game code still calls.
+// The lockstep FIFO (Net_HandleInput, wired into G_MoveLoop) carries per-tic
+// state instead, so these snapshot senders are inert. Map "wait for server"
+// onto the lockstep ready handshake; the rest no-op.
+#define Net_WaitForServer       Net_WaitForPlayers
+#define Net_SendClientUpdate(...)   ((void)0)
+#define Net_SendServerUpdates(...)  ((void)0)
+#define Net_SendMapUpdate(...)      ((void)0)
+#define Net_NotifyNewGame(...)      ((void)0)
+#define Net_SpawnPlayer(...)        ((void)0)
+
+// Deferred peripheral senders (loud, not silent): in-engine chat send (transport
+// carries lobby chat), per-player map-vote cast (vote UI deferred).
+#define Net_SendMessage(...)  NETDUKE32_MP_TODO("in-engine chat send")
+#define Net_SendMapVote(...)  NETDUKE32_MP_TODO("in-engine map-vote cast")
+
+// Client info on join -> lockstep player name + options (oldnet.cpp).
+void Net_SendClientInfo(void);
 
 OLDNET_EXTERN input_t netInput;
 
