@@ -33,6 +33,42 @@
   #status { margin-top:14px; font-size:14px; color:#a89a88; min-height:1.2em; letter-spacing:.03em; }
   #hint { margin-top:26px; font-size:12px; color:#6f6456; }
   #err { color:#ff7a5c; max-width:640px; font-size:13px; white-space:pre-wrap; }
+
+  /* --- Web-wrapper settings panel (separate from the in-game menu) --- */
+  #gear { position:fixed; top:12px; right:12px; z-index:20; width:40px; height:40px; border-radius:8px;
+    border:1px solid #3a3a42; background:rgba(20,20,24,.7); color:#e8e2d6; font-size:20px; line-height:1; cursor:pointer;
+    display:none; align-items:center; justify-content:center; }
+  #gear:hover { background:rgba(42,42,50,.92); }
+  #diag { position:fixed; top:10px; left:10px; z-index:15; font-family:monospace; font-size:12px; color:#9effa0;
+    background:rgba(0,0,0,.5); padding:4px 8px; border-radius:6px; display:none; white-space:pre; pointer-events:none; }
+  #settings { position:fixed; inset:0; z-index:30; display:none; align-items:center; justify-content:center;
+    background:rgba(0,0,0,.55); font-family:"DejaVu Sans Mono",Menlo,Consolas,monospace; }
+  #settings.open { display:flex; }
+  #settings .panel { width:min(560px,92vw); max-height:88vh; overflow:auto; background:#141417; border:1px solid #2c2c33;
+    border-radius:14px; padding:22px 24px; color:#c9c3b6; box-shadow:0 20px 60px rgba(0,0,0,.6); }
+  #settings h3 { margin:0 0 6px; font-size:16px; font-weight:700; }
+  #settings h3 .brand { color:var(--duke-yellow); }
+  #settings h3 .ver { color:#6f6a5f; font-weight:400; font-size:12px; margin-left:8px; }
+  #settings section { margin:16px 0; }
+  #settings h4 { margin:0 0 9px; font-size:11px; letter-spacing:.09em; text-transform:uppercase; color:#8a8479; }
+  #settings .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  #settings button.s { border:1px solid #3a3a42; background:#1b1b20; color:#e8e2d6; padding:8px 14px; border-radius:8px; cursor:pointer; font:inherit; }
+  #settings button.s:hover { background:#26262d; }
+  #settings button.s.on { border-color:var(--duke-yellow); color:var(--duke-yellow); }
+  #settings button.danger { border-color:#6a2a24; color:#e08a80; }
+  #settings button.danger:hover { background:#2a1614; }
+  #settings ul#grplist { list-style:none; margin:0; padding:0; }
+  #settings #grplist li { display:flex; justify-content:space-between; gap:12px; padding:8px 11px; background:#0f0f12;
+    border:1px solid #24242a; border-radius:7px; margin-bottom:6px; font-size:13px; }
+  #settings #grplist .gname { color:#e8e2d6; } #settings #grplist .gid { color:var(--duke-yellow); font-size:12px; }
+  #settings #grplist .gsz { color:#7a756a; white-space:nowrap; }
+  #settings #grplist li.empty { color:#7a756a; justify-content:flex-start; }
+  #settings input[type=range] { accent-color:var(--duke-red); flex:1; min-width:120px; }
+  #settings label.chk { cursor:pointer; display:inline-flex; align-items:center; gap:8px; }
+  #settings .foot { margin-top:20px; padding-top:14px; border-top:1px solid #24242a; display:flex;
+    justify-content:space-between; align-items:center; color:#6f6a5f; font-size:12px; }
+  #settings .foot button { border:1px solid #3a3a42; background:#1b1b20; color:#e8e2d6; padding:8px 20px; border-radius:8px; cursor:pointer; font:inherit; }
+  #settings .foot button:hover { background:#26262d; }
 </style>
 </head>
 <body>
@@ -43,6 +79,38 @@
   <div id="status">Loading&hellip;</div>
   <div id="hint">Click to capture the mouse &middot; Esc to release</div>
   <div id="err"></div>
+</div>
+<button id="gear" title="Settings" aria-label="Settings">&#9881;</button>
+<div id="diag"></div>
+<div id="settings" role="dialog" aria-modal="true">
+  <div class="panel">
+    <h3><span class="brand">eduke32</span>-wasm <span class="ver" id="ver">Duke Nukem 3D &middot; WebAssembly</span></h3>
+    <section>
+      <h4>Loaded GRP files</h4>
+      <ul id="grplist"><li class="empty">&hellip;</li></ul>
+    </section>
+    <section>
+      <h4>Display</h4>
+      <div class="row">
+        <button class="s" id="btnFull">Fullscreen</button>
+        <button class="s" id="btn43">4:3</button>
+        <button class="s" id="btnFill">Fill</button>
+        <span>res</span>
+        <input type="range" id="res" min="0" max="3" step="1" value="3">
+        <span id="resLabel" style="width:58px;text-align:right"></span>
+      </div>
+    </section>
+    <section>
+      <label class="chk"><input type="checkbox" id="diagChk"> Diagnostics overlay</label>
+    </section>
+    <section>
+      <button class="s danger" id="btnClear">Clear local data&hellip;</button>
+    </section>
+    <div class="foot">
+      <span>classic 8-bit software renderer</span>
+      <button id="btnClose">Close</button>
+    </div>
+  </div>
 </div>
 <script>
   var loaderEl = document.getElementById('loader'),
@@ -57,15 +125,24 @@
 
   // --- Aspect ratio: render at 4:3 and pillarbox the canvas with side margins ---
   var ASPECT = 4 / 3;
+  function e32ResCap() { return parseInt(localStorage.getItem('e32_res') || '0', 10) || 0; }  // 0 = native
+  function e32Fill()   { return localStorage.getItem('e32_display') === 'fill'; }
   function renderBox() {
     var W = window.innerWidth || 1280, H = window.innerHeight || 720, w, h;
     if (W / H > ASPECT) { h = H; w = Math.round(h * ASPECT); }   // window wider than 4:3 -> bars L/R
     else                { w = W; h = Math.round(w / ASPECT); }   // window taller than 4:3 -> bars top/bottom
+    var cap = e32ResCap();                                       // optional render-height cap (Settings)
+    if (cap && h > cap) { w = Math.round(w * cap / h); h = cap; }
     return { w: w & ~1, h: h & ~1 };
   }
   function fitCanvas() {
-    var c = document.getElementById('canvas'), b = renderBox();
-    // Only write when changed so the MutationObserver below cannot loop.
+    var c = document.getElementById('canvas');
+    if (e32Fill()) {   // stretch the 4:3 render to fill the window (no margins)
+      if (c.style.width  !== '100vw') c.style.width  = '100vw';
+      if (c.style.height !== '100vh') c.style.height = '100vh';
+      return;
+    }
+    var b = renderBox();  // 4:3, centered -> black side margins
     if (c.style.width  !== b.w + 'px') c.style.width  = b.w + 'px';
     if (c.style.height !== b.h + 'px') c.style.height = b.h + 'px';
   }
@@ -93,8 +170,11 @@
     monitorRunDependencies: function (left) {
       if (left === 0) { setPct(100); statusEl.textContent = 'Starting…'; }
     },
-    onRuntimeInitialized: function () { started = true; fitCanvas(); setTimeout(hideLoader, 400); },
-    printErr: function (t) { console.error(t); },
+    onRuntimeInitialized: function () { started = true; fitCanvas(); document.getElementById('gear').style.display = 'flex'; setTimeout(hideLoader, 400); },
+    printErr: function (t) {
+      console.error(t);
+      if (!window.__e32ver) { var m = /EDuke32\s+\S+/.exec(t); if (m) { window.__e32ver = m[0]; var v = document.getElementById('ver'); if (v) v.textContent = m[0]; } }
+    },
     preRun: [function () {
       // Windowed at the 4:3 render box. The screen override above makes the engine
       // render at this resolution; fitCanvas() centers it with side margins.
@@ -127,6 +207,122 @@
   window.addEventListener('resize', fitCanvas);
   new MutationObserver(fitCanvas).observe(document.getElementById('canvas'),
     { attributes: true, attributeFilter: ['width', 'height', 'style'] });
+
+  // ---------------- Web-wrapper settings panel (not the in-game menu) ----------------
+  (function () {
+    var RES_STEPS = [480, 720, 1080, 0];            // slider index -> render-height cap (0 = Native)
+    var RES_NAMES = ['480p', '720p', '1080p', 'Native'];
+    var $ = function (id) { return document.getElementById(id); };
+    var settingsEl = $('settings'), gearEl = $('gear'), diagEl = $('diag');
+
+    function open()  { populateGRPs(); syncControls(); settingsEl.classList.add('open'); try { document.exitPointerLock(); } catch (e) {} }
+    function close() { settingsEl.classList.remove('open'); }
+
+    function hsize(n) { return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.round(n / 1024) + ' KB'; }
+    var KNOWN_GRP = { 11035779: 'Duke Nukem 3D Shareware 1.3D', 44356548: 'Duke Nukem 3D Atomic Edition' };
+
+    // List every .GRP the engine has in its in-memory filesystem.
+    function scanGRPs() {
+      var out = [];
+      try {
+        var FS = Module.FS;
+        ['/', '/data'].forEach(function (dir) {
+          var names; try { names = FS.readdir(dir); } catch (e) { return; }
+          names.forEach(function (n) {
+            if (!/\.grp$/i.test(n)) return;
+            var p = (dir === '/' ? '' : dir) + '/' + n, sz = 0;
+            try { sz = FS.stat(p).size; } catch (e) {}
+            out.push({ name: n, size: sz, id: KNOWN_GRP[sz] || null });
+          });
+        });
+      } catch (e) {}
+      return out;
+    }
+    function populateGRPs() {
+      var ul = $('grplist'), grps = scanGRPs();
+      ul.innerHTML = '';
+      if (!grps.length) { ul.innerHTML = '<li class="empty">No GRP files loaded.</li>'; return; }
+      grps.forEach(function (g) {
+        var li = document.createElement('li');
+        li.innerHTML = '<span class="gname">' + g.name + (g.id ? ' <span class="gid">' + g.id + '</span>' : '') + '</span>' +
+                       '<span class="gsz">' + hsize(g.size) + '</span>';
+        ul.appendChild(li);
+      });
+    }
+
+    function syncControls() {
+      var fill = e32Fill();
+      $('btn43').classList.toggle('on', !fill);
+      $('btnFill').classList.toggle('on', fill);
+      var cap = e32ResCap(), idx = RES_STEPS.indexOf(cap); if (idx < 0) idx = 3;
+      $('res').value = idx; $('resLabel').textContent = RES_NAMES[idx];
+      $('diagChk').checked = localStorage.getItem('e32_diag') === '1';
+    }
+
+    function setDisplay(mode) { localStorage.setItem('e32_display', mode); fitCanvas(); syncControls(); }
+
+    // Diagnostics overlay: browser frame rate + render size + engine build.
+    var diagOn = false, frames = 0, lastT = 0, raf = 0;
+    function diagLoop(t) {
+      if (!diagOn) return;
+      frames++;
+      if (!lastT) lastT = t;
+      if (t - lastT >= 500) {
+        var fps = Math.round(frames * 1000 / (t - lastT)); frames = 0; lastT = t;
+        var c = $('canvas');
+        diagEl.textContent = fps + ' fps  ' + c.width + 'x' + c.height + (window.__e32ver ? '  ' + window.__e32ver : '');
+      }
+      raf = requestAnimationFrame(diagLoop);
+    }
+    function setDiag(on) {
+      diagOn = on; localStorage.setItem('e32_diag', on ? '1' : '0');
+      diagEl.style.display = on ? 'block' : 'none';
+      cancelAnimationFrame(raf);
+      if (on) { frames = 0; lastT = 0; raf = requestAnimationFrame(diagLoop); }
+    }
+
+    function clearData() {
+      if (!confirm('Clear saved settings and local data, then reload?')) return;
+      try { localStorage.clear(); } catch (e) {}
+      var done = function () { location.reload(); };
+      try {
+        if (window.indexedDB && indexedDB.databases) {
+          indexedDB.databases().then(function (dbs) {
+            (dbs || []).forEach(function (d) { if (d.name) indexedDB.deleteDatabase(d.name); });
+            setTimeout(done, 250);
+          }, done);
+        } else done();
+      } catch (e) { done(); }
+    }
+
+    gearEl.addEventListener('click', open);
+    $('btnClose').addEventListener('click', close);
+    settingsEl.addEventListener('click', function (e) { if (e.target === settingsEl) close(); });   // click backdrop
+    $('btn43').addEventListener('click', function () { setDisplay('4:3'); });
+    $('btnFill').addEventListener('click', function () { setDisplay('fill'); });
+    $('btnFull').addEventListener('click', function () {
+      var el = document.documentElement;
+      if (document.fullscreenElement) { (document.exitFullscreen || function(){}).call(document); }
+      else { (el.requestFullscreen || el.webkitRequestFullscreen || function(){}).call(el); }
+    });
+    $('res').addEventListener('input', function () { $('resLabel').textContent = RES_NAMES[+this.value]; });
+    $('res').addEventListener('change', function () {
+      var cap = RES_STEPS[+this.value];
+      if (cap === e32ResCap()) return;
+      localStorage.setItem('e32_res', String(cap));
+      // The engine reads the render resolution once at boot, so reload to apply it.
+      location.reload();
+    });
+    $('diagChk').addEventListener('change', function () { setDiag(this.checked); });
+    $('btnClear').addEventListener('click', clearData);
+    // Esc closes the panel (before the game sees it) when the panel is open.
+    window.addEventListener('keydown', function (e) {
+      if (settingsEl.classList.contains('open') && e.key === 'Escape') { close(); e.preventDefault(); e.stopPropagation(); }
+    }, true);
+
+    if (localStorage.getItem('e32_diag') === '1') setDiag(true);
+    syncControls();
+  })();
 </script>
 <script src="eduke32.js"></script>
 </body>

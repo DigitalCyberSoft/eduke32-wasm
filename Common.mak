@@ -1006,6 +1006,9 @@ ifeq ($(RENDERTYPE),SDL)
         # and silently corrupts memory (the engine froze at the title screen). Size
         # it for the deepest gameplay path.
         LINKERFLAGS += -sASYNCIFY_STACK_SIZE=16777216
+        # Expose the MEMFS runtime API so the host page can enumerate loaded GRP
+        # files (settings panel) and write eduke32.cfg before boot.
+        LINKERFLAGS += -sEXPORTED_RUNTIME_METHODS=FS,callMain,ccall,cwrap
         ifneq (0,$(EM_SINGLE_FILE))
             LINKERFLAGS += -sSINGLE_FILE=1 --shell-file platform/emscripten/shell.html
             ifneq ($(strip $(GAME_DATA)),)
