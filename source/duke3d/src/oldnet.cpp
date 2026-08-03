@@ -22,6 +22,15 @@
 // in mainline; owned here by the netcode.
 int quickExit = 0;
 
+// Classic multiplayer load-game relay globals (absent from our tree).
+signed char multiwho, multipos, multiwhat, multiflag;
+
+// netduke32 deathmatch flag absent from our tree's flag set (used only in a
+// visibility-adjustment log line).
+#ifndef DMFLAG_ALLOWVISIBILITYCHANGE
+# define DMFLAG_ALLOWVISIBILITYCHANGE (1 << 11)
+#endif
+
 // ---------------------------------------------------------------------------
 // Transport seam. The netcode never talks to enet/UDP/sockets directly; every
 // outgoing packet is classified onto a logical channel + reliability here and
@@ -549,7 +558,13 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 ud.m_coop           = packbuf[j++];
                 ud.m_dmflags        = (int32_t)B_UNBUF32(&packbuf[j]);  j += sizeof(int32_t);
                 uint32_t flags      = (uint32_t)B_UNBUF32(&packbuf[j]); j += sizeof(int32_t);
-                G_NewGame(flags | NEWGAME_FROMSERVER);
+                // [NetDuke32 port] Upstream: G_NewGame(flags | NEWGAME_FROMSERVER).
+                // Our tree's G_NewGame takes (volume, level, skill); the server's
+                // choices were staged into ud.m_* just above, so start from those.
+                // TODO(netcode): upstream NEWGAME_* flag nuances (NOSEND/RESETALL)
+                // are not modeled by this tree's G_NewGame.
+                (void)flags;
+                G_NewGame(ud.m_volume_number, ud.m_level_number, ud.m_player_skill);
                 break;
             }
             case PACKET_TYPE_NULL_PACKET:
@@ -633,7 +648,7 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
             }
             case PACKET_TYPE_EOL:
             {
-                ud.gm = MODE_EOL;
+                g_player[myconnectindex].ps->gm = MODE_EOL;
                 ud.level_number = packbuf[1];
                 ud.from_bonus = packbuf[2];
                 ud.secretlevel = packbuf[3];
@@ -647,9 +662,9 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 {
                     case PACKET_TYPE_VERSION:
                     {
-                        if (packbuf[2] != (char)atoi(VERSION))
+                        if (packbuf[2] != (char)atoi(s_buildRev))
                         {
-                            LOG_F(ERROR, "Player has version %d, expecting %d", packbuf[2], (char)atoi(VERSION));
+                            LOG_F(ERROR, "Player has version %d, expecting %d", packbuf[2], (char)atoi(s_buildRev));
                             G_GameExit("You cannot play with different versions of NetDuke32!");
                         }
                         if (packbuf[3] != (char)BYTEVERSION)
@@ -718,7 +733,9 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                         if (rts_numlumps == 0)
                             continue;
 
-                        if (ud.config.SoundToggle == 0 || ud.lockout == 1 || ud.config.FXDevice < 0 || !(ud.config.VoiceToggle & 4))
+                        // [NetDuke32 port] this tree has no separate ud.config.FXDevice
+                        // (SDL sound is always present); the SoundToggle gate above suffices.
+                        if (ud.config.SoundToggle == 0 || ud.lockout == 1 || !(ud.config.VoiceToggle & 4))
                             break;
 
                         rtsptr = (char*)RTS_GetSound(packbuf[1] - 1);
@@ -873,7 +890,7 @@ void Net_SendQuit(void)
     netQuitSend = 1;
     if (g_gameQuit == 0 && (numplayers > 1))
     {
-        if (ud.gm & MODE_GAME)
+        if (g_player[myconnectindex].ps->gm & MODE_GAME)
         {
             g_gameQuit = 1;
             quittimer = (int32_t)totalclock+(CLOCKTICKSPERSECOND*2);
@@ -1087,7 +1104,7 @@ void Net_EndOfLevel(bool secret)
     if (/*(myconnectindex != connecthead) ||*/ oldnet_predicting)
         return;
 
-    ud.gm = MODE_EOL;
+    g_player[myconnectindex].ps->gm = MODE_EOL;
 
     if (secret)
     {
@@ -1131,7 +1148,7 @@ void Net_EnterMessage(void)
 {
     short ch, hitstate, i, j, l;
 
-    if (ud.gm & MODE_SENDTOWHOM)
+    if (g_player[myconnectindex].ps->gm & MODE_SENDTOWHOM)
     {
         if (g_chatPlayer != -1 || ud.multimode < 3)
         {
@@ -1194,7 +1211,7 @@ void Net_EnterMessage(void)
             }
 
             g_chatPlayer = -1;
-            ud.gm &= ~(MODE_TYPE|MODE_SENDTOWHOM);
+            g_player[myconnectindex].ps->gm &= ~(MODE_TYPE|MODE_SENDTOWHOM);
         }
         else if (g_chatPlayer == -1)
         {
@@ -1238,7 +1255,7 @@ void Net_EnterMessage(void)
                     g_chatPlayer = ud.multimode;
                     if (i == 27)
                     {
-                        ud.gm &= ~(MODE_TYPE|MODE_SENDTOWHOM);
+                        g_player[myconnectindex].ps->gm &= ~(MODE_TYPE|MODE_SENDTOWHOM);
                         g_chatPlayer = -1;
                     }
                     else
@@ -1272,7 +1289,7 @@ void Net_EnterMessage(void)
             KB_ClearKeyDown(sc_Enter);
             if (Bstrlen(typebuf) == 0)
             {
-                ud.gm &= ~(MODE_TYPE|MODE_SENDTOWHOM);
+                g_player[myconnectindex].ps->gm &= ~(MODE_TYPE|MODE_SENDTOWHOM);
                 return;
             }
             if (ud.automsg)
@@ -1280,10 +1297,10 @@ void Net_EnterMessage(void)
                 if (SHIFTS_IS_PRESSED) g_chatPlayer = -1;
                 else g_chatPlayer = ud.multimode;
             }
-            ud.gm |= MODE_SENDTOWHOM;
+            g_player[myconnectindex].ps->gm |= MODE_SENDTOWHOM;
         }
         else if (hitstate == -1)
-            ud.gm &= ~(MODE_TYPE|MODE_SENDTOWHOM);
+            g_player[myconnectindex].ps->gm &= ~(MODE_TYPE|MODE_SENDTOWHOM);
         else pub = NUMPAGES;
     }
 }
@@ -1496,7 +1513,7 @@ void Net_Disconnect(bool showScores)
 
     if (!quickExit && showScores)
     {
-        if (playerswhenstarted > 1 && ud.gm & MODE_GAME && GTFLAGS(GAMETYPE_SCORESHEET))
+        if (playerswhenstarted > 1 && g_player[myconnectindex].ps->gm & MODE_GAME && GTFLAGS(GAMETYPE_SCORESHEET))
         {
             G_BonusScreen(1);
             videoSetGameMode(ud.config.ScreenMode, ud.config.ScreenWidth, ud.config.ScreenHeight, ud.config.ScreenBPP, ud.detail);
