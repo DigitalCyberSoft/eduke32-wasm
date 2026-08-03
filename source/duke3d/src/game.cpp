@@ -37,6 +37,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 //#include "minicoro.h"
 #ifdef NETDUKE32
 # include "oldnet.h"
+# include "net_predict.h"
 #else
 # include "network.h"
 #endif
@@ -7140,8 +7141,22 @@ MAIN_LOOP_RESTART:
                         && (myplayer.gm & MODE_GAME))
                     {
                         g_frameJustDrawn = false;
-                        Net_GetPackets();
-                        G_DoMoveThings();
+#ifdef NETDUKE32
+                        if (numplayers > 1)
+                        {
+                            // Lockstep: feed our already-rotated local input to the FIFO,
+                            // latch+send it and advance movefifoend (Net_HandleInput), then
+                            // advance the sim only over confirmed ticks (G_MoveLoop).
+                            netInput = inputfifo[0][myconnectindex];
+                            Net_HandleInput();
+                            G_MoveLoop();
+                        }
+                        else
+#endif
+                        {
+                            Net_GetPackets();
+                            G_DoMoveThings();
+                        }
                     }
 
                 }
@@ -7298,8 +7313,18 @@ int G_DoMoveThings(void)
     if (g_netClient) // [75] The server should not overwrite its own randomseed
         randomseed = ticrandomseed;
 
+#ifdef NETDUKE32
+    // Lockstep: read the confirmed tic (movefifoplc) from the input ring, then
+    // advance the play cursor. Single-player keeps index 0 (byte-identical) and
+    // never advances movefifoplc.
+    for (bssize_t TRAVERSE_CONNECT(i))
+        Bmemcpy(&g_player[i].input, &inputfifo[numplayers > 1 ? (movefifoplc & (MOVEFIFOSIZ - 1)) : 0][i], sizeof(input_t));
+    if (numplayers > 1)
+        movefifoplc++;
+#else
     for (bssize_t TRAVERSE_CONNECT(i))
         Bmemcpy(&g_player[i].input, &inputfifo[(g_netServer && myconnectindex == i)][i], sizeof(input_t));
+#endif
 
     G_UpdateInterpolations();
 
@@ -7387,6 +7412,39 @@ int G_DoMoveThings(void)
 
     return 0;
 }
+
+#ifdef NETDUKE32
+// [NetDuke32 sub-step d] Lockstep confirmed-tick loop. Advances the sim only
+// over ticks every peer has confirmed (movefifoplc..movefifoend, minus the
+// bufferjitter latency cushion), with client-side prediction hiding latency.
+// MP only -- single-player never calls this (it stays on the per-frame path).
+int G_MoveLoop(void)
+{
+    if (numplayers > 1)
+        Net_DoPrediction(PREDICTSTATE_PROCESS);
+    else
+        bufferjitter = 0;
+
+    while ((g_player[myconnectindex].movefifoend - movefifoplc) > bufferjitter)
+    {
+        if (numplayers > 1)
+        {
+            // Don't process a tic until every peer has sent their input for it.
+            for (bssize_t TRAVERSE_CONNECT(i))
+                if ((g_player[i].movefifoend <= movefifoplc) && !g_gameQuit)
+                    return 0;
+        }
+
+        int const doMoveReturn = G_DoMoveThings();
+        Net_GetSyncStat();
+
+        if (doMoveReturn)
+            return 1;
+    }
+
+    return 0;
+}
+#endif
 
 #ifndef EDUKE32_STANDALONE
 void A_SpawnWallGlass(int spriteNum, int wallNum, int glassCnt)
