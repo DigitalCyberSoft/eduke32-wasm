@@ -571,6 +571,9 @@ ifneq (1,$(NETDUKE32))
 else
     # NetDuke32 lockstep netcode replaces the mainline snapshot netcode.
     duke3d_excl += network.cpp
+    ifeq ($(PLATFORM),EMSCRIPTEN)
+        duke3d_excl += net_transport_stub.cpp
+    endif
 endif
 
 duke3d_game_objs := $(call getfiltered,duke3d,*.cpp) \

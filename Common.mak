@@ -1022,6 +1022,10 @@ ifeq ($(RENDERTYPE),SDL)
         # Expose the MEMFS runtime API so the host page can enumerate loaded GRP
         # files (settings panel) and write eduke32.cfg before boot.
         LINKERFLAGS += -sEXPORTED_RUNTIME_METHODS=FS,callMain,ccall,cwrap
+        ifeq (1,$(NETDUKE32))
+            LINKERFLAGS += --js-library platform/emscripten/net/seam_library.js
+            LINKERFLAGS += -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_Net_ReceiveFrame,_Net_PeerEvent,_Net_SetLocalIndex
+        endif
         ifneq (0,$(EM_SINGLE_FILE))
             LINKERFLAGS += -sSINGLE_FILE=1 --shell-file platform/emscripten/shell.html
             ifneq ($(strip $(GAME_DATA)),)
