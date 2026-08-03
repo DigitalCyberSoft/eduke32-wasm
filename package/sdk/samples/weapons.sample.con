@@ -1,0 +1,2025 @@
+
+// Note: This file has been directly converted from the EDuke32
+// C source code to CON code, without any fixes or improvements.
+// Further changes to player.c may or may not be reflected here.
+
+/*
+gamevar currentweapon 0 0 //  (system) (pointer)
+gamevar gs 0 0 //  (system) (pointer)
+gamevar looking_arc 0 0 //  (system) (pointer)
+gamevar gun_pos 0 0 //  (system) (pointer)
+gamevar weapon_xoffset 0 0 //  (system) (pointer)
+gamevar weaponcount 0 0 //  (system) (pointer)
+gamevar looking_angSR1 0 0 //  (system) (pointer)
+
+gamevar xdim 0 0 //  (system) (pointer) (read only)
+gamevar ydim 0 0 //  (system) (pointer) (read only)
+gamevar windowx1 0 0 //  (system) (pointer) (read only)
+gamevar windowx2 0 0 //  (system) (pointer) (read only)
+gamevar windowy1 0 0 //  (system) (pointer) (read only)
+gamevar windowy2 0 0 //  (system) (pointer) (read only)
+*/
+
+
+/* TEMPORARY: so that this code supports the Incinerator without breaking under Atomic */
+
+define FLAMETHROWER_WEAPON 12
+
+define FLAMETHROWERSPRITE 5134
+define FLAMETHROWER 5138
+define FLAMETHROWERFIRE 5139
+define FLAMETHROWERPILOT 5174
+
+// not a real system gamevar
+gamevar WEAPON12_TOTALTIME 16 1
+
+
+/* weapons.con */
+
+gamevar hud_tilenum 0 1
+gamevar hud_x 0 1
+gamevar hud_y 0 1
+gamevar hud_scale 65536 1
+gamevar hud_angle 0 1
+gamevar hud_shade 0 1
+gamevar hud_pal 0 1
+gamevar hud_orientation 0 1
+
+gamevar hud_fistsign 0 1
+gamevar hud_totaltime 0 1
+
+gamevar hud_shadef 0 1
+gamevar hud_palf 0 1
+
+// It is unfortunate that we need so many temporary gamevars.
+gamevar hud_temp 0 1
+gamevar hud_temp2 0 1
+gamevar hud_temp3 0 1
+gamevar hud_temp4 0 1
+
+// The following temporary gamevars are internal to the G_Draw subroutines.
+gamevar hud_int_temp 0 1
+gamevar hud_int_temp2 0 1
+gamevar hud_int_x 0 1
+gamevar hud_int_y 0 1
+gamevar hud_int_scale 0 1
+gamevar hud_int_angle 0 1
+gamevar hud_int_orientation 0 1
+
+gamevar weapon_pos 0 1
+gamevar weaponscale 0 1
+gamevar playerid 0 1
+
+// define ROTATESPRITE_MAX 2048
+
+// preliminary functions
+
+state G_DrawTilePal
+    set hud_int_angle hud_angle
+    set hud_int_orientation hud_orientation
+
+    ifand hud_orientation 4
+        add hud_int_angle 1024
+
+    or hud_int_orientation 2
+
+    rotatesprite hud_x hud_y hud_scale hud_int_angle hud_tilenum hud_shade hud_pal hud_int_orientation windowx1 windowy1 windowx2 windowy2
+ends
+
+state G_DrawTileScaled
+    set hud_int_x hud_x
+    set hud_int_y hud_y
+    set hud_int_angle hud_angle
+    set hud_int_orientation hud_orientation
+
+    shiftl hud_int_x 16
+    shiftl hud_int_y 16
+
+    set hud_int_temp 12582912 // 192<<16
+
+    switch currentweapon
+        case DEVISTATOR_WEAPON
+        case TRIPBOMB_WEAPON
+            set hud_int_temp 10485760 // 160<<16
+            break
+        default
+            ifand hud_orientation 262144
+            {
+                set hud_int_temp 10485760 // 160<<16
+                and hud_int_orientation -262145 // ~262144
+            }
+            break
+    endswitch
+
+    ifand hud_orientation 4
+        add hud_int_angle 1024
+
+    /*
+    ifg rendermode 2
+        ifn usemodels 0
+            ifhasmodel hud_tilenum hud_pal
+            {
+                scalevar hud_int_temp2 14680064 weaponscale 100 // 224<<16
+
+                add hud_int_y 14680064 // 224<<16
+                sub hud_int_y hud_int_temp2
+            }
+    */
+
+    scalevar hud_int_x hud_int_x weaponscale 100
+    scalevar hud_int_temp2 hud_int_temp weaponscale 100
+    sub hud_int_temp hud_int_temp2
+    add hud_int_x hud_int_temp
+
+    scalevar hud_int_y hud_int_y weaponscale 100
+    set hud_int_temp 13107200 // 200<<16
+    scalevar hud_int_temp2 hud_int_temp weaponscale 100
+    sub hud_int_temp hud_int_temp2
+    add hud_int_y hud_int_temp
+
+    scalevar hud_int_scale hud_scale weaponscale 100
+
+    or hud_int_orientation 2050 // 2|2048
+
+    rotatesprite hud_int_x hud_int_y hud_int_scale hud_int_angle hud_tilenum hud_shade hud_pal hud_int_orientation windowx1 windowy1 windowx2 windowy2
+ends
+
+state G_DrawWeaponTile
+    // basic fading between player weapon shades
+    ifn hud_shade hud_shadef
+    {
+        set hud_int_temp 0
+        ife hud_pal 0 set hud_int_temp 1
+        ife hud_pal hud_palf set hud_int_temp 1
+        ife hud_int_temp 1
+        {
+            set hud_int_temp hud_shade
+            sub hud_int_temp hud_shadef
+            set hud_int_temp2 hud_int_temp
+            shiftr hud_int_temp 2
+            add hud_shadef hud_int_temp
+
+            ife hud_int_temp 0
+            {
+                shiftr hud_int_temp2 1
+                add hud_shadef hud_int_temp2
+                ife hud_int_temp2 0
+                    set hud_shadef hud_shade
+            }
+        }
+    }
+    else
+        set hud_shadef hud_shade
+
+    set hud_palf hud_pal
+    set hud_shade hud_shadef
+
+    state G_DrawTileScaled
+ends
+
+// helper states
+
+state reset_hud_weapon_x_coordinate
+    set hud_x weapon_xoffset
+    sub hud_x looking_angSR1
+ends
+state reset_hud_weapon_y_coordinate
+    set hud_y looking_arc
+    sub hud_y gun_pos
+ends
+state reset_hud_weapon_coordinates
+    state reset_hud_weapon_x_coordinate
+    state reset_hud_weapon_y_coordinate
+ends
+
+state determine_animation
+    getuserdef[].pause_on hud_temp
+    ifn hud_temp 0
+        set hud_temp 1
+
+    ifand player[].gm 1 // MODE_MENU
+        or hud_temp 1
+
+    getactor[playerid].pal hud_int_temp
+    ife hud_int_temp 1
+        or hud_temp 1
+ends
+
+// other EVENT_DISPLAYWEAPON code
+
+state draw_shrunk_fists // Shrunk Running Fists
+    // common calculations
+    state reset_hud_weapon_x_coordinate
+
+    set hud_temp3 looking_arc
+    ife player[].jetpack_on 0
+    {
+        getactor[playerid].xvel hud_temp2
+        shiftr hud_temp2 3
+        add hud_temp3 32
+        sub hud_temp3 hud_temp2
+        add hud_fistsign hud_temp2
+    }
+    // common calculations continued
+    set hud_temp2 hud_fistsign
+    sin hud_temp2 hud_temp2
+    set hud_temp4 hud_temp2
+    shiftr hud_temp2 10
+    shiftr hud_temp4 8
+    abs hud_temp4
+
+    // right fist
+    guniqhudid 101
+
+    add hud_x hud_temp2
+    add hud_x 250
+
+    set hud_y hud_temp3
+    add hud_y 258
+    sub hud_y hud_temp4
+
+    set hud_tilenum FIST
+
+    state G_DrawTilePal
+
+    // cleanup
+    sub hud_x 250
+
+    // left fist
+    guniqhudid 102
+
+    sub hud_x hud_temp2
+    add hud_x 40
+
+    set hud_y hud_temp3
+    add hud_y 200
+    add hud_y hud_temp4
+
+    or hud_orientation 4
+
+    state G_DrawTilePal
+
+    // cleanup
+    set hud_orientation 0
+    set hud_angle 0
+    guniqhudid 0
+ends
+
+state draw_quick_kick // Quick Kick
+    set hud_temp 14
+    sub hud_temp player[].quick_kick
+
+    set hud_temp2 0
+    ifn hud_temp 14 set hud_temp2 1
+    ifn player[].last_quick_kick 0 set hud_temp2 1
+    ife hud_temp2 1
+    {
+        getplayer[].hudpal hud_pal
+        ife hud_pal 0
+            getplayer[].palookup hud_pal
+
+        guniqhudid 100
+
+        // common calculations
+        state reset_hud_weapon_coordinates
+
+        set hud_tilenum KNEE
+
+        set hud_orientation 262148 // o|4|262144
+
+        set hud_temp3 0
+
+        ifg hud_temp 5
+            ifl hud_temp 13
+            {
+                add hud_x 144 // 160-16
+
+                add hud_y 214
+
+                add hud_tilenum 1
+
+                state G_DrawTileScaled
+
+                set hud_temp3 1
+            }
+
+        ife hud_temp3 0
+        {
+            add hud_x 80
+
+            add hud_y 250
+
+            state G_DrawTileScaled
+        }
+    }
+ends
+
+// weapon code
+
+state draw_kick // KNEE_WEAPON:
+    ifg weaponcount 0
+    {
+        guniqhudid currentweapon
+
+        state reset_hud_weapon_coordinates
+
+        ife hud_pal 0
+            getplayer[].palookup hud_pal
+
+        set hud_tilenum KNEE
+
+        set hud_temp3 0
+
+        ifg weaponcount 4
+            ifl weaponcount 10
+            {
+                add hud_x 160
+
+                add hud_y 214
+
+                add hud_tilenum 1
+
+                state G_DrawTileScaled
+
+                set hud_temp3 1
+            }
+
+        ife hud_temp3 0
+        {
+            add hud_x 220
+
+            add hud_y 250
+
+            state G_DrawTileScaled
+        }
+    }
+ends
+
+state draw_tripbomb // TRIPBOMB_WEAPON:
+    state reset_hud_weapon_coordinates
+
+    add hud_x 8
+    add hud_y 10
+
+    ifg weaponcount 6
+    {
+        set hud_temp weaponcount
+        shiftl hud_temp 3
+        add hud_y hud_temp
+    }
+    else ifl weaponcount 4
+    {
+        set hud_temp currentweapon
+        shiftl hud_temp 2
+        guniqhudid hud_temp
+
+        add hud_x 142
+        add hud_y 234
+
+        set hud_tilenum HANDHOLDINGLASER
+        add hud_tilenum 3
+
+        state G_DrawWeaponTile
+
+        // undo
+        sub hud_x 142
+        sub hud_y 234
+    }
+
+    // common to both hands
+
+    add hud_y 249
+
+    set hud_tilenum weaponcount
+    shiftr hud_tilenum 2
+    add hud_tilenum HANDHOLDINGLASER
+
+    // left hand
+    guniqhudid currentweapon
+
+    add hud_x 130
+
+    state G_DrawWeaponTile
+
+    // right hand
+    set hud_temp3 currentweapon
+    shiftl hud_temp3 1
+    guniqhudid hud_temp3
+
+    /*
+    // absolute method
+    sub hud_x 130 // undo
+    add hud_x 152
+    */
+    // relative method
+    add hud_x 22
+
+    or hud_orientation 4
+
+    state G_DrawWeaponTile
+
+    and hud_orientation -5 // ~4
+
+    guniqhudid 0
+ends
+
+state draw_rpg // RPG_WEAPON:
+
+    set hud_x weapon_xoffset
+    set hud_y looking_arc
+    shiftl hud_y 1
+    sub hud_y gun_pos
+
+    set hud_temp weaponcount
+    shiftl hud_temp 7
+    add hud_temp 768
+    sin hud_temp hud_temp
+    shiftr hud_temp 11
+
+    sub hud_x hud_temp
+    sub hud_y hud_temp
+
+    or hud_orientation 512
+
+    add hud_x 164
+
+    add hud_y 176
+
+    ifg weaponcount 0
+        ifl weaponcount 8
+        {
+            set hud_tilenum weaponcount
+            shiftr hud_tilenum 1
+            add hud_tilenum RPGGUN
+
+            state G_DrawWeaponTile
+        }
+
+    set hud_tilenum RPGGUN
+
+    state G_DrawWeaponTile
+
+    and hud_orientation -513 // ~512
+ends
+
+state draw_shotgun // SHOTGUN_WEAPON:
+    state reset_hud_weapon_coordinates
+
+    sub hud_x 8
+
+    switch weaponcount
+        case 1
+        case 2
+            set hud_temp4 currentweapon
+            shiftl hud_temp4 1
+            guniqhudid hud_temp4
+
+            add hud_x 168
+            add hud_y 201
+
+            set hud_shade -128
+
+            set hud_tilenum SHOTGUN
+            add hud_tilenum 2
+
+            state G_DrawWeaponTile
+
+            sub hud_x 168
+            sub hud_y 201
+            set hud_shade gs
+        case 0
+        case 6
+        case 7
+        case 8
+            guniqhudid currentweapon
+
+            add hud_x 146
+            add hud_y 202
+
+            set hud_tilenum SHOTGUN
+
+            state G_DrawWeaponTile
+
+            guniqhudid 0
+            break
+        case 3
+        case 4
+        case 5
+        case 9
+        case 10
+        case 11
+        case 12
+            ifg weaponcount 1
+                ifl weaponcount 5
+                {
+                    add hud_y 40
+                    add hud_x 20
+
+                    set hud_temp4 currentweapon
+                    shiftl hud_temp4 1
+                    guniqhudid hud_temp4
+
+                    add hud_x 178
+                    add hud_y 194
+
+                    set hud_shade -128
+
+                    set hud_tilenum weaponcount
+                    sub hud_tilenum 1
+                    shiftr hud_tilenum 1
+                    add hud_tilenum SHOTGUN
+                    add hud_tilenum 1
+
+                    state G_DrawWeaponTile
+
+                    sub hud_x 178
+                    sub hud_y 194
+                    set hud_shade gs
+                }
+
+            guniqhudid currentweapon
+
+            add hud_x 158
+
+            add hud_y 220
+
+            set hud_tilenum SHOTGUN
+            add hud_tilenum 3
+
+            state G_DrawWeaponTile
+
+            guniqhudid 0
+            break
+        case 13
+        case 14
+        case 15
+        case 28
+        case 29
+        case 30
+            guniqhudid currentweapon
+
+            add hud_x 198 // 32 + 166
+            add hud_y 210
+
+            set hud_tilenum SHOTGUN
+            add hud_tilenum 4
+
+            state G_DrawWeaponTile
+
+            guniqhudid 0
+            break
+        case 16
+        case 17
+        case 18
+        case 19
+        case 24
+        case 25
+        case 26
+        case 27
+            guniqhudid currentweapon
+
+            add hud_x 234 // 64 + 170
+            add hud_y 196
+
+            set hud_tilenum SHOTGUN
+            add hud_tilenum 5
+
+            state G_DrawWeaponTile
+            break
+        case 20
+        case 21
+        case 22
+        case 23
+            guniqhudid currentweapon
+
+            add hud_x 240 // 64 + 176
+            add hud_y 196
+
+            set hud_tilenum SHOTGUN
+            add hud_tilenum 6
+
+            state G_DrawWeaponTile
+            break
+    endswitch
+ends
+
+
+state draw_chaingun // CHAINGUN_WEAPON:
+    // hud_temp4 = FIREDELAY
+    state reset_hud_weapon_coordinates
+
+    ifg weaponcount 0
+    {
+        set hud_temp weaponcount
+        shiftl hud_temp 7
+        sin hud_temp hud_temp
+        shiftr hud_temp 12
+        add hud_y hud_temp
+
+        state determine_animation
+        ifn hud_temp 1
+        {
+            displayrand hud_temp
+            and hud_temp 3
+            inv hud_temp
+            add hud_temp 1
+            add hud_x hud_temp
+        }
+    }
+
+    // base
+    add hud_x 168
+    add hud_y 260
+
+    set hud_tilenum CHAINGUN
+
+    state G_DrawWeaponTile
+
+    sub hud_x 168
+    sub hud_y 260
+
+    switch weaponcount
+        case 0
+            add hud_x 178
+            add hud_y 233
+            add hud_tilenum 1 // relative
+
+            state G_DrawWeaponTile
+            break
+        default
+            state determine_animation
+
+            ifg weaponcount hud_temp4
+                ifl weaponcount hud_totaltime
+                {
+                    // muzzleflash 1
+                    ifn hud_temp 1
+                    {
+                        displayrand hud_temp3
+                        and hud_temp3 7
+                    }
+                    else
+                        set hud_temp3 0
+
+                    add hud_x 136 // -4+140
+                    add hud_x hud_temp3
+
+                    set hud_temp2 weaponcount
+                    shiftr hud_temp2 1
+
+                    add hud_y hud_temp3
+                    sub hud_y hud_temp2
+                    add hud_y 208
+
+                    set hud_tilenum weaponcount
+                    sub hud_tilenum 4
+                    div hud_tilenum 5
+                    add hud_tilenum CHAINGUN
+                    add hud_tilenum 5
+
+                    state G_DrawWeaponTile
+
+                    // cleanup
+                    sub hud_x hud_temp3
+                    sub hud_y hud_temp3
+
+                    // muzzleflash 3
+                    ifn hud_temp 1
+                    {
+                        displayrand hud_temp3
+                        and hud_temp3 7
+                    }
+
+                    add hud_x 44 // relative
+                    add hud_x hud_temp3
+                    add hud_y hud_temp3
+
+                    state G_DrawWeaponTile
+
+                    // cleanup
+                    sub hud_x 180 // -4+140 + 44
+                    sub hud_y 208
+                    sub hud_x hud_temp3
+                    sub hud_y hud_temp3
+                    add hud_y hud_temp2
+                }
+
+            sub hud_totaltime 4
+            ifl weaponcount hud_totaltime
+            {
+                // muzzleflash 2
+                ifn hud_temp 1
+                {
+                    displayrand hud_temp3
+                    and hud_temp3 7
+                }
+                else
+                    set hud_temp3 0
+
+                set hud_temp2 weaponcount
+                shiftr hud_temp2 1
+
+                add hud_x hud_temp3
+                add hud_x 158 // -4+162
+
+                add hud_y hud_temp3
+                sub hud_y hud_temp2
+                add hud_y 208
+
+                set hud_tilenum weaponcount
+                sub hud_tilenum 2
+                div hud_tilenum 5
+                add hud_tilenum CHAINGUN
+                add hud_tilenum 5
+
+                state G_DrawWeaponTile
+
+                // cleanup
+                sub hud_x hud_temp3
+                sub hud_x 158
+                sub hud_y hud_temp3
+                add hud_y hud_temp2
+                sub hud_y 208
+
+                // barrels (hot)
+                add hud_x 178
+
+                add hud_y 233
+
+                set hud_tilenum CHAINGUN
+                add hud_tilenum 1
+                add hud_tilenum hud_temp2
+
+                state G_DrawWeaponTile
+            }
+            else
+            {
+                // barrels
+                add hud_x 178
+
+                add hud_y 233
+
+                set hud_tilenum CHAINGUN
+                add hud_tilenum 1
+
+                state G_DrawWeaponTile
+            }
+            break
+    endswitch
+ends
+
+state draw_pistol // PISTOL_WEAPON:
+    // hud_temp4 = FIREDELAY
+    // hud_temp3 = RELOAD
+
+    state reset_hud_weapon_y_coordinate
+
+    set hud_tilenum FIRSTGUN
+
+    add hud_totaltime 1
+    ifl weaponcount hud_totaltime
+    {
+        set hud_x 183 // 195-12
+        add hud_x weapon_xoffset
+        sub hud_x looking_angSR1
+
+        add hud_y 244
+
+        ife weaponcount hud_temp4
+            sub hud_x 3
+
+        ifl weaponcount 3
+            add hud_tilenum weaponcount
+
+        set hud_orientation 2
+
+        guniqhudid currentweapon
+
+        state G_DrawWeaponTile
+
+        guniqhudid 0
+    }
+    else
+    {
+        or hud_orientation 512
+
+        sub hud_temp3 weaponcount
+
+        ifg hud_temp3 17
+        {
+            guniqhudid currentweapon
+
+            set hud_x 194
+            sub hud_x looking_angSR1
+
+            add hud_y 230
+
+            add hud_tilenum 4
+
+            state G_DrawWeaponTile
+
+            guniqhudid 0
+        }
+        else ifg hud_temp3 12
+        {
+            add hud_tilenum 6
+
+            set hud_temp weaponcount
+            shiftl hud_temp 3
+
+            set hud_x 244
+            sub hud_x hud_temp
+            sub hud_x looking_angSR1
+
+            set hud_temp2 weaponcount
+            shiftl hud_temp2 4
+
+            add hud_y 130
+            add hud_y hud_temp2
+
+            state G_DrawWeaponTile
+
+            sub hud_y 130
+            sub hud_y hud_temp2
+            sub hud_tilenum 6
+
+            guniqhudid currentweapon
+
+            set hud_x 224
+            sub hud_x looking_angSR1
+
+            add hud_y 220
+
+            add hud_tilenum 5
+
+            state G_DrawWeaponTile
+
+            guniqhudid 0
+        }
+        else ifg hud_temp3 7
+        {
+            add hud_tilenum 6
+
+            set hud_temp weaponcount
+            shiftl hud_temp 1
+
+            set hud_x 124
+            add hud_x hud_temp
+            sub hud_x looking_angSR1
+
+            set hud_temp2 weaponcount
+            shiftl hud_temp2 3
+
+            add hud_y 430
+            sub hud_y hud_temp2
+
+            state G_DrawWeaponTile
+
+            sub hud_y 430
+            add hud_y hud_temp2
+            sub hud_tilenum 6
+
+            guniqhudid currentweapon
+
+            set hud_x 224
+            sub hud_x looking_angSR1
+
+            add hud_y 220
+
+            add hud_tilenum 5
+
+            state G_DrawWeaponTile
+
+            guniqhudid 0
+        }
+        else ifg hud_temp3 4
+        {
+            set hud_x 184
+            sub hud_x looking_angSR1
+
+            add hud_y 235
+
+            add hud_tilenum 8
+
+            state G_DrawWeaponTile
+
+            sub hud_y 235
+            sub hud_tilenum 8
+
+            guniqhudid currentweapon
+
+            set hud_x 224
+            sub hud_x looking_angSR1
+
+            add hud_y 210
+
+            add hud_tilenum 5
+
+            state G_DrawWeaponTile
+
+            guniqhudid 0
+        }
+        else ifg hud_temp3 2
+        {
+            set hud_x 164
+            sub hud_x looking_angSR1
+
+            add hud_y 245
+
+            add hud_tilenum 8
+
+            state G_DrawWeaponTile
+
+            sub hud_y 245
+            sub hud_tilenum 8
+
+            guniqhudid currentweapon
+
+            set hud_x 224
+            sub hud_x looking_angSR1
+
+            add hud_y 220
+
+            add hud_tilenum 5
+
+            state G_DrawWeaponTile
+
+            guniqhudid 0
+        }
+        else ifg hud_temp3 0
+        {
+            guniqhudid currentweapon
+
+            set hud_x 194
+            sub hud_x looking_angSR1
+
+            add hud_y 235
+
+            add hud_tilenum 5
+
+            state G_DrawWeaponTile
+
+            guniqhudid 0
+        }
+    }
+ends
+
+state draw_pipebomb // HANDBOMB_WEAPON:
+    state reset_hud_weapon_coordinates
+
+    guniqhudid currentweapon
+
+    set hud_tilenum HANDTHROW
+
+    ifn weaponcount 0
+    {
+        ifl weaponcount hud_totaltime
+        {
+            ifl weaponcount 7
+            {
+                set hud_temp weaponcount
+                mul hud_temp 10
+                add hud_y hud_temp // D
+            }
+            else ifl weaponcount 12
+            {
+                set hud_temp weaponcount
+                sub hud_temp 10
+                mul hud_temp 20
+                sub hud_y hud_temp // U
+            }
+            else ifl weaponcount 20
+            {
+                set hud_temp weaponcount
+                sub hud_temp 14
+                mul hud_temp 9
+                add hud_y hud_temp // D
+            }
+
+            add hud_x 190
+
+            add hud_y 250
+
+            switch weaponcount
+                /*
+                case 0
+                case 1
+                case 2
+                case 3
+                case 4
+                    add hud_tilenum 0
+                    break
+                */
+                case 5
+                case 6
+                case 7
+                case 8
+                case 9
+                case 10
+                case 11
+                    add hud_tilenum 1
+                    break
+                case 12
+                case 13
+                case 14
+                case 15
+                case 16
+                case 17
+                case 18
+                case 19
+                case 20
+                    add hud_tilenum 2
+                    break
+            endswitch
+
+            state G_DrawWeaponTile
+        }
+    }
+    else
+    {
+        add hud_x 190
+
+        add hud_y 260
+
+        state G_DrawWeaponTile
+    }
+
+    guniqhudid 0
+ends
+
+state draw_detonator // HANDREMOTE_WEAPON:
+    state reset_hud_weapon_coordinates
+
+    guniqhudid currentweapon
+
+    add hud_x 102 // -48+150
+
+    add hud_y 258
+
+    set hud_tilenum HANDREMOTE
+
+    switch weaponcount
+        /*
+        case 0
+        case 6
+        case 7
+        case 8
+        case 9
+        case 10
+            add hud_tilenum 0
+            break
+        */
+        case 1
+        case 2
+        case 4
+        case 5
+            add hud_tilenum 1
+            break
+        case 3
+            add hud_tilenum 2
+            break
+    endswitch
+
+    state G_DrawWeaponTile
+
+    guniqhudid 0
+ends
+
+state draw_devastator // DEVISTATOR_WEAPON:
+    state reset_hud_weapon_coordinates
+
+    // for guniqhudid
+    set hud_temp4 currentweapon
+    shiftl hud_temp4 1
+
+    set hud_tilenum DEVISTATOR
+
+    set hud_temp -1 // flag
+
+    ifg weaponcount 0
+    {
+        add hud_totaltime 1
+        ifl weaponcount hud_totaltime
+        {
+            set hud_temp 0
+
+            switch weaponcount
+                default
+                    addlogvar weaponcount // debug
+                    break
+                    /*
+                case 0
+                case 6
+                    set hud_temp 0
+                    break
+                    */
+                case 1
+                case 5
+                    set hud_temp 4
+                    break
+                case 2
+                case 4
+                    set hud_temp 12
+                    break
+                case 3
+                    set hud_temp 24
+                    break
+            endswitch
+
+            set hud_temp2 weaponcount
+            shiftr hud_temp2 2
+            // sign function:
+            ife hud_temp2 0
+                set hud_temp3 0
+            else ifg hud_temp2 0
+                set hud_temp3 1
+            else ifl hud_temp2 0
+                set hud_temp3 -1
+
+            ifn player[].hbomb_hold_delay 0
+            {
+                guniqhudid currentweapon
+
+                set hud_temp2 hud_temp
+                shiftr hud_temp2 1
+                add hud_x hud_temp2
+                add hud_x 268
+
+                add hud_y hud_temp
+                add hud_y 238
+
+                add hud_tilenum hud_temp3
+
+                set hud_shade -32
+
+                state G_DrawWeaponTile
+
+                // cleanup
+                /*
+                sub hud_x 268
+                sub hud_x hud_temp2
+                sub hud_y 238
+                sub hud_y hud_temp
+                */
+                state reset_hud_weapon_coordinates
+                sub hud_tilenum hud_temp3
+                set hud_shade gs
+
+                guniqhudid hud_temp4
+
+                add hud_x 30
+
+                add hud_y 240
+
+                or hud_orientation 4
+
+                state G_DrawWeaponTile
+
+                and hud_orientation -5 // ~4
+
+                guniqhudid 0
+            }
+            else
+            {
+                guniqhudid hud_temp4
+
+                add hud_x 30
+                set hud_temp2 hud_temp
+                shiftr hud_temp2 1
+                sub hud_x hud_temp2
+
+                add hud_y 240
+                add hud_y hud_temp
+
+                add hud_tilenum hud_temp3
+
+                set hud_shade -32
+
+                or hud_orientation 4
+
+                state G_DrawWeaponTile
+
+                // cleanup
+                /*
+                sub hud_x 30
+                add hud_x hud_temp2
+                sub hud_y 240
+                sub hud_y hud_temp
+                */
+                state reset_hud_weapon_coordinates
+                sub hud_tilenum hud_temp3
+                set hud_shade gs
+                and hud_orientation -5 // ~4
+
+                guniqhudid currentweapon
+
+                add hud_x 268
+
+                add hud_y 238
+
+                state G_DrawWeaponTile
+
+                guniqhudid 0
+            }
+        break
+        }
+    }
+
+    ife hud_temp -1
+    {
+        guniqhudid currentweapon
+
+        add hud_x 268
+
+        add hud_y 238
+
+        state G_DrawWeaponTile
+
+        sub hud_x 268
+        sub hud_y 238
+
+        guniqhudid hud_temp4
+
+        add hud_x 30
+
+        add hud_y 240
+
+        or hud_orientation 4
+
+        state G_DrawWeaponTile
+
+        and hud_orientation -5 // ~4
+
+        guniqhudid 0
+    }
+ends
+
+state draw_freezer // FREEZE_WEAPON:
+    state reset_hud_weapon_coordinates
+
+    set hud_tilenum FREEZE
+
+    or hud_orientation 512
+
+    set hud_temp3 0
+
+    ifg weaponcount 0
+    {
+        add hud_totaltime 1
+        ifl weaponcount hud_totaltime
+        {
+            state determine_animation
+            ifn hud_temp 1
+            {
+                displayrand hud_temp
+                and hud_temp 3
+
+                add hud_x hud_temp
+
+                displayrand hud_temp
+                and hud_temp 3
+
+                add hud_y hud_temp
+            }
+
+            guniqhudid 0
+
+            add hud_x 210
+
+            add hud_y 277 // 16 + 261
+
+            add hud_tilenum 2
+
+            set hud_shade -32
+
+            state G_DrawWeaponTile
+
+            guniqhudid currentweapon
+
+            sub hud_y 26 // relative
+
+            set hud_temp weaponcount
+            mod hud_temp 6
+            div hud_temp 2
+            add hud_tilenum 1
+            add hud_tilenum hud_temp
+
+            state G_DrawWeaponTile
+
+            guniqhudid 0
+
+            set hud_temp3 1
+        }
+    }
+    ife hud_temp3 0
+    {
+        guniqhudid currentweapon
+
+        add hud_x 210
+
+        add hud_y 261
+
+        state G_DrawWeaponTile
+
+        guniqhudid 0
+    }
+
+    and hud_orientation -513 // ~512
+ends
+
+state draw_incinerator // FLAMETHROWER_WEAPON:
+    state reset_hud_weapon_coordinates
+
+    set hud_temp3 currentweapon
+    shiftl hud_temp3 1
+
+    getplayer[].cursectnum hud_temp4
+    ifn sector[hud_temp4].lotag 2 // ST_2_UNDERWATER
+        set hud_temp4 weaponcount
+    else
+        set hud_temp4 0
+
+    ifg hud_temp4 0
+    {
+        add hud_totaltime 1
+        ifl weaponcount hud_totaltime
+        {
+            set hud_tilenum FLAMETHROWERFIRE
+
+            state determine_animation
+            ifn hud_temp 1
+            {
+                displayrand hud_temp
+                and hud_temp 1
+
+                add hud_x hud_temp
+
+                displayrand hud_temp
+                and hud_temp 1
+
+                add hud_y hud_temp
+            }
+
+            guniqhudid hud_temp3
+
+            add hud_x 210
+
+            add hud_y 277 // 16 + 261
+
+            set hud_shade -32
+
+            state G_DrawWeaponTile
+
+            guniqhudid currentweapon
+
+            sub hud_y 26 // relative
+
+            set hud_temp weaponcount
+            mod hud_temp 6
+            div hud_temp 2
+            add hud_tilenum 1
+            add hud_tilenum hud_temp
+
+            state G_DrawWeaponTile
+
+            guniqhudid 0
+
+            break
+        }
+    }
+
+    set hud_tilenum FLAMETHROWER
+
+    guniqhudid currentweapon
+
+    add hud_x 210
+
+    add hud_y 261
+
+    state G_DrawWeaponTile
+
+    set hud_tilenum FLAMETHROWERPILOT
+
+    guniqhudid hud_temp3
+
+    state G_DrawWeaponTile
+
+    guniqhudid 0
+ends
+
+state draw_expander // GROW_WEAPON:
+    state reset_hud_weapon_coordinates
+
+    add hud_x 28
+    add hud_y 18
+
+    set hud_temp4 hud_pal
+    set hud_pal 2
+
+    set hud_temp3 currentweapon
+    shiftl hud_temp3 1
+
+    set hud_temp2 0
+
+    ifg weaponcount 0
+    {
+        ifl weaponcount hud_totaltime
+        {
+            state determine_animation
+            ifn hud_temp 1
+            {
+                displayrand hud_temp
+                and hud_temp 3
+
+                add hud_x hud_temp
+
+                displayrand hud_temp
+                and hud_temp 3
+
+                sub hud_y hud_temp
+            }
+
+            add hud_x 184
+
+            add hud_y 240
+
+            set hud_tilenum weaponcount
+            and hud_tilenum 3
+            add hud_tilenum SHRINKER
+            add hud_tilenum 3
+
+            set hud_shade -32
+
+            guniqhudid hud_temp3
+
+            state G_DrawTileScaled
+
+            guniqhudid currentweapon
+
+            add hud_x 4
+
+            set hud_tilenum SHRINKER
+            sub hud_tilenum 1
+
+            set hud_shade gs
+
+            set hud_pal hud_temp4
+
+            state G_DrawWeaponTile
+
+            guniqhudid 0
+
+            set hud_temp2 1
+        }
+    }
+    ife hud_temp2 0
+    {
+        add hud_x 184
+
+        add hud_y 240
+
+        set hud_tilenum SHRINKER
+        add hud_tilenum 2
+
+        getplayer[].random_club_frame hud_shade
+        sin hud_shade hud_shade
+        shiftr hud_shade 10
+        inv hud_shade
+        add hud_shade 16
+
+        guniqhudid hud_temp3
+
+        state G_DrawTileScaled
+
+        guniqhudid currentweapon
+
+        add hud_x 4
+
+        set hud_tilenum SHRINKER
+        sub hud_tilenum 2
+
+        set hud_shade gs
+
+        set hud_pal hud_temp4
+
+        state G_DrawWeaponTile
+
+        guniqhudid 0
+    }
+ends
+
+state draw_shrinker // SHRINKER_WEAPON:
+    state reset_hud_weapon_coordinates
+
+    add hud_x 28
+    add hud_y 18
+
+    set hud_temp4 hud_pal
+    set hud_pal 0
+
+    set hud_temp3 currentweapon
+    shiftl hud_temp3 1
+
+    set hud_temp2 0
+
+    ifg weaponcount 0
+    {
+        ifl weaponcount hud_totaltime
+        {
+            state determine_animation
+            ifn hud_temp 1
+            {
+                displayrand hud_temp
+                and hud_temp 3
+
+                add hud_x hud_temp
+
+                displayrand hud_temp
+                and hud_temp 3
+
+                sub hud_y hud_temp
+            }
+
+            add hud_x 184
+
+            add hud_y 240
+
+            set hud_tilenum weaponcount
+            and hud_tilenum 3
+            add hud_tilenum SHRINKER
+            add hud_tilenum 3
+
+            set hud_shade -32
+
+            guniqhudid hud_temp3
+
+            state G_DrawTileScaled
+
+            guniqhudid currentweapon
+
+            add hud_x 4
+
+            set hud_tilenum SHRINKER
+            add hud_tilenum 1
+
+            set hud_shade gs
+
+            set hud_pal hud_temp4
+
+            state G_DrawWeaponTile
+
+            guniqhudid 0
+
+            set hud_temp2 1
+        }
+    }
+    ife hud_temp2 0
+    {
+        add hud_x 184
+
+        add hud_y 240
+
+        set hud_tilenum SHRINKER
+        add hud_tilenum 2
+
+        getplayer[].random_club_frame hud_shade
+        sin hud_shade hud_shade
+        shiftr hud_shade 10
+        inv hud_shade
+        add hud_shade 16
+
+        guniqhudid hud_temp3
+
+        state G_DrawTileScaled
+
+        guniqhudid currentweapon
+
+        add hud_x 4
+
+        set hud_tilenum SHRINKER
+
+        set hud_shade gs
+
+        set hud_pal hud_temp4
+
+        state G_DrawWeaponTile
+
+        guniqhudid 0
+    }
+ends
+
+// framework
+
+onevent EVENT_DISPLAYWEAPON // P_DisplayWeapon
+
+    getplayer[].weapon_pos weapon_pos
+    getuserdef[].weaponscale weaponscale
+    getplayer[].i playerid
+
+    getuserdef[].drawweapon hud_temp
+
+    ife hud_temp 2 // weapon icons
+    {
+        set hud_tilenum -1
+
+        switch currentweapon
+            case PISTOL_WEAPON
+                set hud_tilenum FIRSTGUNSPRITE
+                break
+            case CHAINGUN_WEAPON
+                set hud_tilenum CHAINGUNSPRITE
+                break
+            case RPG_WEAPON
+                set hud_tilenum RPGSPRITE
+                break
+            case FREEZE_WEAPON
+                set hud_tilenum FREEZESPRITE
+                break
+            case FLAMETHROWER_WEAPON
+                set hud_tilenum FLAMETHROWERSPRITE
+                break
+            case SHRINKER_WEAPON
+                set hud_tilenum SHRINKERSPRITE
+                break
+            case GROW_WEAPON
+                set hud_tilenum GROWSPRITEICON
+                break
+            case DEVISTATOR_WEAPON
+                set hud_tilenum DEVISTATORSPRITE
+                break
+            case TRIPBOMB_WEAPON
+                set hud_tilenum TRIPBOMBSPRITE
+                break
+            case HANDREMOTE_WEAPON
+            case HANDBOMB_WEAPON
+                set hud_tilenum HEAVYHBOMB
+                break
+            case SHOTGUN_WEAPON
+                set hud_tilenum SHOTGUNSPRITE
+                break
+            case KNEE_WEAPON
+                break
+            default
+                addlogvar currentweapon
+                break
+        endswitch
+
+        ifn hud_tilenum -1
+        {
+            set hud_x 160
+            set hud_y weapon_pos
+            mul hud_y weapon_pos
+            add hud_y 180
+            scalevar hud_scale 65536 userdef[].statusbarscale 100
+            rotatesprite hud_x hud_y hud_scale 0 hud_tilenum 0 0 2 windowx1 windowy1 windowx2 windowy2
+        }
+
+        set RETURN -1
+    }
+
+    ifn hud_temp 1 break // If we are not displaying the actual HUD weapons, stop processing.
+
+    // these gamevars can get changed in the states up above, so reset them now.
+    set hud_scale 65536
+    set hud_orientation 0
+    set hud_angle 0
+    set hud_shade gs
+
+    state draw_quick_kick
+
+    // cleanup
+    set hud_orientation 0
+    set hud_angle 0
+    guniqhudid 0
+
+    getplayer[].hudpal hud_pal
+
+    getactor[playerid].xrepeat hud_temp
+    ifl hud_temp 40
+        state draw_shrunk_fists
+    else
+    {
+        switch currentweapon
+            case KNEE_WEAPON
+                set hud_totaltime WEAPON0_TOTALTIME
+                state draw_kick
+                break
+            case TRIPBOMB_WEAPON
+                set hud_totaltime WEAPON8_TOTALTIME
+                state draw_tripbomb
+                break
+            case RPG_WEAPON
+                set hud_totaltime WEAPON4_TOTALTIME
+                state draw_rpg
+                break
+            case SHOTGUN_WEAPON
+                set hud_totaltime WEAPON2_TOTALTIME
+                state draw_shotgun
+                break
+            case CHAINGUN_WEAPON
+                set hud_temp4 WEAPON3_FIREDELAY
+                set hud_totaltime WEAPON3_TOTALTIME
+                state draw_chaingun
+                break
+            case PISTOL_WEAPON
+                set hud_temp3 WEAPON1_RELOAD
+                set hud_temp4 WEAPON1_FIREDELAY
+                set hud_totaltime WEAPON1_TOTALTIME
+                state draw_pistol
+                break
+            case HANDBOMB_WEAPON
+                set hud_totaltime WEAPON5_TOTALTIME
+                state draw_pipebomb
+                break
+            case HANDREMOTE_WEAPON
+                set hud_totaltime WEAPON10_TOTALTIME
+                state draw_detonator
+                break
+            case DEVISTATOR_WEAPON
+                set hud_totaltime WEAPON7_TOTALTIME
+                state draw_devastator
+                break
+            case FREEZE_WEAPON
+                set hud_totaltime WEAPON9_TOTALTIME
+                state draw_freezer
+                break
+            case FLAMETHROWER_WEAPON
+                set hud_totaltime WEAPON12_TOTALTIME
+                state draw_incinerator
+                break
+            case GROW_WEAPON
+                set hud_totaltime WEAPON11_TOTALTIME
+                state draw_expander
+                break
+            case SHRINKER_WEAPON
+                set hud_totaltime WEAPON6_TOTALTIME
+                state draw_shrinker
+                break
+            default
+                addlogvar currentweapon
+                break
+        endswitch
+
+        // cleanup
+        set hud_orientation 0
+        set hud_angle 0
+        guniqhudid 0
+    }
+
+    set RETURN -1
+endevent
+
+
+state reset_vars_not_displayweapon
+    getuserdef[].weaponscale weaponscale
+    getplayer[].i playerid
+
+    set hud_scale 65536
+    set hud_orientation 0
+    set hud_angle 0
+
+    getactor[playerid].shade hud_shade
+    ifvarg hud_shade 24
+        set hud_shade 24
+ends
+
+state calc_display_base
+    getinput[].avel hud_x
+    shiftr hud_x 5
+
+    getplayer[].look_ang hud_temp4
+    shiftr hud_temp4 1
+    sub hud_x hud_temp4
+
+
+    getplayer[].look_ang hud_y
+    abs hud_y
+    div hud_y 9
+
+    getplayer[].hard_landing hud_temp4
+    shiftl hud_temp4 3
+    sub hud_y hud_temp4
+
+    getplayer[].q16horiz hud_temp4
+    sub hud_temp4 player[].q16horizoff
+
+    // fix16_to_int
+    // CON should not do this.
+    ifge hud_temp4 0
+        add hud_temp4 32768 // fix16_half
+    else
+        sub hud_temp4 32768 // fix16_half
+    div hud_temp4 65536 // fix16_one
+
+    shiftr hud_temp4 4
+    sub hud_y hud_temp4
+ends
+
+onevent EVENT_DISPLAYKNUCKLES
+    state reset_vars_not_displayweapon
+
+    getplayer[].knuckle_incs hud_temp
+    shiftr hud_temp 1
+    ifae hud_temp 11 // ARRAY_SIZE(knuckleFrames)
+    {
+        set RETURN -1
+        break
+    }
+    ifle sprite[playerid].extra 0
+    {
+        set RETURN -1
+        break
+    }
+
+    state calc_display_base
+
+    set hud_tilenum CRACKKNUCKLES
+
+    switch hud_temp
+        case 0
+        case 10
+            break
+
+        case 1
+        case 9
+            add hud_tilenum 1
+            break
+
+        case 2
+        case 3
+        case 7
+        case 8
+            add hud_tilenum 2
+            break
+
+        case 4
+        case 5
+        case 6
+            add hud_tilenum 3
+            break
+    endswitch
+
+    add hud_x 160
+
+    add hud_y 180
+
+    set hud_orientation 262148 // 4|262144
+    getplayer[].hudpal hud_pal
+
+    guniqhudid 202
+
+    state G_DrawTileScaled
+
+    guniqhudid 0
+
+    set RETURN 1
+endevent
+
+state get_access_tip_y_array // access_tip_y[]
+    switch hud_temp
+        case 1
+            set hud_temp4 -8
+            break
+        case 2
+        case 20
+            set hud_temp4 -16
+            break
+        case 3
+        case 19
+            set hud_temp4 -32
+            break
+        case 4
+        case 18
+            set hud_temp4 -64
+            break
+        case 5
+            set hud_temp4 -84
+            break
+        case 6
+        case 7
+        case 8
+        case 9
+        case 10
+        case 11
+        case 12
+        case 13
+        case 14
+        case 15
+            set hud_temp4 -108
+            break
+        case 16
+            set hud_temp4 -96
+            break
+        case 17
+            set hud_temp4 -72
+            break
+        case 22
+            set hud_temp4 16
+            break
+        case 23
+            set hud_temp4 32
+            break
+        case 24
+            set hud_temp4 48
+            break
+        /*
+        case 0
+        case 21
+        */
+        default
+            set hud_temp4 0
+            break
+    endswitch
+ends
+
+onevent EVENT_DISPLAYTIP
+    state reset_vars_not_displayweapon
+
+    set RETURN 1
+
+    getplayer[].tipincs hud_temp
+    ifae hud_temp 25 // ARRAY_SIZE(access_tip_y)
+        break
+
+    state calc_display_base
+    state get_access_tip_y_array
+
+    add hud_x 170
+
+    shiftr hud_temp4 1
+    add hud_y hud_temp4
+    add hud_y 240
+
+    set hud_tilenum 26
+    sub hud_tilenum hud_temp
+    shiftr hud_tilenum 4
+    add hud_tilenum TIP
+
+    getplayer[].hudpal hud_pal
+
+    set hud_orientation 262144
+
+    guniqhudid 201
+
+    state G_DrawTileScaled
+
+    guniqhudid 0
+endevent
+
+onevent EVENT_DISPLAYACCESS
+    state reset_vars_not_displayweapon
+
+    set RETURN 1
+
+    getplayer[].access_incs hud_temp
+    ifae hud_temp 21 // ARRAY_SIZE(access_tip_y)-4
+        break
+    ifle sprite[playerid].extra 0
+        break
+
+    state calc_display_base
+    state get_access_tip_y_array
+
+    set hud_temp2 hud_temp4
+    shiftr hud_temp2 2
+    add hud_x hud_temp2
+    add hud_x 170
+
+    add hud_y hud_temp4
+    add hud_y 266
+
+    getplayer[].access_spritenum hud_pal
+    ifb hud_pal MAXSPRITES
+        getactor[hud_pal].pal hud_pal
+    else
+        set hud_pal 0
+
+    set hud_temp3 1
+    set hud_temp2 hud_temp
+    sub hud_temp2 3
+    ifle hud_temp2 0
+        set hud_temp3 0
+    shiftr hud_temp2 3
+    ife hud_temp2 0
+        set hud_temp3 0
+    ifn hud_temp3 0
+    {
+        set hud_tilenum hud_temp
+        shiftr hud_tilenum 3
+        add hud_tilenum HANDHOLDINGLASER
+
+        set hud_orientation 262144
+    }
+    else
+    {
+        set hud_tilenum HANDHOLDINGACCESS
+
+        set hud_orientation 262148 // 4|262144
+    }
+
+    guniqhudid 200
+
+    state G_DrawTileScaled
+
+    guniqhudid 0
+endevent
