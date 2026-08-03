@@ -63,6 +63,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 //#define BYTEVERSION_14      116
 //#define BYTEVERSION_15      117
 #define BYTEVERSION         (BYTEVERSION_EDUKE32+(PLUTOPAK?1:(VOLUMEONE<<1)))
+// NetDuke32 net-protocol byte version (used only in a version-mismatch log).
+#define BYTEVERSION_NETDUKE32  192
 
 #define NUMPAGES            1
 

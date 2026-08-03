@@ -68,6 +68,7 @@ int movefifoplc;
 // selects master/slave vs offline; botNameSeed drives deterministic bot names.
 int g_networkBroadcastMode = NETMODE_OFFLINE;
 int botNameSeed = 0;
+int32_t playerswhenstarted = 1;
 
 static int g_chatPlayer = -1;
 static char recbuf[180];

@@ -11,6 +11,22 @@
 #define OLDNET_EXTERN extern
 #endif
 
+// Number of players present when the current match started. Not in mainline.
+extern int32_t playerswhenstarted;
+
+// netduke32's all-players iterator + helper (mainline lacks both). Safe to
+// define globally: the stock tree does not use the ALL_PLAYERS name.
+static inline int32_t G_GetNextPlayer(int32_t pNum)
+{
+    for (int32_t i = pNum + 1; i < MAXPLAYERS; i++)
+        if ((g_player[i].ps != NULL) && g_player[i].connected)
+            return i;
+    return -1;
+}
+#ifndef ALL_PLAYERS
+# define ALL_PLAYERS(i) i = 0; i != -1; i = G_GetNextPlayer(i)
+#endif
+
 #define INPUTFIFO_CURTICK (movefifoplc & (MOVEFIFOSIZ - 1))
 #define INPUTFIFO_LASTTICK ((movefifoplc - 1) & (MOVEFIFOSIZ - 1))
 #define INPUTFIFO_PREDICTTICK (predictfifoplc & (MOVEFIFOSIZ - 1))

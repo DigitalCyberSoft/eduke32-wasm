@@ -280,6 +280,12 @@ typedef struct {
     uint8_t user_map;
     uint8_t screenfade, menubackground;
     uint8_t shadow_pal;
+#ifdef NETDUKE32
+    // NetDuke32 multiplayer game-mode fields (gated so the stock user_defs
+    // layout / savegame format is unchanged).
+    int32_t fraglimit;   // deathmatch frag limit
+    int32_t m_dmflags;   // pending (menu) deathmatch flags; committed to dmflags on start
+#endif
 } user_defs;
 
 extern user_defs ud;
