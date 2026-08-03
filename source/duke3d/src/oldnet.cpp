@@ -5,6 +5,7 @@
 #include "net_predict.h"
 #include "net_transport.h"
 #include "chatpipe.h"
+#include "demo.h"  // G_CloseDemoWrite (Net_CheckPlayerQuit)
 
 // NetDuke32's player-iteration macros differ from our tree's (ours are bare
 // loop clauses used as `for (TRAVERSE_CONNECT(i))`; netduke32's bake in the
@@ -29,6 +30,9 @@ signed char multiwho, multipos, multiwhat, multiflag;
 // visibility-adjustment log line).
 #ifndef DMFLAG_ALLOWVISIBILITYCHANGE
 # define DMFLAG_ALLOWVISIBILITYCHANGE (1 << 11)
+#endif
+#ifndef M_DMFLAGS_TEST
+# define M_DMFLAGS_TEST(x) (ud.m_dmflags & (x))
 #endif
 
 // ---------------------------------------------------------------------------
