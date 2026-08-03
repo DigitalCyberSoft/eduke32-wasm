@@ -31,6 +31,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "input.h"
 #include "microprofile.h"
 #include "screens.h"
+#ifdef NETDUKE32
+# include "net_predict.h"  // oldnet_predicting (G_MovePlayerSprite prediction guard)
+#endif
 
 #if KRANDDEBUG
 # define ACTOR_STATIC
@@ -1477,6 +1480,166 @@ static int P_Emerge(int, DukePlayer_t *, int, int);
 static void P_FinishWaterChange(int, DukePlayer_t *, int, int, int);
 
 static FORCE_INLINE fix16_t P_GetQ16AngleDeltaForTic(DukePlayer_t const *pPlayer) { return getq16angledelta(pPlayer->oq16ang, pPlayer->q16ang); }
+
+#ifdef NETDUKE32
+// [NetDuke32 port] Alive-player sprite movement, extracted (as netduke32 did)
+// from G_MovePlayers so the client-side prediction replay can move just the
+// local player. This is a verbatim copy of the owner>=0 / newowner branch
+// below, parameterized by playerNum -- it does NOT include the dead/holoduke
+// branch or the cosmetic shade blend, which prediction does not need. The
+// stock G_MovePlayers is left untouched (deploy build unaffected). The one
+// intentional delta vs the inline copy is the !oldnet_predicting guard on
+// A_Execute, so the player's CON code does not double-run during prediction.
+void G_MovePlayerSprite(int playerNum)
+{
+    int const  spriteNum   = g_player[playerNum].ps->i;
+    auto const pSprite     = &sprite[spriteNum];
+    auto &     thisPlayer  = g_player[playerNum];
+    auto const pPlayer     = thisPlayer.ps;
+
+    if (pSprite->owner < 0)
+        return;
+
+    if (pPlayer->newowner >= 0)  //Looking thru the camera
+    {
+        pSprite->x              = pPlayer->opos.x;
+        pSprite->y              = pPlayer->opos.y;
+        pSprite->z              = pPlayer->opos.z + pPlayer->spritezoffset;
+        actor[spriteNum].bpos.z = pSprite->z;
+        pSprite->ang            = fix16_to_int(pPlayer->oq16ang);
+
+        setsprite(spriteNum, &pSprite->xyz);
+    }
+    else
+    {
+        int32_t otherPlayerDist;
+#ifdef YAX_ENABLE
+        // TROR water submerge/emerge
+        int const playerSectnum = pSprite->sectnum;
+        int const sectorLotag   = sector[playerSectnum].lotag;
+        int32_t   otherSector;
+
+        if (A_CheckNoSE7Water((uspriteptr_t)pSprite, playerSectnum, sectorLotag, &otherSector))
+        {
+            // NOTE: Compare with G_MoveTransports().
+            pPlayer->on_warping_sector = 1;
+
+            if ((sectorLotag == ST_1_ABOVE_WATER ?
+                P_Submerge(playerNum, pPlayer, playerSectnum, otherSector) :
+                P_Emerge(playerNum, pPlayer, playerSectnum, otherSector)) == 1)
+                P_FinishWaterChange(spriteNum, pPlayer, sectorLotag, -1, otherSector);
+        }
+#endif
+        if (g_netServer || ud.multimode > 1)
+            otherp = P_FindOtherPlayer(playerNum, &otherPlayerDist);
+        else
+        {
+            otherp = playerNum;
+            otherPlayerDist = 0;
+        }
+
+        if (!oldnet_predicting && G_TileHasActor(sprite[spriteNum].picnum))
+            A_Execute(spriteNum, playerNum, otherPlayerDist);
+
+        if (pPlayer->newowner < 0)
+        {
+            pPlayer->q16angvel    = P_GetQ16AngleDeltaForTic(pPlayer);
+            pPlayer->oq16ang      = pPlayer->q16ang;
+            pPlayer->oq16horiz    = pPlayer->q16horiz;
+            pPlayer->oq16horizoff = pPlayer->q16horizoff;
+        }
+
+        if (ud.recstat || pPlayer->gm & MODE_DEMO)
+        {
+            thisPlayer.smoothcamera = true;
+            P_UpdateAngles(playerNum, thisPlayer.input);
+        }
+
+        if (pPlayer->one_eighty_count < 0)
+        {
+            thisPlayer.smoothcamera = true;
+            pPlayer->one_eighty_count += 128;
+            pPlayer->q16ang += F16(128);
+        }
+
+        if (g_netServer || ud.multimode > 1)
+        {
+            if (sprite[g_player[otherp].ps->i].extra > 0)
+            {
+                if (pSprite->yrepeat > 32 && sprite[g_player[otherp].ps->i].yrepeat < 32)
+                {
+                    if (otherPlayerDist < 1400 && pPlayer->knee_incs == 0)
+                    {
+                        // Don't stomp teammates.
+                        if (
+                            ((g_gametypeFlags[ud.coop] & GAMETYPE_TDM) && pPlayer->team != g_player[otherp].ps->team) ||
+                            (!(g_gametypeFlags[ud.coop] & GAMETYPE_PLAYERSFRIENDLY) && !(g_gametypeFlags[ud.coop] & GAMETYPE_TDM))
+                            )
+                        {
+                            pPlayer->knee_incs = 1;
+                            pPlayer->weapon_pos = -1;
+                            pPlayer->actorsqu = g_player[otherp].ps->i;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (pPlayer->actorsqu >= 0)
+        {
+            thisPlayer.smoothcamera = true;
+            pPlayer->q16ang += fix16_from_int(
+            G_GetAngleDelta(fix16_to_int(pPlayer->q16ang), getangle(sprite[pPlayer->actorsqu].x - pPlayer->pos.x, sprite[pPlayer->actorsqu].y - pPlayer->pos.y))
+            >> 2);
+        }
+
+        if (ud.god)
+        {
+            pSprite->extra = pPlayer->max_player_health;
+            pSprite->cstat = 257;
+            if (!WW2GI)
+                pPlayer->inv_amount[GET_JETPACK] = 1599;
+        }
+
+        if (pSprite->extra > 0)
+        {
+#ifndef EDUKE32_STANDALONE
+            if (!FURY)
+            {
+                actor[spriteNum].htowner = spriteNum;
+
+                if (ud.god == 0)
+                    if (G_CheckForSpaceCeiling(pSprite->sectnum) || G_CheckForSpaceFloor(pSprite->sectnum))
+                    {
+                        LOG_F(WARNING, "%s: player killed by space sector!", EDUKE32_FUNCTION);
+                        P_QuickKill(pPlayer);
+                    }
+            }
+#endif
+        }
+        else
+        {
+            pPlayer->pos.x = pSprite->x;
+            pPlayer->pos.y = pSprite->y;
+            pPlayer->pos.z = pSprite->z-(20<<8);
+
+            pPlayer->newowner = -1;
+
+            if (pPlayer->wackedbyactor >= 0 && sprite[pPlayer->wackedbyactor].statnum < MAXSTATUS)
+            {
+                thisPlayer.smoothcamera = true;
+                pPlayer->q16ang += fix16_from_int(G_GetAngleDelta(fix16_to_int(pPlayer->q16ang),
+                                                              getangle(sprite[pPlayer->wackedbyactor].x - pPlayer->pos.x,
+                                                                       sprite[pPlayer->wackedbyactor].y - pPlayer->pos.y))
+                                              >> 1);
+                pPlayer->q16ang &= 0x7FFFFFF;
+            }
+        }
+
+        pSprite->ang = fix16_to_int(pPlayer->q16ang);
+    }
+}
+#endif  // NETDUKE32
 
 ACTOR_STATIC void G_MovePlayers(void)
 {

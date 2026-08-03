@@ -434,6 +434,9 @@ void G_ResetConveyorInterp(void);
 void G_ClearCameraView(DukePlayer_t *ps);
 void G_DoInterpolations(int smoothRatio);
 void G_MoveWorld(void);
+#ifdef NETDUKE32
+void G_MovePlayerSprite(int playerNum);  // client-side prediction player move
+#endif
 void G_RefreshLights(void);
 void G_StopInterpolation(const int32_t *posptr);
 
