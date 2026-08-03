@@ -76,6 +76,9 @@ endif
 ifeq ($(PLATFORM),WII)
     EXESUFFIX := .elf
 endif
+ifeq ($(PLATFORM),EMSCRIPTEN)
+    EXESUFFIX := .js
+endif
 ifeq ($(PLATFORM),WINDOWS)
     EXESUFFIX := .exe
     DLLSUFFIX := .dll
@@ -290,6 +293,8 @@ else ifeq ($(PLATFORM),WII)
     IMPLICIT_ARCH := ppc
 else ifeq ($(PLATFORM),$(filter $(PLATFORM),DINGOO GCW))
     IMPLICIT_ARCH := mipsel
+else ifeq ($(PLATFORM),EMSCRIPTEN)
+    IMPLICIT_ARCH := wasm32
 else
     ifneq ($(ARCH),)
         override ARCH := $(subst i486,i386,$(subst i586,i386,$(subst i686,i386,$(strip $(ARCH)))))
@@ -304,6 +309,21 @@ else
     ifeq ($(findstring arm64,$(IMPLICIT_ARCH)),arm64)
         BITS := 64
     endif
+endif
+
+ifeq ($(PLATFORM),EMSCRIPTEN)
+    # WebAssembly (Emscripten): replace the host toolchain. This must come
+    # after the generic detection above, whose CLANG detection would rewrite
+    # CC to bare "clang" ("emcc --version" mentions clang).
+    override CC := emcc -x c
+    override CXX := em++ -x c++
+    override COBJC := emcc -x objective-c
+    override COBJCXX := em++ -x objective-c++
+    override L_CC := emcc
+    override L_CXX := em++
+    override AR := emar
+    override RANLIB := emranlib
+    override STRIP :=
 endif
 
 
@@ -390,6 +410,18 @@ else ifeq ($(PLATFORM),$(filter $(PLATFORM),DINGOO GCW))
     override NOASM := 1
 else ifeq ($(PLATFORM),$(filter $(PLATFORM),BEOS))
     override NOASM := 1
+else ifeq ($(PLATFORM),EMSCRIPTEN)
+    # WebAssembly: software renderer only, no x86 asm, no GTK, no netcode,
+    # no system libs for vorbis/flac. SDL2 comes from the Emscripten port
+    # (-sUSE_SDL=2), not from the system.
+    override USE_OPENGL := 0
+    override NOASM := 1
+    override HAVE_GTK2 := 0
+    override NETCODE := 0
+    override HAVE_VORBIS := 0
+    override HAVE_FLAC := 0
+    override STARTUP_WINDOW := 0
+    override SDL_STATIC := 0
 endif
 
 ifneq (i386,$(strip $(IMPLICIT_ARCH)))
@@ -438,6 +470,12 @@ ifeq ($(RELEASE),0)
 else
     OPTLEVEL := 2
     LTO := 1
+endif
+
+ifeq ($(PLATFORM),EMSCRIPTEN)
+    # LTO is assigned above, after the Toggles section; disable it for
+    # Emscripten (emcc handles -flto but it slows links and is not needed).
+    override LTO := 0
 endif
 
 ifeq (0,$(CLANG))
@@ -590,9 +628,15 @@ ifeq ($(PACKAGE_REPOSITORY),0)
     COMMONFLAGS += -O$(OPTLEVEL) $(OPTOPT)
 endif
 
+ifeq ($(PLATFORM),EMSCRIPTEN)
+# Emscripten's linker (wasm-ld) rejects -save-temps/-dumpdir at link time.
+define LF
+endef
+else
 define LF
 -save-temps=obj -dumpdir $1
 endef
+endif
 
 ifneq (0,$(LTO))
     COMPILERFLAGS += -DUSING_LTO
@@ -921,6 +965,15 @@ ifeq ($(RENDERTYPE),SDL)
         SDLCONFIG :=
     endif
 
+    ifeq ($(PLATFORM),EMSCRIPTEN)
+        # SDL2 comes from the Emscripten port, not the system.
+        override SDLCONFIG :=
+        COMPILERFLAGS += -sUSE_SDL=2
+        # -sMALLOC=emmalloc: mimalloc's Emscripten prim (prim/emscripten/prim.c)
+        # uses emmalloc_memalign/emmalloc_free as its OS-memory backend.
+        LINKERFLAGS += -sUSE_SDL=2 -sALLOW_MEMORY_GROWTH=1 -sASYNCIFY -sEXIT_RUNTIME=1 -sMALLOC=emmalloc
+    endif
+
     ifneq ($(strip $(SDLCONFIG)),)
         ifeq ($(strip $(shell $(SDLCONFIG) --version $(DONT_PRINT_STDERR))),)
             override SDLCONFIG :=
@@ -958,7 +1011,9 @@ ifeq ($(RENDERTYPE),SDL)
                 COMPILERFLAGS += -D_GNU_SOURCE=1
             endif
             COMPILERFLAGS += -D_REENTRANT -DSDL_USEFOLDER
-            LIBS += -l$(SDLNAME)
+            ifneq ($(PLATFORM),EMSCRIPTEN)
+                LIBS += -l$(SDLNAME)
+            endif
         endif
     endif
 endif
@@ -993,7 +1048,7 @@ else ifeq ($(SUBPLATFORM),LINUX)
     LIBS += -lrt -latomic
 endif
 
-ifeq (,$(filter $(PLATFORM),WINDOWS WII))
+ifeq (,$(filter $(PLATFORM),WINDOWS WII EMSCRIPTEN))
     ifneq ($(PLATFORM),BSD)
         LIBS += -ldl
     endif

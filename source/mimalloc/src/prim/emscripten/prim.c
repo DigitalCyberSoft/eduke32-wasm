@@ -55,7 +55,15 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config) {
   config->has_virtual_reserve = false;
 }
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+// emmalloc is a C library; without extern "C" the C++ build (CPLUSPLUS=1)
+// mangles these references and the link fails.
 extern void emmalloc_free(void*);
+#ifdef __cplusplus
+}
+#endif
 
 int _mi_prim_free(void* addr, size_t size) {
   MI_UNUSED(size);
@@ -68,7 +76,13 @@ int _mi_prim_free(void* addr, size_t size) {
 // Allocation
 //---------------------------------------------
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 extern void* emmalloc_memalign(size_t alignment, size_t size);
+#ifdef __cplusplus
+}
+#endif
 
 // Note: the `try_alignment` is just a hint and the returned pointer is not guaranteed to be aligned.
 int _mi_prim_alloc(size_t size, size_t try_alignment, bool commit, bool allow_large, bool* is_large, bool* is_zero, void** addr) {
@@ -189,6 +203,11 @@ bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
 //----------------------------------------------------------------
 // Random
 //----------------------------------------------------------------
+
+// getentropy() is declared in unistd.h on Emscripten (under _GNU_SOURCE,
+// which emcc defines by default); nothing else in the mimalloc include
+// chain pulls it in.
+#include <unistd.h>
 
 bool _mi_prim_random_buf(void* buf, size_t buf_len) {
   int err = getentropy(buf, buf_len);

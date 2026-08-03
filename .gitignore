@@ -8,6 +8,12 @@ obj/
 /ekenbuild
 /ekenbuild-editor
 
+# Emscripten outputs
+/eduke32.js
+/eduke32.wasm
+/*.data
+/*.data.js
+
 /arttool
 /bsuite
 /cacheinfo

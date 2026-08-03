@@ -140,6 +140,12 @@ mimalloc_objs += prim/prim.c
 
 mimalloc_cflags := -D_WIN32_WINNT=0x0600 -DMI_USE_RTLGENRANDOM -DMI_SHOW_ERRORS -fexceptions -Wno-cast-qual -Wno-unknown-pragmas -Wno-array-bounds -Wno-null-dereference -Wno-missing-field-initializers
 
+ifeq ($(PLATFORM),EMSCRIPTEN)
+    # Emscripten links with -fno-exceptions (DISABLE_EXCEPTION_THROWING);
+    # -fexceptions here would emit __cxa_* references and break the link.
+    mimalloc_cflags := $(filter-out -fexceptions,$(mimalloc_cflags))
+endif
+
 ifeq (,$(filter 1 2 3 4 5 6 7,$(GCC_MAJOR)))
     mimalloc_cflags += -Wno-class-memaccess
 endif
@@ -728,6 +734,12 @@ components := \
 roles := \
     game \
     editor \
+
+ifeq ($(PLATFORM),EMSCRIPTEN)
+    # The map editor (mapster32) is native-only; the browser build produces
+    # the game only.
+    roles := game
+endif
 
 
 ifeq ($(PRETTY_OUTPUT),1)

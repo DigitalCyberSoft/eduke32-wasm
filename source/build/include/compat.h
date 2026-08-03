@@ -14,8 +14,9 @@
 #include <string.h>
 
 #ifdef USE_MIMALLOC
-# if defined __cplusplus && defined __APPLE__
+# if defined __cplusplus && (defined __APPLE__ || defined __EMSCRIPTEN__)
 // avoid compilation failure due to use of std::realloc in this header
+// (libc++ on both Apple and Emscripten)
 #  include <locale>
 # endif
 # include "mimalloc.h"
@@ -385,6 +386,11 @@ defined __x86_64__ || defined __amd64__ || defined _M_X64 || defined _M_IA64 || 
 #elif defined(GEKKO) || defined(__ANDROID__)
 # define B_LITTLE_ENDIAN 0
 # define B_BIG_ENDIAN 1
+
+#elif defined(__EMSCRIPTEN__)
+// WebAssembly memory is little-endian by specification.
+# define B_LITTLE_ENDIAN 1
+# define B_BIG_ENDIAN 0
 
 #elif defined(__OpenBSD__)
 # include <machine/endian.h>

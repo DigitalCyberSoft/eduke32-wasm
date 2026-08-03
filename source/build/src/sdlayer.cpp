@@ -2,6 +2,9 @@
 // Use SDL 1.2 or 2.0 from http://www.libsdl.org
 
 #include <signal.h>
+#ifdef __EMSCRIPTEN__
+# include <emscripten.h>
+#endif
 
 #include "a.h"
 #include "build.h"
@@ -323,7 +326,7 @@ void wm_setapptitle(const char *name)
 //
 
 /* XXX: libexecinfo could be used on systems without gnu libc. */
-#if !defined _WIN32 && defined __GNUC__ && !defined __OpenBSD__ && !(defined __APPLE__ && defined __BIG_ENDIAN__) && !defined GEKKO && !defined EDUKE32_TOUCH_DEVICES && !defined __OPENDINGUX__
+#if !defined _WIN32 && defined __GNUC__ && !defined __OpenBSD__ && !(defined __APPLE__ && defined __BIG_ENDIAN__) && !defined GEKKO && !defined EDUKE32_TOUCH_DEVICES && !defined __OPENDINGUX__ && !defined __EMSCRIPTEN__
 # define PRINTSTACKONSEGV 1
 # include <execinfo.h>
 #endif
@@ -2191,6 +2194,12 @@ void videoShowFrame(int32_t w)
         sdl_surface = SDL_GetWindowSurface(sdl_window);
         SDL_UpdateWindowSurface(sdl_window);
     }
+#ifdef __EMSCRIPTEN__
+    // Emscripten: yield to the browser so the presented frame is painted and
+    // queued input is processed. The engine loop never blocks on its own, so
+    // without this yield the tab would freeze. Requires -sASYNCIFY.
+    emscripten_sleep(0);
+#endif
 #else
     SDL_Flip(sdl_surface);
 #endif

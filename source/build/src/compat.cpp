@@ -20,7 +20,7 @@
 #endif
 #endif
 
-#if defined __linux || defined EDUKE32_BSD
+#if defined __linux || defined EDUKE32_BSD || defined __EMSCRIPTEN__
 #include <libgen.h>  // for dirname()
 #include <pwd.h>     // for getpwuid()
 #endif
