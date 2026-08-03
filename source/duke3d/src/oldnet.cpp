@@ -128,6 +128,13 @@ int g_networkBroadcastMode = NETMODE_OFFLINE;
 int botNameSeed = 0;
 int32_t playerswhenstarted = 1;
 
+// Snapshot connection-layer compat globals (see oldnet.h). Inert under the
+// lockstep model; the transport track establishes connections.
+int      g_networkMode = NET_CLIENT;
+int      g_netDisconnect = 0;
+char     g_netPassword[32];
+uint16_t g_netPort = 0;
+
 static int g_chatPlayer = -1;
 static char recbuf[180];
 

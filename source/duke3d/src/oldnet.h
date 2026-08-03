@@ -77,6 +77,33 @@ extern int botNameSeed;
 #define Net_InsertSprite(...) ((void)0)
 #define Net_DeleteSprite(...) ((void)0)
 
+// Snapshot world-state machinery has no lockstep equivalent (deterministic
+// replay needs no world snapshots) -> no-op, as under mainline NETCODE_DISABLE.
+#define Net_StoreClientState(...) ((void)0)
+#define Net_ResetPrediction(...) ((void)0)
+#define Net_InitMapStateHistory(...) ((void)0)
+#define Net_AddWorldToInitialSnapshot(...) ((void)0)
+#define Net_WaitForInitialSnapshot(...) ((void)0)
+#define DumpMapStateHistory(...) ((void)0)
+
+// Snapshot connection layer. The transport track owns the wire; these exist so
+// the game compiles, but the in-engine snapshot connect/dedicated-server paths
+// stay inert (g_networkMode stays NET_CLIENT -- no dedicated server in-browser).
+enum { NET_CLIENT = 0, NET_SERVER, NET_DEDICATED_CLIENT, NET_DEDICATED_SERVER };
+enum { CHAN_MOVE = 0, CHAN_GAMESTATE, CHAN_CHAT, CHAN_MISC, CHAN_MAX };
+extern int      g_networkMode;
+extern int      g_netDisconnect;
+extern char     g_netPassword[32];
+extern uint16_t g_netPort;
+
+// Snapshot packet-type names the game code still uses -> lockstep packet types.
+#define PACKET_MESSAGE PACKET_TYPE_MESSAGE
+#define PACKET_RTS     PACKET_TYPE_RTS
+
+// Vote senders -> lockstep equivalents (oldnet.cpp).
+#define Net_SendMapVoteInitiate Net_InitiateVote
+#define Net_SendMapVoteCancel   Net_CancelVote
+
 OLDNET_EXTERN input_t netInput;
 
 OLDNET_EXTERN bool oldnet_gotinitialsettings; // True if we got PACKET_TYPE_INIT_SETTINGS from the host.
