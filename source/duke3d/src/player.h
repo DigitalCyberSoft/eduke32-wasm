@@ -288,6 +288,15 @@ typedef struct
         ready; // currently unused. May be used later to indicate that a player has pressed use on intermission to indicate they are ready to go on to the next map
     char user_name[32];
     uint32_t revision;
+#ifdef NETDUKE32
+    // NetDuke32 lockstep netcode per-player state (see oldnet.cpp / net_predict.cpp).
+    // Gated so the stock build's playerdata_t layout is unchanged.
+    int32_t movefifoend;      // per-player input FIFO write cursor
+    int32_t myminlag;         // running minimum lag for buffer/jitter tuning
+    int32_t lastSyncTick;     // last tick a sync CRC was recorded for this player
+    char    playerreadyflag;  // handshake counter used by Net_WaitForPlayers
+    char    connected;        // 1 while this slot is an active peer
+#endif
 } playerdata_t;
 #pragma pack(pop)
 
