@@ -147,7 +147,11 @@ enum loguru_verbosities_game
 #include "inv.h"
 #include "macros.h"
 #include "music.h"
-#include "network.h"
+#ifdef NETDUKE32
+# include "oldnet.h"
+#else
+# include "network.h"
+#endif
 #include "player.h"
 #include "quotes.h"
 #include "rts.h"

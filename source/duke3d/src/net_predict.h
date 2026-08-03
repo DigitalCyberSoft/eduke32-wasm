@@ -44,7 +44,7 @@ NET_PREDICT_EXTERN DukePlayer_t  predictedPlayer;
 NET_PREDICT_EXTERN spritetype predicted_sprite[MAXSPRITES];
 NET_PREDICT_EXTERN spritetype *original_sprite;
 
-NET_PREDICT_EXTERN ActorData_t predicted_pActor;
+NET_PREDICT_EXTERN actor_t predicted_pActor;
 
 NET_PREDICT_EXTERN intptr_t *original_pValues[MAXGAMEVARS];
 NET_PREDICT_EXTERN intptr_t *predicted_pValues[MAXGAMEVARS];

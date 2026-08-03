@@ -568,6 +568,9 @@ ifneq (1,$(NETDUKE32))
         sync.cpp \
         chatpipe.cpp \
 
+else
+    # NetDuke32 lockstep netcode replaces the mainline snapshot netcode.
+    duke3d_excl += network.cpp
 endif
 
 duke3d_game_objs := $(call getfiltered,duke3d,*.cpp) \

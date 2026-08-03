@@ -4,8 +4,23 @@
 #include "oldnet.h"
 #include "net_predict.h"
 #include "net_transport.h"
+#include "chatpipe.h"
+
+// NetDuke32's player-iteration macros differ from our tree's (ours are bare
+// loop clauses used as `for (TRAVERSE_CONNECT(i))`; netduke32's bake in the
+// for()). Redefine them TU-locally so this module compiles verbatim without
+// disturbing the rest of the engine.
+#undef TRAVERSE_CONNECT
+#define TRAVERSE_CONNECT(i) for (i = connecthead; i != -1; i = connectpoint2[i])
+#ifndef ALL_PLAYERS
+# define ALL_PLAYERS(i) i = 0; i != -1; i = G_GetNextPlayer(i)
+#endif
 
 #define TIMERUPDATESIZ 32
+
+// quickExit: set when the user force-quits (ctrl-alt-del / crash). Not present
+// in mainline; owned here by the netcode.
+int quickExit = 0;
 
 // ---------------------------------------------------------------------------
 // Transport seam. The netcode never talks to enet/UDP/sockets directly; every
@@ -48,6 +63,11 @@ int mymaxlag, otherminlag, bufferjitter = 1;
 
 int movefifosendplc;
 int movefifoplc;
+
+// NetDuke32 netcode globals not present in mainline. g_networkBroadcastMode
+// selects master/slave vs offline; botNameSeed drives deterministic bot names.
+int g_networkBroadcastMode = NETMODE_OFFLINE;
+int botNameSeed = 0;
 
 static int g_chatPlayer = -1;
 static char recbuf[180];

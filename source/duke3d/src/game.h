@@ -34,7 +34,11 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "gamevars.h"
 //#include "minicoro.h"
 #include "mmulti.h"
-#include "network.h"
+#ifdef NETDUKE32
+# include "oldnet.h"
+#else
+# include "network.h"
+#endif
 #include "savegame.h"
 
 #ifdef __cplusplus

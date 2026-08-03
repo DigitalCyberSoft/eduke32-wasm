@@ -427,7 +427,13 @@ else ifeq ($(PLATFORM),EMSCRIPTEN)
     override USE_OPENGL := 0
     override NOASM := 1
     override HAVE_GTK2 := 0
-    override NETCODE := 0
+    # Stock WASM has no netcode. The NetDuke32 port re-enables it only when its
+    # flag is on (dev/test builds); the default deploy build stays netcode-off.
+    ifeq (1,$(NETDUKE32))
+        override NETCODE := 1
+    else
+        override NETCODE := 0
+    endif
     override HAVE_VORBIS := 0
     override HAVE_FLAC := 0
     override STARTUP_WINDOW := 0

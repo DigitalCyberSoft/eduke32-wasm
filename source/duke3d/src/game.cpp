@@ -35,7 +35,11 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "menus.h"
 #include "microprofile.h"
 //#include "minicoro.h"
-#include "network.h"
+#ifdef NETDUKE32
+# include "oldnet.h"
+#else
+# include "network.h"
+#endif
 #include "osdcmds.h"
 #include "osdfuncs.h"
 #include "palette.h"

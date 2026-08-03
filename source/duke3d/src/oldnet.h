@@ -31,6 +31,9 @@ extern int mymaxlag, otherminlag, bufferjitter;
 extern int movefifosendplc;
 extern int movefifoplc;
 
+extern int g_networkBroadcastMode;
+extern int botNameSeed;
+
 OLDNET_EXTERN input_t netInput;
 
 OLDNET_EXTERN bool oldnet_gotinitialsettings; // True if we got PACKET_TYPE_INIT_SETTINGS from the host.

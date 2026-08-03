@@ -12,7 +12,7 @@ CREATE_PREDICTED_LINKED_LIST(spritestat);
 int32_t predicted_Numsprites;
 int16_t predicted_tailspritefree;
 
-ActorData_t  backupActor;
+actor_t  backupActor;
 int32_t      backupSeed;
 randomseed_t backupRandom;
 
