@@ -358,6 +358,10 @@ CPLUSPLUS := 1
 # Feature toggles
 STANDALONE ?= 0
 NETCODE ?= 1
+# NetDuke32 netcode port (flag-gated, default OFF). When 1, compiles the
+# NetDuke32 lockstep+prediction+sync netcode over the pluggable transport seam
+# (net_transport.h). Default OFF keeps the stock build byte-for-byte unchanged.
+NETDUKE32 ?= 0
 STARTUP_WINDOW ?= 1
 RETAIL_MENU ?= 0
 POLYMER ?= 1
@@ -895,6 +899,9 @@ COMPILERFLAGS += -DRENDERTYPE$(RENDERTYPE)=1
 
 ifeq (0,$(NETCODE))
     COMPILERFLAGS += -DNETCODE_DISABLE
+endif
+ifeq (1,$(NETDUKE32))
+    COMPILERFLAGS += -DNETDUKE32
 endif
 ifneq (0,$(STARTUP_WINDOW))
     COMPILERFLAGS += -DSTARTUP_WINDOW

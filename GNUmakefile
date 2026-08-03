@@ -557,6 +557,19 @@ duke3d_excl := \
     $(duke3d_common_editor_objs) \
     $(duke3d_editor_objs) \
 
+# NetDuke32 netcode port (flag-gated). Default OFF: keep the new netcode files
+# out of the stock build entirely. ON: they are globbed in (and, from the core
+# stage onward, network.cpp is replaced by oldnet.cpp).
+ifneq (1,$(NETDUKE32))
+    duke3d_excl += \
+        net_transport_stub.cpp \
+        oldnet.cpp \
+        net_predict.cpp \
+        sync.cpp \
+        chatpipe.cpp \
+
+endif
+
 duke3d_game_objs := $(call getfiltered,duke3d,*.cpp) \
     common.cpp \
     grpscan.cpp \
