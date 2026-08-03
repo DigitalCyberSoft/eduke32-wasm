@@ -401,6 +401,15 @@ class DukeNet {
     const m = this.match;
     if (!m || m.role !== "guest" || peerId !== m.hostId) return;
     this.myConnectIndex = msg.yourSlot | 0;
+    // Tell the netcode our authoritative slot (host is 0; we are a guest at
+    // yourSlot). Reaches the page's Emscripten Module — ccall is exported via
+    // EXPORTED_RUNTIME_METHODS, Net_SetLocalIndex via EXPORTED_FUNCTIONS. Guarded
+    // so it is a strict no-op when the wasm runtime is absent (Node unit tests) or
+    // not yet ready, mirroring seam_library.js / index.html's window guards.
+    if (typeof window !== "undefined") {
+      const mod = (window as unknown as { Module?: { ccall?: (...args: unknown[]) => unknown } }).Module;
+      mod?.ccall?.("Net_SetLocalIndex", "void", ["number"], [this.myConnectIndex]);
+    }
     // The host is our single peer (star). Register it and attach.
     this.seam.registerPeer(peerId, msg.hostSlot | 0);
     m.peers.setAttached(peerId, true);
