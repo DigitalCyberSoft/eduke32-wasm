@@ -1,0 +1,55 @@
+From: eduke32-net transport branch
+Subject: [PATCH] pages.yml: build + ship the multiplayer transport bundle
+
+Adds a Node toolchain step that builds platform/emscripten/eduke32-net.js
+(the WebRTC+Nostr transport) with esbuild, on its OWN toolchain separate from
+emcc, and copies it plus grp-manifest.json into the published site beside
+eduke32.js. `.github/workflows/pages.yml` is shared, so this is delivered as a
+patch for `main` to apply rather than committed from the transport branch.
+
+Apply from the repo root on the branch that owns pages.yml (wasm/main):
+
+    git apply platform/emscripten/docs/ci-pages.patch
+
+--- a/.github/workflows/pages.yml
++++ b/.github/workflows/pages.yml
+@@ -39,5 +39,16 @@
+       - name: Verify toolchain
+         run: emcc --version
+
++      - name: Set up Node (multiplayer transport bundle)
++        uses: actions/setup-node@v4
++        with:
++          node-version: '22'
++
++      - name: Build multiplayer transport (eduke32-net.js)
++        working-directory: platform/emscripten
++        run: |
++          npm ci
++          npm run build:net
++
+       - name: Build (classic software renderer, multi-file)
+         run: make PLATFORM=EMSCRIPTEN EM_SINGLE_FILE=0 -j"$(nproc)"
+@@ -45,6 +56,8 @@
+       - name: Assemble site
+         run: |
+           mkdir -p _site
+           cp eduke32.js eduke32.wasm eduke32.data _site/
+           cp platform/emscripten/index.html _site/index.html
++          cp platform/emscripten/eduke32-net.js _site/eduke32-net.js
++          cp platform/emscripten/grp-manifest.json _site/grp-manifest.json
+           ls -la _site
+
+NOTE ON LINE NUMBERS: the @@ hunk offsets are approximate for the wasm-branch
+pages.yml at the time of writing. If `git apply` reports an offset mismatch, use
+`git apply --recount` or apply the two edits by hand — they are:
+  1. Insert the two Node steps ("Set up Node…" + "Build multiplayer transport…")
+     between the "Verify toolchain" and "Build (classic software renderer…)" steps.
+  2. Add the two `cp` lines (eduke32-net.js, grp-manifest.json) to the
+     "Assemble site" step, after the index.html copy.
+
+Optionally also run the standalone transport tests as a gate:
+
+      - name: Test multiplayer transport
+        working-directory: platform/emscripten
+        run: npm test

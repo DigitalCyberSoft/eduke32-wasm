@@ -1,0 +1,10 @@
+# Node toolchain for the multiplayer transport bundle (separate from the emcc build).
+node_modules/
+# esbuild sourcemap: large and regenerable by `npm run build:net`.
+eduke32-net.js.map
+# emcc build outputs, if a local build drops them here.
+eduke32.js
+eduke32.wasm
+eduke32.data
+_site/
+npm-debug.log*

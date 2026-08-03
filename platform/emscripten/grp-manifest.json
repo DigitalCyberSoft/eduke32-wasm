@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "note": "Bundleable free GRP descriptors for the startup selector. Per the design research, there are NO redistributable popular multiplayer GRPs (all popular content needs the paid base or lacks a redistribution license), so this manifest ships ONLY the free shareware GRP plus whatever the user provides. DO NOT add third-party GRPs. crc values are unsigned CRC-32 (matches grpscan.cpp). The built-in multiplayer arenas are the shareware Episode-1 DukeMatch maps already shipped in the GRP.",
+  "grps": [
+    {
+      "id": "duke3d-shareware-13d",
+      "name": "Duke Nukem 3D Shareware 1.3D",
+      "crc": 2553993507,
+      "size": 11035779,
+      "filename": "DUKE.GRP",
+      "source": "bundled",
+      "shareware": true
+    }
+  ]
+}

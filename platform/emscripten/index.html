@@ -4,6 +4,13 @@
   eduke32.js + eduke32.wasm + eduke32.data, all served beside this page).
   Shows a resource loading screen while the wasm + game data download, then
   hands off to the engine. Serve over HTTP(S); Web Audio unlocks on first click.
+
+  MULTIPLAYER (eduke32-net): a single deferred module script (eduke32-net.js,
+  built by platform/emscripten esbuild) adds window.DukeNet — the WebRTC+Nostr
+  transport. It is independent of the wasm build and does NOT touch the boot,
+  loader, 4:3 letterbox, or preRun cfg logic below. The only boot hook it adds is
+  applyNetGrpChoice() in preRun, which relaunches on a previously DOWNLOADED GRP
+  and is a strict no-op on a normal boot.
 -->
 <html lang="en">
 <head>
@@ -155,6 +162,45 @@
     Object.defineProperty(window.screen, 'height', { configurable: true, get: function(){ return renderBox().h; } });
   } catch (e) {}
 
+  // --- eduke32-net addition ---------------------------------------------------
+  // Relaunch on a previously DOWNLOADED GRP (see window.DukeNet GRP transfer). The
+  // player's persisted choice is localStorage['eduke32-net-gamegrp'] = {crc,filename};
+  // absent => normal boot (bundled shareware), so this is a strict no-op for the
+  // common case. Reads the verified GRP bytes straight from the same IndexedDB the
+  // transport wrote them to (no dependency on the deferred net module being loaded
+  // yet), writes them into FS, and appends -gamegrp. Fails safe to a normal boot.
+  function applyNetGrpChoice() {
+    var choice;
+    try { choice = JSON.parse(localStorage.getItem('eduke32-net-gamegrp') || 'null'); } catch (e) { choice = null; }
+    if (!choice || typeof choice.crc !== 'number') return;
+    if (typeof indexedDB === 'undefined' || !Module.FS || !Module.addRunDependency) return;
+    Module.addRunDependency('duke-net-grp');
+    var done = function () { try { Module.removeRunDependency('duke-net-grp'); } catch (e) {} };
+    try {
+      var req = indexedDB.open('eduke32-net', 1);
+      req.onerror = done;
+      req.onsuccess = function () {
+        var db = req.result;
+        try {
+          var g = db.transaction('grps', 'readonly').objectStore('grps').get(choice.crc >>> 0);
+          g.onsuccess = function () {
+            try {
+              var rec = g.result;
+              if (rec && rec.bytes && rec.filename) {
+                Module.FS.writeFile('/' + rec.filename, rec.bytes);
+                Module.arguments.push('-gamegrp', rec.filename);
+              }
+            } catch (e) {}
+            try { db.close(); } catch (e) {}
+            done();
+          };
+          g.onerror = function () { try { db.close(); } catch (e) {} done(); };
+        } catch (e) { try { db.close(); } catch (e2) {} done(); }
+      };
+    } catch (e) { done(); }
+  }
+  // ---------------------------------------------------------------------------
+
   var Module = {
     canvas: (function(){ var c = document.getElementById('canvas');
       c.addEventListener('webglcontextlost', function(e){ alert('WebGL context lost.'); e.preventDefault(); }, false);
@@ -183,7 +229,9 @@
         Module.FS.writeFile('/eduke32.cfg',
           '[Screen Setup]\nScreenMode = 0\nScreenWidth = ' + b.w + '\nScreenHeight = ' + b.h + '\nScreenBPP = 8\n');
       } catch (e) {}
-    }]
+    },
+    // eduke32-net addition: apply a downloaded GRP choice before the engine runs.
+    applyNetGrpChoice]
   };
   window.onerror = function (msg) { errEl.textContent = String(msg); };
 
@@ -324,6 +372,10 @@
     syncControls();
   })();
 </script>
+<!-- eduke32-net addition: the WebRTC+Nostr multiplayer transport (window.DukeNet).
+     A deferred, self-contained ES module built by platform/emscripten esbuild;
+     independent of the wasm graph. Must be served beside eduke32.js. -->
+<script type="module" src="eduke32-net.js"></script>
 <script src="eduke32.js"></script>
 </body>
 </html>
