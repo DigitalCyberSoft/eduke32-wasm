@@ -88,7 +88,6 @@ DN.on({
   onStatus: (m) => log("status: " + m),
   onError: (m) => log("error: " + m, "r"),
   onRoster: (ps) => log("roster: " + ps.map((p) => p.name + (p.connected ? "*" : "")).join(", ")),
-  onChannelsReady: undefined,
   onJoined: (i) => log(`JOINED matchId=${i.matchId} myConnectIndex=${i.myConnectIndex}`, "g"),
   onGrpProgress: (f, label) => log(`${label}: ${(f * 100) | 0}%`),
   onLeft: () => log("left"),

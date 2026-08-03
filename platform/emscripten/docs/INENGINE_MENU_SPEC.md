@@ -23,8 +23,8 @@ the menu draws them as plain `MINIFONT`/`BIGFONT` text with no extra escaping.
 
 - **JS → C (data push).** On each `DukeNet` event, JS calls a small exported C setter
   with a JSON string; C parses once and caches a struct array it redraws from (Duke
-  menus redraw every frame, so do **not** re-parse per frame). JS wiring is ready as
-  `DukeNet.bindInEngineMenu(Module)` (spec §4) and is a no-op until the C setters exist.
+  menus redraw every frame, so do **not** re-parse per frame). The JS wiring is the
+  ready-to-drop-in `DukeNet.on({...})` snippet in §4 (enable once the C setters exist).
 - **C → JS (actions).** Menu selections call `window.DukeNet` methods via
   `emscripten_run_script` / a `ccall` bridge (spec §3).
 
@@ -64,9 +64,9 @@ export. `DukeNet.getMyConnectIndex()` returns the local slot after joining.
 
 ## 4. JS wiring (ready to enable at reconciliation)
 
-Once the C setters above are exported, this single call (add to `duke-net.ts`, or run
-from the boot glue) forwards every `DukeNet` event into the menu — guarded so it is a
-no-op until the C side exists:
+Once the C setters above are exported, this `DukeNet.on({...})` registration (add to the
+boot glue or `duke-net.ts`) forwards every `DukeNet` event into the menu. All the JS
+methods it references already exist; only the C `NetMenu_*` targets are pending:
 
 ```ts
 function rowForMenu(r) {
