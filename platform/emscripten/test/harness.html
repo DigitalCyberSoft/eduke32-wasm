@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<!--
+  STANDALONE 2-peer transport harness (no C engine, no netcode required).
+
+  Verifies, over the DEFAULT PUBLIC NOSTR RELAYS, the whole wire path this branch
+  owns: Nostr signaling -> WebRTC (3 data channels) -> the GRP-gated join handshake
+  -> the seam send/receive queue. It drives window.DukeNet exactly as the eventual
+  in-engine menu will.
+
+  HOW TO RUN (two browser tabs / two machines):
+    1. From platform/emscripten:  npm run build:net   (produces ../eduke32-net.js)
+    2. Serve this folder over http, e.g.:  npx http-server .. -p 8080
+    3. Open  http://localhost:8080/test/harness.html  in TWO tabs.
+    4. Tab A: click "Host".  Copy the invite code it prints.
+    5. Tab B: paste the code, click "Join".
+    6. Both tabs should reach "channels ready" then "JOINED"; then use
+       "Broadcast test frame" on the host and "Drain (net_poll)" on the guest to
+       see the byte round-trip through the seam.
+
+  Both peers advertise the SAME synthetic GRP fingerprint so the GRP gate passes
+  without any real GRP loaded. TURN can be injected with ?turn=<base64 JSON>; a
+  private relay with ?relays=ws://host:port .
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>DukeNet transport harness</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 20px; background:#111; color:#ddd; }
+  button { font: inherit; padding:6px 12px; margin:3px; background:#222; color:#eee; border:1px solid #444; border-radius:6px; cursor:pointer; }
+  button:hover { background:#2c2c2c; }
+  input, textarea { font: inherit; background:#0c0c0c; color:#eee; border:1px solid #444; border-radius:6px; padding:6px; }
+  #code { width: 520px; }
+  .panel { border:1px solid #333; border-radius:10px; padding:14px; margin-bottom:14px; }
+  #log { white-space: pre-wrap; background:#0a0a0a; border:1px solid #333; border-radius:8px; padding:10px; height:340px; overflow:auto; font-family: ui-monospace, monospace; font-size:12px; }
+  .k { color:#f2c400; } .g { color:#9effa0; } .r { color:#ff7a5c; }
+</style>
+</head>
+<body>
+<h2>DukeNet transport harness <span class="k">(no engine)</span></h2>
+
+<div class="panel">
+  <b>Identity / GRP</b><br />
+  Name <input id="name" value="Duke" size="12" />
+  <button id="btnHostPub">Host (public)</button>
+  <button id="btnHost">Host (private)</button>
+  <span id="did" style="color:#777"></span>
+</div>
+
+<div class="panel">
+  <b>Join</b><br />
+  <input id="code" placeholder="paste invite code or URL" />
+  <button id="btnJoin">Join</button>
+  <button id="btnList">List public matches</button>
+</div>
+
+<div class="panel">
+  <b>Seam round-trip</b> (after JOINED)<br />
+  <button id="btnBroadcast">Broadcast test frame (host → REL)</button>
+  <button id="btnDrain">Drain (net_poll) → show queued frames</button>
+  <button id="btnLeave">Leave</button>
+</div>
+
+<div id="log"></div>
+
+<script type="module">
+import "../eduke32-net.js"; // sets window.DukeNet
+const DN = window.DukeNet;
+const logEl = document.getElementById("log");
+const log = (msg, cls) => {
+  const t = new Date().toISOString().slice(11, 23);
+  logEl.innerHTML += `<span style="color:#666">${t}</span> ` + (cls ? `<span class="${cls}">${msg}</span>` : msg) + "\n";
+  logEl.scrollTop = logEl.scrollHeight;
+};
+
+document.getElementById("did").textContent = "device " + (window.DUKE_DEVICE_ID || "?");
+
+// Both peers advertise the SAME synthetic shareware fingerprint so the GRP gate
+// passes with no real GRP loaded. (crc = shareware 1.3D so classification is
+// 'shareware'; sha/size are placeholders — identical on both peers is all the gate
+// needs.)
+async function primeGrp() {
+  await DN.setLocalGrp([{ name: "DUKE.GRP", crc: 0x983ad923 >>> 0, sha256: "harness-synthetic-sha", size: 11035779 }]);
+  log("local GRP fingerprint set (synthetic shareware)", "g");
+}
+
+DN.on({
+  onStatus: (m) => log("status: " + m),
+  onError: (m) => log("error: " + m, "r"),
+  onRoster: (ps) => log("roster: " + ps.map((p) => p.name + (p.connected ? "*" : "")).join(", ")),
+  onChannelsReady: undefined,
+  onJoined: (i) => log(`JOINED matchId=${i.matchId} myConnectIndex=${i.myConnectIndex}`, "g"),
+  onGrpProgress: (f, label) => log(`${label}: ${(f * 100) | 0}%`),
+  onLeft: () => log("left"),
+});
+
+document.getElementById("btnHost").onclick = async () => {
+  await primeGrp();
+  const name = document.getElementById("name").value;
+  DN.setPlayerName(name);
+  const r = await DN.host({ name: name + "'s game", isPublic: false, maxPlayers: 4 });
+  log("HOST private. invite code:", "k");
+  log(r.inviteCode, "k");
+};
+document.getElementById("btnHostPub").onclick = async () => {
+  await primeGrp();
+  const name = document.getElementById("name").value;
+  DN.setPlayerName(name);
+  const r = await DN.host({ name: name + "'s game", isPublic: true, maxPlayers: 4 });
+  log("HOST public. invite code:", "k");
+  log(r.inviteCode, "k");
+};
+document.getElementById("btnJoin").onclick = async () => {
+  await primeGrp();
+  DN.setPlayerName(document.getElementById("name").value);
+  const code = document.getElementById("code").value.trim();
+  log("joining…");
+  await DN.join(code);
+};
+document.getElementById("btnList").onclick = async () => {
+  await primeGrp();
+  log("querying public lobby…");
+  const rows = await DN.listMatches();
+  if (!rows.length) log("(no public matches)");
+  rows.forEach((r) =>
+    log(`  ${r.name} — players ${r.players}/${r.maxPlayers} — ${r.haveGrp ? "HAVE GRP" : r.needsPaidGrp ? "needs PAID GRP" : "downloadable"} — ping ${r.ping == null ? "?" : Math.round(r.ping) + "ms"}`),
+  );
+};
+
+// Simulate the netcode: broadcast a raw frame through the seam (C net_broadcast),
+// and drain the inbound queue (C net_poll) on the other side.
+let seq = 0;
+document.getElementById("btnBroadcast").onclick = () => {
+  const payload = new TextEncoder().encode("hello-" + seq++);
+  DN._seamBroadcast(1 /*NET_CHAN_REL*/, 1, payload);
+  log("net_broadcast REL " + payload.length + " bytes", "k");
+};
+document.getElementById("btnDrain").onclick = () => {
+  const items = DN._seamDrain();
+  if (!items.length) { log("net_poll: (queue empty)"); return; }
+  for (const it of items) {
+    if (it.kind === 1) log(`net_poll: PEER_EVENT peer=${it.peer} event=${it.event}`, "g");
+    else log(`net_poll: FRAME peer=${it.peer} ch=${it.channel} "${new TextDecoder().decode(it.data)}"`, "g");
+  }
+};
+document.getElementById("btnLeave").onclick = () => DN.leave();
+
+log("harness ready. Host in one tab, Join in another.", "g");
+</script>
+</body>
+</html>
