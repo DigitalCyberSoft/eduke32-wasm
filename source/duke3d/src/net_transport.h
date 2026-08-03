@@ -83,6 +83,13 @@ void Net_ReceiveFrame(int peerToken, int channel, const uint8_t *data, int len);
 // Deliver a peer connect (NET_PEER_UP) / disconnect (NET_PEER_DOWN).
 void Net_PeerEvent(int peerToken, int eventType);
 
+// [additive] Tell the netcode its own slot (== connectindex) after the join
+// handshake. The transport is the sole slot authority (peerToken==connectindex);
+// the netcode never assigns connectindex itself. The host is slot 0; each guest
+// calls this once with the host-assigned slot. netduke32's oldnet does not
+// negotiate connectindex in its own protocol, so this is where it is set.
+void Net_SetLocalIndex(int slot);
+
 #ifdef __cplusplus
 }
 #endif

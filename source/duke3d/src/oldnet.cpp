@@ -926,6 +926,57 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
     } while (0);
 }
 
+// ---------------------------------------------------------------------------
+// Connection handshake (transport -> netcode).
+//
+// The transport is a STAR listen-server with host-authoritative slot
+// assignment (host == slot 0; peerToken == connectindex). These entry points
+// feed its decisions into the classic connectindex/connecthead/connectpoint2/
+// numplayers state the lockstep protocol runs on. netduke32's oldnet does not
+// negotiate connectindex itself (classic mmulti set it); the transport does.
+// ---------------------------------------------------------------------------
+static void Net_RebuildConnectChain(void)
+{
+    // Rebuild the connect chain (terminated by -1) and player count from the
+    // connected flags. connecthead is the lowest connected slot (host hub).
+    int count = 0, prev = -1, head = -1;
+
+    for (int i = 0; i < MAXPLAYERS; i++)
+    {
+        if (!g_player[i].connected)
+            continue;
+
+        ++count;
+        if (head < 0) head = i;
+        if (prev >= 0) connectpoint2[prev] = i;
+        prev = i;
+    }
+
+    if (prev >= 0) connectpoint2[prev] = -1;
+
+    connecthead = (head < 0) ? 0 : head;
+    numplayers  = max(count, 1);
+}
+
+void Net_PeerEvent(int peerToken, int eventType)
+{
+    if ((unsigned)peerToken >= MAXPLAYERS)
+        return;
+
+    g_player[peerToken].connected = (eventType == NET_PEER_UP) ? 1 : 0;
+    Net_RebuildConnectChain();
+}
+
+void Net_SetLocalIndex(int slot)
+{
+    if ((unsigned)slot >= MAXPLAYERS)
+        return;
+
+    myconnectindex = screenpeek = slot;
+    g_player[slot].connected    = 1;
+    Net_RebuildConnectChain();
+}
+
 void Net_SendQuit(void)
 {
     if (netQuitSend)
