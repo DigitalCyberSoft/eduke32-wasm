@@ -11,6 +11,8 @@ obj/
 # Emscripten outputs
 /eduke32.js
 /eduke32.wasm
+/eduke32.html
+/boot-test.html
 /*.data
 /*.data.js
 
@@ -93,3 +95,6 @@ project.xcworkspace/
 .DS_Store
 ._*
 /source/voidwrap/sdk/
+
+# Local test harness pages
+/boot-menu.html

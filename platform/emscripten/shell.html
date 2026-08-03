@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EDuke32</title>
+<style>
+html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+#canvas { display: block; width: 100vw; height: 100vh; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<script>
+var Module = {
+  canvas: document.getElementById('canvas'),
+  print: function (t) { console.log(t); },
+  printErr: function (t) { console.error(t); },
+};
+</script>
+<!-- The SCRIPT substitution includes its own <script> tags in this
+     Emscripten version; do not wrap it. -->
+{{{ SCRIPT }}}
+</body>
+</html>

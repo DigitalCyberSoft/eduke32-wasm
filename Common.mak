@@ -77,7 +77,13 @@ ifeq ($(PLATFORM),WII)
     EXESUFFIX := .elf
 endif
 ifeq ($(PLATFORM),EMSCRIPTEN)
-    EXESUFFIX := .js
+    ifneq (0,$(EM_SINGLE_FILE))
+        # Self-contained HTML (wasm + game data embedded): runs from file://
+        # with no server and no fetch.
+        EXESUFFIX := .html
+    else
+        EXESUFFIX := .js
+    endif
 endif
 ifeq ($(PLATFORM),WINDOWS)
     EXESUFFIX := .exe
@@ -422,6 +428,19 @@ else ifeq ($(PLATFORM),EMSCRIPTEN)
     override HAVE_FLAC := 0
     override STARTUP_WINDOW := 0
     override SDL_STATIC := 0
+    # Use Emscripten's default allocator (dlmalloc), not mimalloc. mimalloc's
+    # OS layer sits on emmalloc, and layering it under ASYNCIFY (which mallocs
+    # a stack-save buffer on every emscripten_sleep yield) corrupts the heap
+    # nondeterministically -> OOB in emmalloc and, downstream, zeroed structs.
+    # A single standard allocator is robust here.
+    override USE_MIMALLOC := 0
+    # Single-file HTML by default (wasm + game data embedded; runs from
+    # file:// with no server). Set EM_SINGLE_FILE=0 for the multi-file
+    # dev build. GAME_DATA is the GRP embedded at link time; the bundled
+    # shareware GRP is licensed for redistribution (assets/shareware/),
+    # the registered/Atomic GRP is not and must be supplied via GAME_DATA.
+    EM_SINGLE_FILE ?= 1
+    GAME_DATA ?= assets/shareware/DUKE3D.GRP
 endif
 
 ifneq (i386,$(strip $(IMPLICIT_ARCH)))
@@ -969,9 +988,24 @@ ifeq ($(RENDERTYPE),SDL)
         # SDL2 comes from the Emscripten port, not the system.
         override SDLCONFIG :=
         COMPILERFLAGS += -sUSE_SDL=2
-        # -sMALLOC=emmalloc: mimalloc's Emscripten prim (prim/emscripten/prim.c)
-        # uses emmalloc_memalign/emmalloc_free as its OS-memory backend.
-        LINKERFLAGS += -sUSE_SDL=2 -sALLOW_MEMORY_GROWTH=1 -sASYNCIFY -sEXIT_RUNTIME=1 -sMALLOC=emmalloc
+        LINKERFLAGS += -sUSE_SDL=2 -sALLOW_MEMORY_GROWTH=1 -sASYNCIFY -sEXIT_RUNTIME=1
+        ifneq (0,$(EM_SINGLE_FILE))
+            LINKERFLAGS += -sSINGLE_FILE=1 --shell-file platform/emscripten/shell.html
+            ifneq ($(strip $(GAME_DATA)),)
+                ifeq ($(wildcard $(GAME_DATA)),)
+                    $(warning GAME_DATA '$(GAME_DATA)' not found; build will boot without game data)
+                endif
+                # --embed-file (not --preload-file): SINGLE_FILE only embeds
+                # the wasm, so preloaded data would remain an external .data
+                # file. Embedding bakes the GRP into the wasm binary, making
+                # the HTML fully self-contained for file:// use.
+                LINKERFLAGS += --embed-file "$(GAME_DATA)@/DUKE3D.GRP"
+            endif
+        else
+            ifneq ($(strip $(GAME_DATA)),)
+                LINKERFLAGS += --preload-file "$(GAME_DATA)@/DUKE3D.GRP"
+            endif
+        endif
     endif
 
     ifneq ($(strip $(SDLCONFIG)),)

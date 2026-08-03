@@ -2888,6 +2888,17 @@ int32_t handleevents(void)
     startwin_idle(NULL);
 #endif
 
+#ifdef __EMSCRIPTEN__
+    // handleevents() is the engine's universal event pump: the main loop and
+    // every blocking wait loop (logo/intro holds, "press a key" waits, fades)
+    // spin on it. Under Emscripten SDL_PollEvent does not yield, so without a
+    // yield here those loops peg the main thread and the tab goes unresponsive
+    // (no repaint, no delivered input, no audio pump). Yield one browser task
+    // per pump. Requires -sASYNCIFY. totalclock is time-based so waits still
+    // advance; this only hands time back to the browser between polls.
+    emscripten_sleep(0);
+#endif
+
     return rv;
 }
 
