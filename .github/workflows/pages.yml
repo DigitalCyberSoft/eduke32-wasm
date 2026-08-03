@@ -1,0 +1,66 @@
+name: Deploy WebAssembly build to GitHub Pages
+
+on:
+  push:
+    branches: [wasm]
+    paths:
+      - 'source/**'
+      - 'Common.mak'
+      - 'GNUmakefile'
+      - 'platform/emscripten/**'
+      - 'assets/shareware/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+# Allow this workflow to publish a Pages deployment.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One concurrent deploy; let an in-progress run finish (don't cancel a live deploy).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.5
+          actions-cache-folder: emsdk-cache
+
+      - name: Verify toolchain
+        run: emcc --version
+
+      - name: Build (classic software renderer, multi-file)
+        run: make PLATFORM=EMSCRIPTEN EM_SINGLE_FILE=0 -j"$(nproc)"
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp eduke32.js eduke32.wasm eduke32.data _site/
+          cp platform/emscripten/index.html _site/index.html
+          ls -la _site
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

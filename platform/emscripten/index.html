@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<!--
+  GitHub Pages host page for the EDuke32 WebAssembly build (multi-file:
+  eduke32.js + eduke32.wasm + eduke32.data, all served beside this page).
+  Shows a resource loading screen while the wasm + game data download, then
+  hands off to the engine. Serve over HTTP(S); Web Audio unlocks on first click.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Duke Nukem 3D (WebAssembly)</title>
+<style>
+  :root { --duke-yellow:#f2c400; --duke-red:#c0281c; }
+  html, body { margin:0; height:100%; background:#000; overflow:hidden; font-family:"Trebuchet MS",Verdana,sans-serif; }
+  #canvas { display:block; width:100vw; height:100vh; image-rendering:pixelated; outline:none; background:#000; }
+  #loader {
+    position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    background:radial-gradient(120% 120% at 50% 30%, #241a12 0%, #0a0805 70%, #000 100%);
+    color:#d8ccbf; z-index:10; transition:opacity .6s ease; text-align:center; padding:24px;
+  }
+  #loader.hidden { opacity:0; pointer-events:none; }
+  #title { font-weight:900; letter-spacing:.06em; line-height:.92; text-transform:uppercase; }
+  #title .a { color:var(--duke-yellow); font-size:clamp(34px,7vw,72px); text-shadow:0 2px 0 #7a5b00, 0 0 24px rgba(242,196,0,.25); }
+  #title .b { color:var(--duke-yellow); font-size:clamp(20px,4vw,40px); }
+  #bar { width:min(420px,72vw); height:16px; margin-top:34px; border:2px solid #4a3a22; border-radius:9px;
+         background:#120d08; box-shadow:inset 0 0 8px #000; overflow:hidden; }
+  #fill { height:100%; width:0%; border-radius:7px; transition:width .25s ease;
+          background:linear-gradient(90deg,#7a1b12,var(--duke-red) 60%,#ff5a3c); }
+  #status { margin-top:14px; font-size:14px; color:#a89a88; min-height:1.2em; letter-spacing:.03em; }
+  #hint { margin-top:26px; font-size:12px; color:#6f6456; }
+  #err { color:#ff7a5c; max-width:640px; font-size:13px; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
+<div id="loader">
+  <div id="title"><div class="a">Duke Nukem</div><div class="b">3D</div></div>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="status">Loading&hellip;</div>
+  <div id="hint">Click to capture the mouse &middot; Esc to release</div>
+  <div id="err"></div>
+</div>
+<script>
+  var loaderEl = document.getElementById('loader'),
+      fillEl   = document.getElementById('fill'),
+      statusEl = document.getElementById('status'),
+      errEl    = document.getElementById('err'),
+      started  = false, hidden = false;
+
+  function setPct(p){ fillEl.style.width = Math.max(0, Math.min(100, p)) + '%'; }
+  function hideLoader(){ if (hidden) return; hidden = true; loaderEl.classList.add('hidden');
+                         setTimeout(function(){ loaderEl.style.display='none'; }, 700); }
+
+  var Module = {
+    canvas: (function(){ var c = document.getElementById('canvas');
+      c.addEventListener('webglcontextlost', function(e){ alert('WebGL context lost.'); e.preventDefault(); }, false);
+      return c; })(),
+    arguments: ['-nosetup'],
+    // Emscripten calls setStatus for wasm/data download + init. "(x/y)" carries bytes.
+    setStatus: function (text) {
+      if (!text) { setPct(100); statusEl.textContent = 'Starting…'; if (started) hideLoader(); return; }
+      var m = text.match(/([\d.]+)\s*\/\s*([\d.]+)/);
+      if (m) { setPct(100 * parseFloat(m[1]) / parseFloat(m[2])); statusEl.textContent = 'Downloading game data…'; }
+      else   { statusEl.textContent = text; }
+    },
+    monitorRunDependencies: function (left) {
+      if (left === 0) { setPct(100); statusEl.textContent = 'Starting…'; }
+    },
+    onRuntimeInitialized: function () { started = true; setTimeout(hideLoader, 400); },
+    printErr: function (t) { console.error(t); },
+    preRun: [function () {
+      // Render windowed at the window size; the engine re-renders on resize.
+      try {
+        var w = (window.innerWidth  || 1280) & ~1, h = (window.innerHeight || 720) & ~1;
+        Module.FS.writeFile('/eduke32.cfg',
+          '[Screen Setup]\nScreenMode = 0\nScreenWidth = ' + w + '\nScreenHeight = ' + h + '\nScreenBPP = 8\n');
+      } catch (e) {}
+    }]
+  };
+  window.onerror = function (msg) { errEl.textContent = String(msg); };
+
+  // Web Audio starts suspended until a user gesture; unlock on first interaction.
+  function unlockAudio() {
+    var sdl = Module.SDL2, ctx = sdl && sdl.audioContext;
+    if (!ctx) return;
+    if (ctx.resume) ctx.resume();
+    var node = sdl.audio && sdl.audio.scriptProcessorNode;
+    if (node && !unlockAudio.done) { unlockAudio.done = true; try { node.disconnect(); node.connect(ctx.destination); } catch (e) {} }
+  }
+  ['pointerdown', 'keydown', 'touchend'].forEach(function (t) { window.addEventListener(t, unlockAudio); });
+  // Mouselook needs relative motion (Pointer Lock); grab it on click.
+  document.getElementById('canvas').addEventListener('click', function () {
+    if (document.pointerLockElement !== this) this.requestPointerLock();
+  });
+</script>
+<script src="eduke32.js"></script>
+</body>
+</html>

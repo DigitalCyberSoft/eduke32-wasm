@@ -1759,6 +1759,13 @@ int setvideomode_sdlcommonpost(int32_t x, int32_t y, int32_t c, int32_t fs, int3
         }
     }
 
+    // Emscripten's SDL2 reports the browser display refresh_rate as 0, which
+    // makes calcFrameDelay() return a zero frame delay; engineFPSLimit()'s inner
+    // loop then spins forever (adds 0 each pass, condition always true) and the
+    // page hangs. Fall back to the refreshfreq default when none is reported.
+    if (refreshfreq <= 0)
+        refreshfreq = 59.0;
+
     static double lastrefreshfreq;
 
     if (refreshfreq != lastrefreshfreq)
@@ -2198,7 +2205,7 @@ void videoShowFrame(int32_t w)
     // Emscripten: yield to the browser so the presented frame is painted and
     // queued input is processed. The engine loop never blocks on its own, so
     // without this yield the tab would freeze. Requires -sASYNCIFY.
-    emscripten_sleep(0);
+    emscripten_sleep(1);
 #endif
 #else
     SDL_Flip(sdl_surface);
@@ -2896,7 +2903,7 @@ int32_t handleevents(void)
     // (no repaint, no delivered input, no audio pump). Yield one browser task
     // per pump. Requires -sASYNCIFY. totalclock is time-based so waits still
     // advance; this only hands time back to the browser between polls.
-    emscripten_sleep(0);
+    emscripten_sleep(1);
 #endif
 
     return rv;

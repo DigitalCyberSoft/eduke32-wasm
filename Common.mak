@@ -988,7 +988,24 @@ ifeq ($(RENDERTYPE),SDL)
         # SDL2 comes from the Emscripten port, not the system.
         override SDLCONFIG :=
         COMPILERFLAGS += -sUSE_SDL=2
+        # The Build engine relies on signed-integer overflow wrapping (fixed-point
+        # math, angle/coordinate wrapping, krand). That is UB; the native x86 build
+        # gets away with it, but the LLVM wasm backend at -O2 miscompiles it into
+        # nondeterministic memory corruption (garbage indices -> OOB writes -> hangs).
+        # -fwrapv makes signed overflow defined (two's-complement wrap).
+        COMPILERFLAGS += -fwrapv
         LINKERFLAGS += -sUSE_SDL=2 -sALLOW_MEMORY_GROWTH=1 -sASYNCIFY -sEXIT_RUNTIME=1
+        # EDuke32's software renderer has deep call chains with large stack-allocated
+        # locals; the Emscripten default 64KB stack is too small. Give it a real
+        # stack. C_ParseCommand recurses per CON nesting level; keep it off the
+        # Asyncify stack so its deep recursion is not instrumented.
+        LINKERFLAGS += -sSTACK_SIZE=16MB -sINITIAL_MEMORY=256MB -sASYNCIFY_REMOVE='C_ParseCommand(bool)'
+        # ASYNCIFY spills the live locals of every function on the C stack at each
+        # emscripten_sleep into a fixed buffer. EDuke32's deep call chains reach the
+        # sleep in handleevents()/videoShowFrame(), so the default buffer overflows
+        # and silently corrupts memory (the engine froze at the title screen). Size
+        # it for the deepest gameplay path.
+        LINKERFLAGS += -sASYNCIFY_STACK_SIZE=16777216
         ifneq (0,$(EM_SINGLE_FILE))
             LINKERFLAGS += -sSINGLE_FILE=1 --shell-file platform/emscripten/shell.html
             ifneq ($(strip $(GAME_DATA)),)
