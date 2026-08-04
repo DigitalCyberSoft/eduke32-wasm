@@ -9,7 +9,9 @@
     "watch:net": "node esbuild.config.mjs --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:net": "node test/net/run.mjs",
+    "relay": "node test/net/nip01-relay.mjs"
   },
   "dependencies": {
     "jsqr": "^1.4.0",
@@ -19,7 +21,10 @@
   "devDependencies": {
     "@types/node": "^22.8.0",
     "esbuild": "^0.24.0",
+    "tsx": "^4.23.5",
     "typescript": "^5.6.3",
-    "vitest": "^2.1.4"
+    "vitest": "^2.1.4",
+    "werift": "^0.24.3",
+    "ws": "^8.21.2"
   }
 }

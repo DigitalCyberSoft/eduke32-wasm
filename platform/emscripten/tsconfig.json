@@ -15,5 +15,7 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["net", "test"]
+  "include": ["net", "test"],
+  "//": "test/net is a runtime-only integration harness (tsx): it uses .ts-extension dynamic imports and werift polyfills that the strict tsc build should not typecheck.",
+  "exclude": ["test/net"]
 }
