@@ -6350,6 +6350,9 @@ void G_UpdatePlayerFromMenu(void)
 
 void G_BackToMenu(void)
 {
+#if defined(NETDUKE32) && defined(__EMSCRIPTEN__)
+    NetMenu_SetInGame(0); // match ended / returned to menu -> reopen the public advert + accept gate
+#endif
     boardfilename[0] = 0;
     if (ud.recstat == 1) G_CloseDemoWrite();
     ud.warp_on = 0;

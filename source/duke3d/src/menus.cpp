@@ -38,6 +38,15 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "sbar.h"
 #include "joystick.h"
 
+// In-engine WebRTC/Nostr multiplayer menu (eduke32-wasm). Everything it adds is gated
+// on NETMENU_WASM so the flag-OFF deploy build stays byte-identical; the guard is only
+// ever defined for the Emscripten NetDuke32 build.
+#if defined(NETDUKE32) && defined(__EMSCRIPTEN__)
+# define NETMENU_WASM 1
+# include <emscripten.h>
+# include "sjson.h"
+#endif
+
 #ifndef __ANDROID__
 droidinput_t droidinput;
 #endif
@@ -370,11 +379,17 @@ MAKE_MENU_TOP_ENTRYLINK( "End Game", MEF_MainMenu, MAIN_QUITTOTITLE, MENU_QUITTO
 MAKE_MENU_TOP_ENTRYLINK( "Quit", MEF_MainMenu, MAIN_QUIT, MENU_QUIT );
 #ifndef EDUKE32_RETAIL_MENU
 MAKE_MENU_TOP_ENTRYLINK( "Quit Game", MEF_MainMenu, MAIN_QUITGAME, MENU_QUIT );
+#ifdef NETMENU_WASM
+MAKE_MENU_TOP_ENTRYLINK( "Multiplayer", MEF_MainMenu, MAIN_MULTIPLAYER, MENU_NETWORK );
+#endif
 #endif
 
 static MenuEntry_t *MEL_MAIN[] = {
     &ME_MAIN_NEWGAME,
     &ME_MAIN_LOADGAME,
+#ifdef NETMENU_WASM
+    &ME_MAIN_MULTIPLAYER,
+#endif
     &ME_MAIN_OPTIONS,
     &ME_MAIN_HELP,
 #ifndef EDUKE32_RETAIL_MENU
@@ -1504,6 +1519,177 @@ static MenuEntry_t *MEL_NETJOIN[] = {
     &ME_NETJOIN_CONNECT,
 };
 
+#ifdef NETMENU_WASM
+// ===========================================================================
+//  In-engine WebRTC/Nostr multiplayer menu (eduke32-wasm) — a thin renderer over
+//  window.DukeNet. JS pushes lobby/roster/status/progress through the NetMenu_*
+//  setters below (parsed ONCE into these cached structs, redrawn every frame);
+//  menu actions call back into window.DukeNet / window.NetMenu via run_script.
+// ===========================================================================
+
+#define NET_BROWSE_MAX 48
+#define NET_ROSTER_MAX 16
+#define NET_GRP_MAX    16
+#define NET_NAME_MAX   32
+
+typedef struct { char name[NET_NAME_MAX]; int players, maxPlayers, ping; int grpState; } netlobbyrow_t; // grpState: 0 have, 1 download, 2 paid
+typedef struct { char name[NET_NAME_MAX]; int connected; } netrosterrow_t;
+typedef struct { char id[40]; char name[48]; int size, shareware, present, isDefault; } netgrprow_t;
+
+static netlobbyrow_t s_netLobby[NET_BROWSE_MAX];   static int s_netLobbyCount;
+static netrosterrow_t s_netRoster[NET_ROSTER_MAX]; static int s_netRosterCount;
+static netgrprow_t s_netGrps[NET_GRP_MAX];         static int s_netGrpCount;
+
+static char s_netStatus[96];        static int s_netStatusIsError;
+static char s_netProgressLabel[48]; static int s_netProgressPct = -1, s_netProgressActive;
+static char s_netGrpLabels[128];    // advertised GRP set, pulled for the HOST CONFIG screen
+
+// Host/join config, bound to the menu widgets below.
+static char s_netMatchName[NET_NAME_MAX] = "Duke Match";
+static char s_netJoinCode[80];
+static int32_t s_netMaxPlayers = 8;
+static int32_t s_netShareGrp = 1;       // On => let others download our shareware GRP (default)
+static int32_t s_netPingIdx  = 0;       // index into the ping presets
+static int s_netHostPublic = 1;         // set by the root HOST PUBLIC/PRIVATE choice
+static int s_netMyConnectIndex = 0;     // 0 = host; guest learns its slot via NetMenu_OnJoined
+
+// --- untrusted-string hardening -------------------------------------------
+// Clamp a peer string to printable ASCII, length-capped. The legacy menu font path
+// does c-'!'+tile on raw bytes (a crash vector on control bytes); peer strings arrive
+// sanitized by sanitize.ts, but we defend the boundary anyway.
+static void netmenu_clamp(char *dst, int dstsize, const char *src)
+{
+    int j = 0;
+    if (dstsize <= 0) return;
+    if (src) for (int i = 0; src[i] && j < dstsize-1; ++i)
+    {
+        unsigned char c = (unsigned char)src[i];
+        if (c >= 0x20 && c < 0x7f) dst[j++] = (char)c;
+    }
+    dst[j] = 0;
+}
+// Emit src as a single-quoted JS string literal (quotes included), clamped to printable
+// ASCII and backslash-escaping ' and \, so it is safe to splice into a run_script eval.
+static void netmenu_js_quote(char *dst, int dstsize, const char *src)
+{
+    int j = 0;
+    if (dstsize < 3) { if (dstsize > 0) dst[0] = 0; return; }
+    dst[j++] = '\'';
+    if (src) for (int i = 0; src[i] && j < dstsize-2; ++i)
+    {
+        unsigned char c = (unsigned char)src[i];
+        if (c < 0x20 || c >= 0x7f) continue;
+        if (c == '\'' || c == '\\') { if (j >= dstsize-3) break; dst[j++] = '\\'; }
+        dst[j++] = (char)c;
+    }
+    dst[j++] = '\'';
+    dst[j] = 0;
+}
+
+// --- action bridge (C -> window.DukeNet / window.NetMenu) ------------------
+static void netmenu_host(void)
+{
+    char name[80], player[80], script[256];
+    netmenu_js_quote(name, sizeof name, s_netMatchName);
+    netmenu_js_quote(player, sizeof player, szPlayerName);
+    Bsnprintf(script, sizeof script, "window.NetMenu&&window.NetMenu.host(%d,%s,%d,%s)",
+              s_netHostPublic ? 1 : 0, name, (int)s_netMaxPlayers, player);
+    emscripten_run_script(script);
+}
+static void netmenu_join_row(int idx)
+{
+    char player[80], script[160];
+    netmenu_js_quote(player, sizeof player, szPlayerName);
+    Bsnprintf(script, sizeof script, "window.NetMenu&&window.NetMenu.joinRow(%d,%s)", idx, player);
+    emscripten_run_script(script);
+}
+static void netmenu_join_code(void)
+{
+    char code[176], player[80], script[320];
+    netmenu_js_quote(code, sizeof code, s_netJoinCode);
+    netmenu_js_quote(player, sizeof player, szPlayerName);
+    Bsnprintf(script, sizeof script, "window.NetMenu&&window.NetMenu.joinCode(%s,%s)", code, player);
+    emscripten_run_script(script);
+}
+static void netmenu_set_ping(int idx)
+{ char s[96]; Bsnprintf(s, sizeof s, "window.NetMenu&&window.NetMenu.setPing(%d)", idx); emscripten_run_script(s); }
+static void netmenu_set_share(int shareOn)
+{ char s[96]; Bsnprintf(s, sizeof s, "window.NetMenu&&window.NetMenu.setAllowDl(%d)", shareOn ? 0 : 1); emscripten_run_script(s); }
+static void netmenu_browse(int start)
+{ emscripten_run_script(start ? "window.NetMenu&&window.NetMenu.startBrowse()" : "window.NetMenu&&window.NetMenu.stopBrowse()"); }
+static void netmenu_leave(void)
+{ emscripten_run_script("window.NetMenu&&window.NetMenu.leave()"); }
+static void netmenu_pull_grp_labels(void)
+{
+    const char *s = emscripten_run_script_string(
+        "(function(){try{var g=window.DukeNet&&DukeNet.getLocalGrp();return g&&g.labels?g.labels.join(', '):'';}catch(e){return '';}})()");
+    netmenu_clamp(s_netGrpLabels, sizeof s_netGrpLabels, s);
+}
+
+// Engine lifecycle -> JS advert/accept-gate (called from network.cpp / game.cpp too).
+extern "C" void NetMenu_SetInGame(int in_game)
+{
+    emscripten_run_script(in_game ? "window.DukeNet&&window.DukeNet.setInGame(true)"
+                                  : "window.DukeNet&&window.DukeNet.setInGame(false)");
+}
+
+// --- screen layout (framework-native: same fonts/macros/formats as neighbours) ---
+static MenuMenuFormat_t MMF_NetBrowse = { { MENU_MARGIN_REGULAR<<16, 52<<16, }, 176<<16 }; // positive cutoff -> windowed+scrollbar like LOAD/SAVE
+static MenuEntryFormat_t MEF_NetBrowseRow = { 2<<16, 0, 250<<16 };
+static MenuEntryFormat_t MEF_NetLobby = { 4<<16, 0, 168<<16 };
+
+// MULTIPLAYER root (repurposes MENU_NETWORK under the flag)
+static MenuLink_t MEO_NET_ROOT_HOSTPUB  = { MENU_NET_HOSTCFG,  MA_Advance, };
+static MenuEntry_t ME_NET_ROOT_HOSTPUB  = MAKE_MENUENTRY( "Host Public Game",   &MF_Redfont, &MEF_CenterMenu, &MEO_NET_ROOT_HOSTPUB,  Link );
+static MenuLink_t MEO_NET_ROOT_HOSTPRIV = { MENU_NET_HOSTCFG,  MA_Advance, };
+static MenuEntry_t ME_NET_ROOT_HOSTPRIV = MAKE_MENUENTRY( "Host Private Game",  &MF_Redfont, &MEF_CenterMenu, &MEO_NET_ROOT_HOSTPRIV, Link );
+static MenuLink_t MEO_NET_ROOT_BROWSE   = { MENU_NET_BROWSE,   MA_Advance, };
+static MenuEntry_t ME_NET_ROOT_BROWSE   = MAKE_MENUENTRY( "Browse Public Games",&MF_Redfont, &MEF_CenterMenu, &MEO_NET_ROOT_BROWSE,   Link );
+static MenuLink_t MEO_NET_ROOT_JOIN     = { MENU_NET_JOINCODE, MA_Advance, };
+static MenuEntry_t ME_NET_ROOT_JOIN     = MAKE_MENUENTRY( "Join by Code",       &MF_Redfont, &MEF_CenterMenu, &MEO_NET_ROOT_JOIN,     Link );
+static MenuLink_t MEO_NET_ROOT_BACK     = { MENU_PREVIOUS,     MA_Return, };
+static MenuEntry_t ME_NET_ROOT_BACK     = MAKE_MENUENTRY( "Back",               &MF_Redfont, &MEF_CenterMenu, &MEO_NET_ROOT_BACK,     Link );
+static MenuEntry_t *MEL_NETWORK_ND[] = {
+    &ME_NET_ROOT_HOSTPUB, &ME_NET_ROOT_HOSTPRIV, &ME_NET_ROOT_BROWSE, &ME_NET_ROOT_JOIN, &ME_NET_ROOT_BACK,
+};
+
+// HOST CONFIG
+static MenuString_t MEO_NET_CFG_NAME = MAKE_MENUSTRING( s_netMatchName, &MF_Bluefont, NET_NAME_MAX, 0 );
+static MenuEntry_t ME_NET_CFG_NAME = MAKE_MENUENTRY( "Name", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_NAME, String );
+static MenuRangeInt32_t MEO_NET_CFG_MAXPLAYERS = MAKE_MENURANGE( &s_netMaxPlayers, &MF_Bluefont, 2, 16, 0, 15, DisplayTypeInteger|EnforceIntervals );
+static MenuEntry_t ME_NET_CFG_MAXPLAYERS = MAKE_MENUENTRY( "Max Players", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_MAXPLAYERS, RangeInt32 );
+static MenuOption_t MEO_NET_CFG_SHARE = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_OffOn, &s_netShareGrp );
+static MenuEntry_t ME_NET_CFG_SHARE = MAKE_MENUENTRY( "GRP Sharing", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_SHARE, Option );
+static MenuLink_t MEO_NET_CFG_START = { MENU_NET_LOBBY, MA_Advance, };
+static MenuEntry_t ME_NET_CFG_START = MAKE_MENUENTRY( "Start", &MF_Redfont, &MEF_VideoSetup_Apply, &MEO_NET_CFG_START, Link );
+static MenuEntry_t *MEL_NET_HOSTCFG[] = {
+    &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_SHARE, &ME_NET_CFG_START,
+};
+
+// BROWSE PUBLIC GAMES — Max Ping control + a dynamic, scrollable match list
+static char const *MEOSN_NET_MAXPING[] = { "Any", "< 100 ms", "< 150 ms", "< 250 ms", "< 400 ms", };
+static MenuOptionSet_t MEOS_NET_MAXPING = MAKE_MENUOPTIONSET( MEOSN_NET_MAXPING, NULL, 0x2 );
+static MenuOption_t MEO_NET_MAXPING = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_NET_MAXPING, &s_netPingIdx );
+static MenuEntry_t ME_NET_MAXPING = MAKE_MENUENTRY( "Max Ping", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_MAXPING, Option );
+static MenuLink_t MEO_NET_BROWSE_ROW = { MENU_NULL, MA_None, }; // activation handled manually; no auto-advance
+static MenuEntry_t ME_NET_BROWSE_ROW_TEMPLATE = MAKE_MENUENTRY( NULL, &MF_Minifont, &MEF_NetBrowseRow, &MEO_NET_BROWSE_ROW, Link );
+static MenuEntry_t ME_NET_BROWSE_ROW[NET_BROWSE_MAX];
+static MenuEntry_t ME_NET_BROWSE_EMPTY = MAKE_MENUENTRY( "Searching for games...", &MF_Minifont, &MEF_NetBrowseRow, &MEO_NULL, Dummy );
+static MenuEntry_t *MEL_NET_BROWSE[1 + NET_BROWSE_MAX]; // [0]=Max Ping, [1..]=rows; built at runtime
+
+// JOIN BY CODE
+static MenuString_t MEO_NET_JOINCODE = MAKE_MENUSTRING( s_netJoinCode, &MF_Bluefont, (int)sizeof(s_netJoinCode), 0 );
+static MenuEntry_t ME_NET_JOINCODE = MAKE_MENUENTRY( "Code", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_JOINCODE, String );
+static MenuLink_t MEO_NET_JOINCODE_CONNECT = { MENU_NULL, MA_None, };
+static MenuEntry_t ME_NET_JOINCODE_CONNECT = MAKE_MENUENTRY( "Connect", &MF_Redfont, &MEF_VideoSetup_Apply, &MEO_NET_JOINCODE_CONNECT, Link );
+static MenuEntry_t *MEL_NET_JOINCODE[] = { &ME_NET_JOINCODE, &ME_NET_JOINCODE_CONNECT, };
+
+// LOBBY (host + guest). Reuses the NetDuke32-aware ME_NETHOST_LAUNCH for the host launch.
+static MenuLink_t MEO_NET_LOBBY_LEAVE = { MENU_NETWORK, MA_Return, };
+static MenuEntry_t ME_NET_LOBBY_LEAVE = MAKE_MENUENTRY( "Leave", &MF_Redfont, &MEF_NetLobby, &MEO_NET_LOBBY_LEAVE, Link );
+static MenuEntry_t *MEL_NET_LOBBY[] = { &ME_NETHOST_LAUNCH, &ME_NET_LOBBY_LEAVE, };
+#endif // NETMENU_WASM
+
 
 #define NoTitle NULL
 
@@ -1552,12 +1738,22 @@ static MenuMenu_t M_SAVE = MAKE_MENUMENU_CUSTOMSIZE( s_SaveGame, &MMF_LoadSave, 
 static MenuMenu_t M_SOUND = MAKE_MENUMENU( "Sound Setup", &MMF_BigOptions, MEL_SOUND );
 static MenuMenu_t M_SOUND_DEVSETUP = MAKE_MENUMENU( "Device Configuration", &MMF_BigOptions, MEL_SOUND_DEVSETUP );
 static MenuMenu_t M_SAVESETUP = MAKE_MENUMENU( "Save Setup", &MMF_BigOptions, MEL_SAVESETUP );
+#ifdef NETMENU_WASM
+static MenuMenu_t M_NETWORK = MAKE_MENUMENU( "Multiplayer", &MMF_Top_Joystick_Network, MEL_NETWORK_ND );
+#else
 static MenuMenu_t M_NETWORK = MAKE_MENUMENU( "Network Game", &MMF_Top_Joystick_Network, MEL_NETWORK );
+#endif
 static MenuMenu_t M_PLAYER = MAKE_MENUMENU( "Player Setup", &MMF_SmallOptions, MEL_PLAYER );
 static MenuMenu_t M_MACROS = MAKE_MENUMENU( "Multiplayer Macros", &MMF_Macros, MEL_MACROS );
 static MenuMenu_t M_NETHOST = MAKE_MENUMENU( "Host Network Game", &MMF_SmallOptionsNarrow, MEL_NETHOST );
 static MenuMenu_t M_NETOPTIONS = MAKE_MENUMENU( "Net Game Options", &MMF_NetSetup, MEL_NETOPTIONS );
 static MenuMenu_t M_NETJOIN = MAKE_MENUMENU( "Join Network Game", &MMF_SmallOptionsNarrow, MEL_NETJOIN );
+#ifdef NETMENU_WASM
+static MenuMenu_t M_NET_HOSTCFG  = MAKE_MENUMENU( "Host Game", &MMF_SmallOptions, MEL_NET_HOSTCFG );
+static MenuMenu_t M_NET_BROWSE   = MAKE_MENUMENU_CUSTOMSIZE( "Browse Public Games", &MMF_NetBrowse, MEL_NET_BROWSE );
+static MenuMenu_t M_NET_JOINCODE = MAKE_MENUMENU( "Join by Code", &MMF_SmallOptions, MEL_NET_JOINCODE );
+static MenuMenu_t M_NET_LOBBY    = MAKE_MENUMENU( "Multiplayer Lobby", &MMF_SmallOptions, MEL_NET_LOBBY );
+#endif
 
 #ifdef EDUKE32_RETAIL_MENU
 static MenuPanel_t M_STORY = { NoTitle, MENU_STORY, MA_Return, MENU_STORY, MA_Advance, };
@@ -1703,6 +1899,12 @@ static Menu_t Menus[] = {
     { &M_NETHOST, MENU_NETHOST, MENU_NETWORK, MA_Return, Menu },
     { &M_NETOPTIONS, MENU_NETOPTIONS, MENU_NETWORK, MA_Return, Menu },
     { &M_USERMAP, MENU_NETUSERMAP, MENU_NETOPTIONS, MA_Return, FileSelect },
+#ifdef NETMENU_WASM
+    { &M_NET_HOSTCFG, MENU_NET_HOSTCFG, MENU_NETWORK, MA_Return, Menu },
+    { &M_NET_BROWSE, MENU_NET_BROWSE, MENU_NETWORK, MA_Return, Menu },
+    { &M_NET_JOINCODE, MENU_NET_JOINCODE, MENU_NETWORK, MA_Return, Menu },
+    { &M_NET_LOBBY, MENU_NET_LOBBY, MENU_NETWORK, MA_Return, Menu },
+#endif
     { &M_NETJOIN, MENU_NETJOIN, MENU_NETWORK, MA_Return, Menu },
 };
 
@@ -1710,6 +1912,139 @@ static CONSTEXPR const uint16_t numMenus = ARRAY_SIZE(Menus);
 
 Menu_t *m_currentMenu = &Menus[0];
 static Menu_t *m_previousMenu = &Menus[0];
+
+#ifdef NETMENU_WASM
+// Rebuild the scrollable BROWSE list from the cached lobby rows. Uses a FIXED entry
+// array (never realloced) so each row's laid-out ytop survives lobby pushes and the
+// per-row columns drawn in Menu_PreDraw never flicker. Rows arrive already sorted by JS
+// (have-GRP first, joinable, ping); we draw them in order.
+static void netmenu_rebuild_browse(void)
+{
+    static int inited = 0;
+    if (!inited)
+    {
+        // Rows keep a NULL name: the framework lays them out + owns cursor/scroll/scrollbar,
+        // while Menu_PreDraw paints each row (name + players + ping + GRP tag) itself, so the
+        // columns always align with the row and never lag a rebuild.
+        for (int i = 0; i < NET_BROWSE_MAX; ++i)
+            ME_NET_BROWSE_ROW[i] = ME_NET_BROWSE_ROW_TEMPLATE;
+        inited = 1;
+    }
+
+    MEL_NET_BROWSE[0] = &ME_NET_MAXPING;
+    int n = 0;
+    for (int i = 0; i < s_netLobbyCount && i < NET_BROWSE_MAX; ++i)
+    {
+        MenuEntry_t *e = &ME_NET_BROWSE_ROW[i];
+        e->type = Link;
+        e->flags &= ~(MEF_Disabled | MEF_LookDisabled | MEF_Hidden);
+        if (s_netLobby[i].grpState == 2) // paid GRP we lack -> shown but non-selectable
+            e->flags |= MEF_Disabled | MEF_LookDisabled;
+        MEL_NET_BROWSE[1 + n++] = e;
+    }
+    if (n == 0) { MEL_NET_BROWSE[1] = &ME_NET_BROWSE_EMPTY; n = 1; }
+
+    M_NET_BROWSE.entrylist = MEL_NET_BROWSE;
+    M_NET_BROWSE.numEntries = 1 + n;
+    if (M_NET_BROWSE.currentEntry >= M_NET_BROWSE.numEntries)
+        M_NET_BROWSE.currentEntry = 0;
+}
+
+static sjson_context *netmenu_json(void)
+{
+    static sjson_context *ctx = nullptr;
+    if (!ctx) ctx = sjson_create_context(0, 0, nullptr);
+    else      sjson_reset_context(ctx);
+    return ctx;
+}
+
+// ---- the six JS -> C setters (spec §2). Parse ONCE into the caches above. ----
+extern "C" EMSCRIPTEN_KEEPALIVE void NetMenu_SetStatus(const char *s)
+{
+    if (!s) { s_netStatus[0] = 0; s_netStatusIsError = 0; return; }
+    s_netStatusIsError = (s[0] == '!');
+    netmenu_clamp(s_netStatus, sizeof s_netStatus, s_netStatusIsError ? s + 1 : s);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void NetMenu_SetLobby(const char *json)
+{
+    s_netLobbyCount = 0;
+    if (json && *json)
+    {
+        sjson_context *ctx = netmenu_json();
+        sjson_node *arr = sjson_decode(ctx, json), *it;
+        if (arr && arr->tag == SJSON_ARRAY) sjson_foreach(it, arr)
+        {
+            if (s_netLobbyCount >= NET_BROWSE_MAX) break;
+            if (it->tag != SJSON_OBJECT) continue;
+            netlobbyrow_t *r = &s_netLobby[s_netLobbyCount++];
+            netmenu_clamp(r->name, sizeof r->name, sjson_get_string(it, "name", "Duke Match"));
+            if (!r->name[0]) netmenu_clamp(r->name, sizeof r->name, "Duke Match");
+            r->players    = sjson_get_int(it, "players", 0);
+            r->maxPlayers = sjson_get_int(it, "maxPlayers", 0);
+            r->ping       = sjson_get_int(it, "ping", -1);
+            const char *gs = sjson_get_string(it, "grpState", "download");
+            r->grpState = !Bstrcmp(gs, "have") ? 0 : !Bstrcmp(gs, "paid") ? 2 : 1;
+        }
+    }
+    netmenu_rebuild_browse();
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void NetMenu_SetRoster(const char *json)
+{
+    s_netRosterCount = 0;
+    if (json && *json)
+    {
+        sjson_context *ctx = netmenu_json();
+        sjson_node *arr = sjson_decode(ctx, json), *it;
+        if (arr && arr->tag == SJSON_ARRAY) sjson_foreach(it, arr)
+        {
+            if (s_netRosterCount >= NET_ROSTER_MAX) break;
+            if (it->tag != SJSON_OBJECT) continue;
+            netrosterrow_t *p = &s_netRoster[s_netRosterCount++];
+            netmenu_clamp(p->name, sizeof p->name, sjson_get_string(it, "name", "Duke"));
+            p->connected = sjson_get_bool(it, "connected", true) ? 1 : 0;
+        }
+    }
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void NetMenu_SetGrpList(const char *json)
+{
+    s_netGrpCount = 0;
+    if (json && *json)
+    {
+        sjson_context *ctx = netmenu_json();
+        sjson_node *arr = sjson_decode(ctx, json), *it;
+        if (arr && arr->tag == SJSON_ARRAY) sjson_foreach(it, arr)
+        {
+            if (s_netGrpCount >= NET_GRP_MAX) break;
+            if (it->tag != SJSON_OBJECT) continue;
+            netgrprow_t *g = &s_netGrps[s_netGrpCount++];
+            netmenu_clamp(g->id, sizeof g->id, sjson_get_string(it, "id", ""));
+            netmenu_clamp(g->name, sizeof g->name, sjson_get_string(it, "name", "GRP"));
+            g->size      = sjson_get_int(it, "size", 0);
+            g->shareware = sjson_get_bool(it, "shareware", false) ? 1 : 0;
+            g->present   = sjson_get_bool(it, "present", false) ? 1 : 0;
+            g->isDefault = sjson_get_bool(it, "isDefault", false) ? 1 : 0;
+        }
+    }
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void NetMenu_SetProgress(int pct, const char *label)
+{
+    s_netProgressPct = clamp(pct, 0, 100);
+    netmenu_clamp(s_netProgressLabel, sizeof s_netProgressLabel, label);
+    s_netProgressActive = (pct >= 0 && pct < 100 && s_netProgressLabel[0]) ? 1 : 0;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void NetMenu_OnJoined(int myConnectIndex)
+{
+    s_netMyConnectIndex = myConnectIndex;
+    netmenu_browse(0); // release the public lobby subscription now that we are joining
+    if (g_player[myconnectindex].ps->gm & MODE_MENU)
+        Menu_Change(MENU_NET_LOBBY);
+}
+#endif // NETMENU_WASM
 static Menu_t * m_parentMenu;
 
 MenuID_t g_currentMenu;
@@ -2783,6 +3118,13 @@ static void Menu_Pre(MenuID_t cm)
         MEL_NETOPTIONS[5] = (g_gametypeFlags[ud.m_coop] & (GAMETYPE_PLAYERSFRIENDLY|GAMETYPE_TDM)) ? &ME_NETOPTIONS_FRFIRE : &ME_NETOPTIONS_MAPEXITS;
         break;
 
+#ifdef NETMENU_WASM
+    case MENU_NET_LOBBY:
+        // Only the host (connectindex 0) may launch the game; guests just wait.
+        MenuEntry_HideOnCondition(&ME_NETHOST_LAUNCH, s_netMyConnectIndex != 0);
+        break;
+#endif
+
     case MENU_OPTIONS:
         MenuEntry_DisableOnCondition(&ME_OPTIONS_PLAYERSETUP, ud.recstat == 1);
         break;
@@ -2971,6 +3313,30 @@ static void msaveloadtext(const vec2_t& origin, int level, int volume, int skill
     }
 }
 
+#ifdef NETMENU_WASM
+// Right-aligned minifont (mminitext is left-only) for the browse "ping" column.
+static void netmenu_mtext_r(int32_t x, int32_t y, char const *t, int32_t pal)
+{
+    G_ScreenText(MF_Minifont.tilenum, x, y, MF_Minifont.zoom, 0, 0, t, 0, pal, g_textstat|ROTATESPRITE_FULL16, 0,
+                 MF_Minifont.emptychar.x, MF_Minifont.emptychar.y, MF_Minifont.between.x, MF_Minifont.between.y,
+                 MF_Minifont.textflags|TEXT_XRIGHT, 0, 0, xdim-1, ydim-1);
+}
+// Shared bottom-of-screen status + GRP-transfer progress line for the net screens.
+static void netmenu_draw_status(const vec2_t origin)
+{
+    if (s_netProgressActive)
+    {
+        Bsnprintf(tempbuf, sizeof tempbuf, "%s  %d%%", s_netProgressLabel, s_netProgressPct);
+        mgametextcenter(origin.x, origin.y + (176<<16), tempbuf);
+    }
+    if (s_netStatus[0])
+        G_ScreenText(MF_Bluefont.tilenum, origin.x + (MENU_MARGIN_CENTER<<16), origin.y + (186<<16),
+                     MF_Bluefont.zoom, 0, 0, s_netStatus, 0, s_netStatusIsError ? 21 : MF_Bluefont.pal, g_textstat, 0,
+                     MF_Bluefont.emptychar.x, MF_Bluefont.emptychar.y, MF_Bluefont.between.x, MF_Bluefont.between.y,
+                     MF_Bluefont.textflags|TEXT_XCENTER, 0, 0, xdim-1, ydim-1);
+}
+#endif
+
 static void Menu_PreDraw(MenuID_t cm, MenuEntry_t* entry, const vec2_t origin)
 {
     int32_t i, j, l = 0;
@@ -3048,6 +3414,73 @@ static void Menu_PreDraw(MenuID_t cm, MenuEntry_t* entry, const vec2_t origin)
             else mminitext(origin.x + ((90+60)<<16), origin.y + ((90+8+8+8+8)<<16), "Off", MF_Minifont.pal_deselected_right);
         }
         break;
+
+#ifdef NETMENU_WASM
+    case MENU_NET_HOSTCFG:
+        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (94<<16), "Advertised GRP:", MF_Minifont.pal_deselected);
+        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (102<<16), s_netGrpLabels[0] ? s_netGrpLabels : "(set on boot)", MF_Minifont.pal_selected);
+        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (114<<16), "GRP Sharing Off: others cannot download your GRP.", MF_Minifont.pal_deselected);
+        netmenu_draw_status(origin);
+        break;
+
+    case MENU_NET_BROWSE:
+    {
+        MenuMenu_t & mm = M_NET_BROWSE;
+        int const ytop_lim = mm.format->pos.y;
+        int const ybot_lim = klabs(mm.format->bottomcutoff);
+        int const cur = mm.currentEntry - 1; // selected match row (entry 0 is Max Ping)
+        for (i = 0; i < s_netLobbyCount && i < NET_BROWSE_MAX; ++i)
+        {
+            MenuEntry_t & e = ME_NET_BROWSE_ROW[i];
+            if (e.ybottom == 0) continue; // not laid out yet this session -> skip (no stray columns)
+            int const rely = e.ytop - mm.scrollPos;
+            if (rely + MF_Minifont.get_yline() < ytop_lim || rely > ybot_lim) continue; // outside the window
+            int const y = origin.y + e.ytop - mm.scrollPos + (1<<16);
+            netlobbyrow_t & r = s_netLobby[i];
+            int const paid = (r.grpState == 2);
+            int const namepal = paid ? MF_Minifont.pal_disabled : (i == cur) ? MF_Minifont.pal_selected : MF_Minifont.pal_deselected;
+            // name (clipped so it never collides with the columns)
+            char nm[24];
+            Bstrncpyz(nm, r.name, sizeof nm);
+            mminitext(origin.x + (MENU_MARGIN_REGULAR<<16), y, nm, namepal);
+            // players x/y
+            Bsnprintf(tempbuf, sizeof tempbuf, "%d/%d", r.players, r.maxPlayers);
+            mminitext(origin.x + (200<<16), y, tempbuf, paid ? MF_Minifont.pal_disabled : MF_Minifont.pal_deselected);
+            // ping, right-aligned; "?" when unknown
+            if (r.ping < 0) Bstrcpy(tempbuf, "?"); else Bsnprintf(tempbuf, sizeof tempbuf, "%d", r.ping);
+            netmenu_mtext_r(origin.x + (262<<16), y, tempbuf, paid ? MF_Minifont.pal_disabled : MF_Minifont.pal_deselected);
+            // GRP tag: have / downloadable / needs paid
+            char const *tag = r.grpState == 0 ? "HAVE" : r.grpState == 1 ? "DL" : "PAID";
+            int const tagpal = r.grpState == 0 ? MF_Minifont.pal_selected : paid ? MF_Minifont.pal_disabled : MF_Minifont.pal_deselected;
+            mminitext(origin.x + (268<<16), y, tag, tagpal);
+        }
+        netmenu_draw_status(origin);
+        break;
+    }
+
+    case MENU_NET_JOINCODE:
+        mgametextcenter(origin.x, origin.y + (108<<16), "Paste an invite code or link, then Connect.");
+        netmenu_draw_status(origin);
+        break;
+
+    case MENU_NET_LOBBY:
+    {
+        mminitext(origin.x + (MENU_MARGIN_REGULAR<<16), origin.y + (72<<16),
+                  s_netMyConnectIndex == 0 ? "Players (you are the host):" : "Players (waiting for the host to start):",
+                  MF_Minifont.pal_deselected);
+        int y = 82;
+        for (i = 0; i < s_netRosterCount && i < NET_ROSTER_MAX; ++i, y += 8)
+        {
+            Bsnprintf(tempbuf, sizeof tempbuf, "%d. %s%s", i, s_netRoster[i].name, s_netRoster[i].connected ? "" : " (connecting)");
+            mminitext(origin.x + ((MENU_MARGIN_REGULAR+8)<<16), origin.y + (y<<16), tempbuf,
+                      s_netRoster[i].connected ? MF_Minifont.pal_selected : MF_Minifont.pal_disabled);
+        }
+        if (s_netRosterCount == 0)
+            mminitext(origin.x + ((MENU_MARGIN_REGULAR+8)<<16), origin.y + (82<<16), "(nobody has joined yet)", MF_Minifont.pal_disabled);
+        netmenu_draw_status(origin);
+        break;
+    }
+#endif
 
 #if 0
     case MENU_VIDEOSETUP:
@@ -3970,6 +4403,31 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
         break;
     }
 
+#ifdef NETMENU_WASM
+    case MENU_NETWORK:
+        // HOST PUBLIC / HOST PRIVATE record the mode, then the link advances to config.
+        if (entry == &ME_NET_ROOT_HOSTPUB || entry == &ME_NET_ROOT_HOSTPRIV)
+        {
+            s_netHostPublic = (entry == &ME_NET_ROOT_HOSTPUB);
+            s_netMyConnectIndex = 0; // hosting -> we are connectindex 0
+        }
+        break;
+
+    case MENU_NET_BROWSE:
+    {
+        // A match row was activated. Row entries follow the Max Ping option at index 0.
+        int const idx = M_NET_BROWSE.currentEntry - 1;
+        if (idx >= 0 && idx < s_netLobbyCount)
+        {
+            if (s_netLobby[idx].grpState == 2)
+                NetMenu_SetStatus("!That match needs a paid GRP you do not own");
+            else
+                netmenu_join_row(idx);
+        }
+        break;
+    }
+#endif
+
     default:
         break;
     }
@@ -4107,6 +4565,9 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
         {
 #ifdef NETDUKE32
             Net_SendNewGame(0);  // lockstep: host broadcasts NEW_GAME to guests
+# ifdef NETMENU_WASM
+            NetMenu_SetInGame(1); // host commits: stop advertising + close the accept gate
+# endif
 #else
             Net_FillNewGame(&pendingnewgame, 1);
             Net_StartNewGame();
@@ -4119,6 +4580,24 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
             Menu_Change(MENU_NETWAITVOTES);
         }
     }
+#ifdef NETMENU_WASM
+    else if (entry == &ME_NET_CFG_START)
+    {
+        s_netMyConnectIndex = 0;           // hosting -> connectindex 0
+        netmenu_host();                    // create the advertised match; link advances to the lobby
+    }
+    else if (entry == &ME_NET_JOINCODE_CONNECT)
+    {
+        if (s_netJoinCode[0])
+            netmenu_join_code();
+        else
+            NetMenu_SetStatus("!Enter an invite code first");
+    }
+    else if (entry == &ME_NET_LOBBY_LEAVE)
+    {
+        netmenu_leave();                   // link returns to the multiplayer root
+    }
+#endif
 }
 
 static int32_t Menu_EntryOptionModify(MenuEntry_t *entry, int32_t newOption)
@@ -4234,6 +4713,12 @@ static int32_t Menu_EntryOptionModify(MenuEntry_t *entry, int32_t newOption)
             }
         }
     }
+#ifdef NETMENU_WASM
+    else if (entry == &ME_NET_MAXPING)
+        netmenu_set_ping(newOption);       // cycles DukeNet.pingPresets()[newOption]
+    else if (entry == &ME_NET_CFG_SHARE)
+        netmenu_set_share(newOption);      // On => allow GRP download (default)
+#endif
 
     switch (g_currentMenu)
     {
@@ -5266,6 +5751,14 @@ static void Menu_AboutToStartDisplaying(Menu_t * m)
             Menu_RefreshSoundProperties();
         break;
 
+#ifdef NETMENU_WASM
+    case MENU_NET_BROWSE:
+        // Populate the list (>=1 active entry) BEFORE the type-switch validates the
+        // selection below, so an empty lobby shows the placeholder instead of asserting.
+        netmenu_rebuild_browse();
+        break;
+#endif
+
     default:
         break;
     }
@@ -5308,6 +5801,19 @@ static void Menu_ChangingTo(Menu_t * m)
         if (g_previousMenu != MENU_SKILL && g_previousMenu != MENU_USERMAP)
             m->parentID = g_previousMenu;
         break;
+
+#ifdef NETMENU_WASM
+    case MENU_NET_BROWSE:
+        netmenu_browse(1);            // subscribe to the public lobby
+        break;
+    case MENU_NETWORK:
+    case MENU_NET_LOBBY:
+        netmenu_browse(0);            // leaving the browser / joined -> release the subscription
+        break;
+    case MENU_NET_HOSTCFG:
+        netmenu_pull_grp_labels();    // read DukeNet.getLocalGrp().labels for the read-only display
+        break;
+#endif
     }
 
 #ifdef __ANDROID__

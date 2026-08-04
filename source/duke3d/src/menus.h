@@ -122,6 +122,14 @@ enum MenuIndex_t {
     MENU_NETHOST        = 20010,
     MENU_NETOPTIONS     = 20011,
     MENU_NETUSERMAP     = 20012,
+#if defined(NETDUKE32) && defined(__EMSCRIPTEN__)
+    // WebRTC/Nostr in-engine multiplayer (eduke32-wasm). IDs kept ascending so the
+    // Menus[] binary search stays sorted; excluded from the flag-OFF deploy build.
+    MENU_NET_HOSTCFG    = 20013, // host config (name / max players / GRP sharing / start)
+    MENU_NET_BROWSE     = 20014, // public games browser (scrollable list)
+    MENU_NET_JOINCODE   = 20015, // join by invite code (text entry)
+    MENU_NET_LOBBY      = 20016, // host/guest lobby (roster + launch)
+#endif
     MENU_NETJOIN        = 20020,
 };
 
@@ -491,6 +499,13 @@ void Menu_Init(void);
 void Menu_Open(uint8_t playerID);
 void Menu_Close(uint8_t playerID);
 void M_DisplayMenus(void);
+
+#if defined(NETDUKE32) && defined(__EMSCRIPTEN__)
+// eduke32-wasm multiplayer: the engine tells the JS transport when the local match
+// actually starts/ends so a public host stops advertising and closes its accept gate
+// (no late joiners into a running lockstep game). No-op when not in a DukeNet match.
+void NetMenu_SetInGame(int in_game);
+#endif
 
 extern MenuFont_t MF_Redfont, MF_Bluefont, MF_Minifont;
 

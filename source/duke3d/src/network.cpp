@@ -5185,6 +5185,10 @@ void Net_InitMapStateHistory()
     g_cl_InterpolatedRevision = cInitialMapStateRevisionNumber;
 }
 
+#if defined(NETDUKE32) && defined(__EMSCRIPTEN__)
+extern "C" void NetMenu_SetInGame(int); // menus.cpp: flip the JS advert/accept-gate
+#endif
+
 void Net_StartNewGame()
 {
     Net_ResetPlayers();
@@ -5197,6 +5201,10 @@ void Net_StartNewGame()
     {
         G_BackToMenu();
     }
+#if defined(NETDUKE32) && defined(__EMSCRIPTEN__)
+    else
+        NetMenu_SetInGame(1); // local player entered MODE_GAME (host and guests)
+#endif
 }
 
 
