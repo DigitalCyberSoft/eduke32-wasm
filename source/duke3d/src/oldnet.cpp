@@ -1072,7 +1072,11 @@ void Net_SendPlayerOptions(void)
 
     buf[l++] = g_player[myconnectindex].ps->auto_aim = ud.config.AutoAim;
     buf[l++] = g_player[myconnectindex].ps->weaponswitch = ud.weaponswitch;
-    buf[l++] = g_player[myconnectindex].ps->palookup = g_player[myconnectindex].pcolor = playerColor_getValidPal(ud.color);
+    // Local color is menu-constrained (MEOSV_PLAYER_COLOR) and always valid, so it
+    // needs no validation; the deferred validator (playerColor_getValidPal) applies
+    // only to untrusted REMOTE colors on the recv path (~L740). Routing the local
+    // color through it fired the "player-color validation not ported" ERROR at SP boot.
+    buf[l++] = g_player[myconnectindex].ps->palookup = g_player[myconnectindex].pcolor = ud.color;
     buf[l++] = g_player[myconnectindex].pteam = ud.team;
 
     TRAVERSE_CONNECT(i)
