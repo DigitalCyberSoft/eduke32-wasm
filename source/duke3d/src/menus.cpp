@@ -4581,6 +4581,18 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
         // TODO(netcode): drive volume/level from a HOST CONFIG map selector.
         ud.m_volume_number = 0;
         ud.m_level_number  = 0;
+        // Multiplayer session setup the stock Net_StartNewGame path implies but this
+        // launch omits. g_netServer is a MACRO (numplayers>1 && host, oldnet.h:71), true
+        // only for the host -- so the host mostly works, but ud.multimode MUST be set for
+        // the guest side (g_netServer is false there), and ud.m_monsters_off MUST be set
+        // or monsters spawn in deathmatch (monster spawn is gated only by ud.monsters_off,
+        // game.cpp:3538). Refs: cmdline.cpp:685 (multimode), game.cpp:6881 (monsters_off),
+        // global.cpp:44 (coop 0 = Deathmatch). No gametype picker yet -> hardcode DM.
+        ud.multimode            = numplayers;
+        g_mostConcurrentPlayers = ud.multimode;
+        ud.m_coop               = 0;   // gametype 0 = Deathmatch (spawn)
+        ud.m_monsters_off       = 1;   // no monsters in deathmatch
+        ud.m_player_skill       = 0;
         if (numplayers > 1)
             Net_SendNewGame(0);   // guests enter the same map at tic 0 (reads ud.m_* above)
         NetMenu_SetInGame(1);     // stop advertising + close the accept gate

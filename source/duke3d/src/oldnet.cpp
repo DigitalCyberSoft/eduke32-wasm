@@ -618,13 +618,22 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 // TODO(netcode): upstream NEWGAME_* flag nuances (NOSEND/RESETALL) are
                 // not modeled by this tree's G_NewGame.
                 (void)flags;
-                // Defer the level entry to the main loop instead of calling G_NewGame
-                // here: this runs INSIDE net_poll -> Net_ReceiveFrame with the shared
-                // packbuf mid-parse, so entering the level inline would re-enter net_poll
-                // and clobber packbuf. Setting MODE_NEWGAME lets app_main consume it off
-                // the packet stack (game.cpp:7186 -> 7044 G_NewGame -> 7189 -> G_EndOfLevel
-                // -> G_EnterLevel -> the tic-0 Net_WaitForPlayers rendezvous). The m_*
-                // values staged just above are what G_NewGame reads at game.cpp:7046.
+                // The guest runs SINGLE-PLAYER logic without this: g_netServer is a macro
+                // that is FALSE on a guest (not connecthead, oldnet.h:71), and the NEW_GAME
+                // packet carries m_coop/skill/level but NOT multimode or monsters_off. Set
+                // the MP session state locally to match the host, or the guest gets no keys
+                // (premap.cpp:788), monsters spawn, and APLAYER starts are misclassified as
+                // STAT_MISC (game.cpp:2797). numplayers is already >1 here (we only receive
+                // NEW_GAME once connected).
+                ud.multimode            = numplayers;
+                g_mostConcurrentPlayers = ud.multimode;
+                ud.m_monsters_off       = 1;   // match the host's deathmatch setup
+                // Defer the level entry to the main loop instead of calling G_NewGame here:
+                // this runs INSIDE net_poll -> Net_ReceiveFrame with the shared packbuf
+                // mid-parse, so entering inline would re-enter net_poll and clobber packbuf.
+                // gameHandleEvents (game.cpp:7114) pumps net_poll at the TOP of the frame,
+                // BEFORE the MODE_NEWGAME check at 7186, so this flag is consumed the same
+                // frame. G_NewGame reads the m_* staged above at game.cpp:7046.
                 g_player[myconnectindex].ps->gm = MODE_RESTART|MODE_NEWGAME;
                 break;
             }
