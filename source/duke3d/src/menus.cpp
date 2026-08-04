@@ -1663,10 +1663,14 @@ static MenuOption_t MEO_NET_CFG_SHARE = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_Off
 static MenuEntry_t ME_NET_CFG_SHARE = MAKE_MENUENTRY( "GRP Sharing", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_SHARE, Option );
 static MenuOption_t MEO_NET_CFG_LOCALONLY = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_OffOn, &s_netLocalOnly );
 static MenuEntry_t ME_NET_CFG_LOCALONLY = MAKE_MENUENTRY( "Local Only", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_LOCALONLY, Option );
+// Map selector: reuses the init-populated level option set (MEOS_NETOPTIONS_LEVEL). The
+// options pointer is assigned per-episode in this menu's ChangingTo; bound to ud.m_level_number.
+static MenuOption_t MEO_NET_CFG_LEVEL = MAKE_MENUOPTION( &MF_Bluefont, NULL, &ud.m_level_number );
+static MenuEntry_t ME_NET_CFG_LEVEL = MAKE_MENUENTRY( "Level", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_LEVEL, Option );
 static MenuLink_t MEO_NET_CFG_START = { MENU_NET_LOBBY, MA_Advance, };
 static MenuEntry_t ME_NET_CFG_START = MAKE_MENUENTRY( "Start", &MF_Redfont, &MEF_VideoSetup_Apply, &MEO_NET_CFG_START, Link );
 static MenuEntry_t *MEL_NET_HOSTCFG[] = {
-    &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_SHARE, &ME_NET_CFG_LOCALONLY, &ME_NET_CFG_START,
+    &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_LEVEL, &ME_NET_CFG_SHARE, &ME_NET_CFG_LOCALONLY, &ME_NET_CFG_START,
 };
 
 // BROWSE PUBLIC GAMES — Max Ping control + a dynamic, scrollable match list
@@ -4582,8 +4586,8 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
         // No in-menu map picker yet, so launch the shareware start map (E1L1) -- a map
         // guaranteed to exist, so G_EnterLevel cannot blank on a missing level.
         // TODO(netcode): drive volume/level from a HOST CONFIG map selector.
-        ud.m_volume_number = 0;
-        ud.m_level_number  = 0;
+        ud.m_volume_number = (NetEpisode >= 0 && NetEpisode < MAXVOLUMES) ? NetEpisode : 0;
+        // ud.m_level_number is chosen by the HOST CONFIG "Level" selector (ME_NET_CFG_LEVEL).
         // Multiplayer session setup the stock Net_StartNewGame path implies but this
         // launch omits. g_netServer is a MACRO (numplayers>1 && host, oldnet.h:71), true
         // only for the host -- so the host mostly works, but ud.multimode MUST be set for
@@ -5857,6 +5861,12 @@ static void Menu_ChangingTo(Menu_t * m)
         break;
     case MENU_NET_HOSTCFG:
         netmenu_pull_grp_labels();    // read DukeNet.getLocalGrp().labels for the read-only display
+        {   // point the Level selector at the current episode's map list + clamp the choice
+            int const vol = (NetEpisode >= 0 && NetEpisode < MAXVOLUMES) ? NetEpisode : 0;
+            MEO_NET_CFG_LEVEL.options = &MEOS_NETOPTIONS_LEVEL[vol];
+            if (ud.m_level_number < 0 || ud.m_level_number >= MEOS_NETOPTIONS_LEVEL[vol].numOptions)
+                ud.m_level_number = 0;
+        }
         break;
 #endif
     }
