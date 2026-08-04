@@ -6594,6 +6594,20 @@ static const char* dukeVerbosityCallback(loguru::Verbosity verbosity)
     }
 }
 
+#ifdef NETNATIVE
+// Native WebRTC transport hooks (defined in net_transport_native.cpp). The C
+// net_transport_init() must be called here at boot to start the transport (the
+// browser's JS transport self-initializes; native has no such path). The command-
+// line/env native transport has no in-engine Launch button, so the host
+// auto-launches from the main loop once the target player count has connected.
+extern "C" {
+    void net_transport_init(void);
+    int net_native_is_host(void);
+    int net_native_should_launch(void);
+    void net_native_mark_launched(void);
+}
+#endif
+
 int app_main(int argc, char const* const* argv)
 {
 #ifdef _WIN32
@@ -7018,6 +7032,15 @@ int app_main(int argc, char const* const* argv)
 
     VM_OnEvent(EVENT_INITCOMPLETE);
 
+#ifdef NETNATIVE
+    // Start the native WebRTC/Nostr transport (reads NN_ROLE/NN_KEY/NN_RELAY/...).
+    // No-op (like the stub) if NN_ROLE is unset. Placed BEFORE MAIN_LOOP_RESTART so the
+    // attract-demo goto path (G_PlaybackDemo -> goto MAIN_LOOP_RESTART) can never skip
+    // it. Begins presence + connection now so peers connect while the host/guest sit at
+    // the menu; net_poll is pumped every menu frame by M_DisplayMenus.
+    net_transport_init();
+#endif
+
 MAIN_LOOP_RESTART:
     totalclock = 0;
     ototalclock = 0;
@@ -7116,6 +7139,31 @@ MAIN_LOOP_RESTART:
             KB_KeyDown[sc_Escape] = 1;
             quitevent = 0;
         }
+
+#ifdef NETNATIVE
+        // Native WebRTC host: auto-launch once the target player count is connected.
+        // Mirrors the browser ME_NETHOST_LAUNCH - set up the deathmatch session
+        // (ud.multimode/coop/monsters) then enter the level directly (the SP New Game
+        // idiom); Net_SendNewGame drives the guests, which follow via their NEW_GAME
+        // handler + the tic-0 Net_WaitForPlayers barrier. G_NewGame_EnterLevel sets
+        // gm = MODE_GAME (premap.cpp:2046), which closes the menu.
+        // Headless auto-launch (NN_AUTOLAUNCH=1, for tests with no human at the menu):
+        // the interactive path is the Multiplayer menu's Launch Game entry.
+        if (net_native_is_host() && net_native_should_launch()
+            && !(g_player[myconnectindex].ps->gm & MODE_GAME))
+        {
+            net_native_mark_launched();
+            ud.m_volume_number      = 0;   // shareware episode 1
+            ud.m_level_number       = 0;   // E1L1 (guaranteed to exist)
+            ud.multimode            = numplayers;
+            g_mostConcurrentPlayers = ud.multimode;
+            ud.m_coop               = 0;   // gametype 0 = Deathmatch
+            ud.m_monsters_off       = 1;
+            ud.m_player_skill       = 0;
+            Net_SendNewGame(0);
+            G_NewGame_EnterLevel();
+        }
+#endif
 
         //if (g_restartFrameRoutine)
         //{

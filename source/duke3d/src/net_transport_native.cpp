@@ -35,6 +35,7 @@
 #include <sjson.h>   // impl provided by eduke32's sjson.o (tests supply their own)
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -48,7 +49,26 @@
 
 using namespace nn;
 
+// NetMenu_* setters (defined in menus.cpp under NETMENU): the native transport drives
+// the in-engine multiplayer menu directly (the browser uses the JS bridge instead).
+extern "C" {
+    void NetMenu_SetStatus(const char *s);
+    void NetMenu_SetRoster(const char *json);
+    void NetMenu_OnJoined(int myConnectIndex);
+}
+
 namespace {
+
+// Temporary boot tracing (file-based so it survives any engine stdout handling).
+// TODO(netcode): remove once native launch is confirmed live.
+inline void nnlog(const std::string &m)
+{
+    if (FILE *f = fopen("/tmp/nnet_debug.log", "a"))
+    {
+        fprintf(f, "%s\n", m.c_str());
+        fclose(f);
+    }
+}
 
 // ── Inbound queue: worker threads -> game-thread net_poll ────────────────────
 struct InboundItem
@@ -68,52 +88,117 @@ struct InboundItem
 class NativeTransport
 {
 public:
-    bool start()
+    // Join the presence thread + tear down peers here too: if the engine exits without
+    // calling net_transport_shutdown(), static destruction of g_t must not destroy a
+    // joinable std::thread ("terminate called without an active exception" -> SIGABRT).
+    ~NativeTransport() { shutdown(); }
+
+    // Infrastructure only: connect the relay + peer manager. Does NOT host or join
+    // until a menu action (net_native_host / net_native_join_code) or an NN_ROLE env
+    // (headless testing) drives it. Returns false if crypto/relay setup fails.
+    bool configure()
     {
-        const char *role = getenv("NN_ROLE");
-        if (!role)
-            return false; // native transport not requested: seam is inert (like the stub)
-        isHost_ = std::string(role) == "host";
-        relay_ = envOr("NN_RELAY", "");
-        myName_ = envOr("NN_NAME", isHost_ ? "Host" : "Guest");
+        myName_ = envOr("NN_NAME", "Player");
         minPlayers_ = std::atoi(envOr("NN_PLAYERS", "2").c_str());
         if (minPlayers_ < 2)
             minPlayers_ = 2;
-        if (relay_.empty())
-            return false;
+        autoLaunch_ = (getenv("NN_AUTOLAUNCH") != nullptr) || (getenv("NN_ROLE") != nullptr);
+
+        const char *relayEnv = getenv("NN_RELAY");
+        if (relayEnv && *relayEnv)
+            relays_ = { relayEnv };
+        else // default to a few public Nostr relays (same set as the browser transport)
+            relays_ = { "wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net" };
 
         myDeviceId_ = "native-" + toHex(randomBytes(8));
-
-        if (isHost_)
-        {
-            roomKey_ = envOr("NN_KEY", "");
-            if (roomKey_.empty())
-                roomKey_ = base64Encode(randomBytes(32));
-            myConnectIndex_ = 0; // host is always slot 0 (connecthead)
-            // Print the room info so a launcher/test can hand it to guests.
-            printf("[nnet] HOSTID %s\n[nnet] KEY %s\n", myDeviceId_.c_str(), roomKey_.c_str());
-            fflush(stdout);
-        }
-        else
-        {
-            roomKey_ = envOr("NN_KEY", "");
-            hostId_ = envOr("NN_HOSTID", "");
-            if (roomKey_.empty() || hostId_.empty())
-            {
-                fprintf(stderr, "[nnet] guest needs NN_KEY + NN_HOSTID\n");
-                return false;
-            }
-        }
-
         sigCtx_ = sjson_create_context(0, 0, nullptr);
-        nostr_ = std::make_unique<NostrClient>(std::vector<std::string>{ relay_ });
+        nostr_ = std::make_unique<NostrClient>(relays_);
         pm_ = std::make_unique<PeerManager>(myDeviceId_, rtc::Configuration{});
         wire();
         nostr_->start();
-        nostr_->subscribeEphemeral(SIGNALING_KIND, roomKey_, [this](const std::string &payload) { onSignal(payload); });
         running_ = true;
-        presenceThread_ = std::thread([this] { presenceLoop(); });
+
+        // Headless auto-start via env (the interactive menu uses net_native_host/join).
+        const char *role = getenv("NN_ROLE");
+        if (role && std::string(role) == "host")
+            hostMatch(0, envOr("NN_NAME", "Duke Match"), minPlayers_, myName_, 0);
+        else if (role && std::string(role) == "guest")
+        {
+            std::string key = envOr("NN_KEY", ""), hid = envOr("NN_HOSTID", "");
+            if (!key.empty() && !hid.empty())
+                joinWithKey(key, hid, myName_);
+        }
         return true;
+    }
+
+    void hostMatch(int isPublic, const std::string &name, int maxPlayers, const std::string &player, int localOnly)
+    {
+        isHost_ = true;
+        isPublic_ = isPublic != 0;
+        localOnly_ = localOnly != 0;
+        myConnectIndex_ = 0;
+        myName_ = player.empty() ? "Host" : player;
+        matchName_ = name.empty() ? "Duke Match" : name;
+        maxPlayers_ = maxPlayers < 2 ? 2 : maxPlayers;
+        roomKey_ = envOr("NN_KEY", "");
+        if (roomKey_.empty())
+            roomKey_ = base64Encode(randomBytes(32));
+        invite_ = makeInvite();
+        printf("[nnet] HOSTID %s\n[nnet] KEY %s\n[nnet] INVITE %s\n", myDeviceId_.c_str(), roomKey_.c_str(), invite_.c_str());
+        fflush(stdout);
+        ensureSignaling();
+        setStatus("Hosting. Invite code (share it): " + invite_);
+        updateRoster();
+    }
+
+    void joinMatch(const std::string &code, const std::string &player)
+    {
+        std::string key, hid, name;
+        if (!parseInvite(code, key, hid, name))
+        {
+            setStatus("!Invalid invite code");
+            return;
+        }
+        joinWithKey(key, hid, player);
+    }
+
+    void joinWithKey(const std::string &key, const std::string &hid, const std::string &player)
+    {
+        isHost_ = false;
+        roomKey_ = key;
+        hostId_ = hid;
+        myName_ = player.empty() ? "Guest" : player;
+        ensureSignaling();
+        pm_->connect(hostId_);
+        setStatus("Connecting to host...");
+    }
+
+    void leave()
+    {
+        if (pm_)
+            pm_->closeAll();
+        std::lock_guard<std::mutex> lk(mtx_);
+        tokenToDevice_.clear();
+        deviceToToken_.clear();
+        inbound_.clear();
+        attached_ = false;
+        launched_ = false;
+    }
+
+    void menuPump() // game thread: apply queued menu updates via the NetMenu_* setters
+    {
+        std::string status, roster;
+        int joined = -1;
+        bool hs = false, hr = false, hj = false;
+        {
+            std::lock_guard<std::mutex> lk(menuMtx_);
+            if (hasStatus_) { status = pendingStatus_; hs = true; hasStatus_ = false; }
+            if (hasRoster_) { roster = pendingRoster_; hr = true; hasRoster_ = false; }
+            if (hasJoined_) { joined = pendingJoined_; hj = true; hasJoined_ = false; }
+        }
+        if (hs) NetMenu_SetStatus(status.c_str());
+        if (hr) NetMenu_SetRoster(roster.c_str());
+        if (hj) NetMenu_OnJoined(joined);
     }
 
     void shutdown()
@@ -186,7 +271,9 @@ public:
     // ── launch readiness (host only; polled by the engine main loop) ─────────
     bool shouldLaunch()
     {
-        if (!isHost_ || launched_)
+        // Only auto-launch in headless mode (NN_AUTOLAUNCH / NN_ROLE). Interactive
+        // hosting waits for the user to pick Launch Game in the Multiplayer menu.
+        if (!autoLaunch_ || !isHost_ || launched_)
             return false;
         std::lock_guard<std::mutex> lk(mtx_);
         return (int)(tokenToDevice_.size() + 1) >= minPlayers_;
@@ -232,9 +319,19 @@ private:
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         while (running_)
         {
-            nostr_->publishEphemeral(SIGNALING_KIND, roomKey_, buildPresenceMsg(myDeviceId_, myName_));
-            if (!isHost_ && !hostId_.empty())
-                pm_->connect(hostId_); // guest dials the star center
+            try
+            {
+                nostr_->publishEphemeral(SIGNALING_KIND, roomKey_, buildPresenceMsg(myDeviceId_, myName_));
+                if (!isHost_ && !hostId_.empty())
+                    pm_->connect(hostId_); // guest dials the star center
+            }
+            catch (const std::exception &e)
+            {
+                nnlog(std::string("presence loop caught: ") + e.what());
+            }
+            catch (...)
+            {
+            }
             for (int t = 0; t < 1000 && running_; t += 100)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
@@ -278,7 +375,7 @@ private:
     {
         // Parse under sigMtx_ (sjson is not thread-safe + the context is shared),
         // extract the fields we need, then release before touching other locks.
-        std::string type;
+        std::string type, joinName;
         int yourSlot = -1, hostSlot = 0;
         {
             std::lock_guard<std::mutex> lk(sigMtx_);
@@ -292,15 +389,18 @@ private:
             type = t;
             yourSlot = sjson_get_int(root, "yourSlot", -1);
             hostSlot = sjson_get_int(root, "hostSlot", 0);
+            const char *jn = sjson_get_string(root, "name", nullptr);
+            if (jn)
+                joinName = jn;
         }
         if (type == "join" && isHost_)
-            hostHandleJoin(peer);
+            hostHandleJoin(peer, joinName);
         else if (type == "join_ok" && !isHost_)
             guestHandleJoinOk(peer, yourSlot, hostSlot);
         // rtt_ping/pong + kick: later refinement; not needed to establish a game.
     }
 
-    void hostHandleJoin(const std::string &peer)
+    void hostHandleJoin(const std::string &peer, const std::string &name)
     {
         int slot;
         {
@@ -310,6 +410,7 @@ private:
             slot = nextFreeSlot();
             tokenToDevice_[slot] = peer;
             deviceToToken_[peer] = slot;
+            deviceName_[peer] = name.empty() ? "Player" : name;
             // NET_PEER_UP at connectindex==slot (drained on the game thread).
             InboundItem up;
             up.kind = InboundItem::PeerEvent;
@@ -323,6 +424,8 @@ private:
         pm_->sendControl(peer, ok);
         printf("[nnet] host: %s joined as slot %d\n", peer.c_str(), slot);
         fflush(stdout);
+        updateRoster();
+        setStatus("Player joined - press Launch Game to start.");
     }
 
     void guestHandleJoinOk(const std::string &peer, int yourSlot, int hostSlot)
@@ -351,6 +454,8 @@ private:
         pm_->setAttached(peer, true);
         printf("[nnet] guest: joined host %s as slot %d\n", peer.c_str(), yourSlot);
         fflush(stdout);
+        setJoined(yourSlot); // NetMenu_OnJoined -> advance the menu to the lobby
+        setStatus("Connected - waiting for the host to start...");
     }
 
     int nextFreeSlot() // caller holds mtx_; host is 0, guests take the lowest free >=1
@@ -361,13 +466,101 @@ private:
         return 1;
     }
 
+    void ensureSignaling() // subscribe to the room + start presence (once per match)
+    {
+        if (signalingStarted_)
+            return;
+        signalingStarted_ = true;
+        nostr_->subscribeEphemeral(SIGNALING_KIND, roomKey_, [this](const std::string &payload) { onSignal(payload); });
+        if (!presenceThread_.joinable())
+            presenceThread_ = std::thread([this] { presenceLoop(); });
+    }
+
+    // URL-safe base64 of {roomKey,hostId,name,maxPlayers} (matches the browser invite shape).
+    std::string makeInvite()
+    {
+        std::string json = "{\"v\":1,\"roomKey\":" + jsonStr(roomKey_) + ",\"hostId\":" + jsonStr(myDeviceId_) +
+                           ",\"name\":" + jsonStr(matchName_) + ",\"maxPlayers\":" + std::to_string(maxPlayers_) + "}";
+        std::string b64 = base64Encode((const uint8_t *)json.data(), json.size());
+        for (char &c : b64) { if (c == '+') c = '-'; else if (c == '/') c = '_'; }
+        while (!b64.empty() && b64.back() == '=')
+            b64.pop_back();
+        return b64;
+    }
+
+    bool parseInvite(const std::string &code, std::string &key, std::string &hid, std::string &name)
+    {
+        std::string t;
+        for (char c : code)
+            if (!isspace((unsigned char)c))
+                t += c;
+        for (char &c : t) { if (c == '-') c = '+'; else if (c == '_') c = '/'; }
+        while (t.size() % 4)
+            t += '=';
+        Bytes raw;
+        if (!base64Decode(t, raw) || raw.empty())
+            return false;
+        std::string json((const char *)raw.data(), raw.size());
+        std::lock_guard<std::mutex> lk(sigMtx_);
+        sjson_reset_context(sigCtx_);
+        sjson_node *root = sjson_decode(sigCtx_, json.c_str());
+        if (!root || root->tag != SJSON_OBJECT)
+            return false;
+        const char *k = sjson_get_string(root, "roomKey", nullptr);
+        const char *h = sjson_get_string(root, "hostId", nullptr);
+        if (!k || !h)
+            return false;
+        key = k;
+        hid = h;
+        const char *n = sjson_get_string(root, "name", "Duke Match");
+        name = n ? n : "Duke Match";
+        return true;
+    }
+
+    void setStatus(const std::string &s)
+    {
+        std::lock_guard<std::mutex> lk(menuMtx_);
+        pendingStatus_ = s;
+        hasStatus_ = true;
+    }
+    void setJoined(int slot)
+    {
+        std::lock_guard<std::mutex> lk(menuMtx_);
+        pendingJoined_ = slot;
+        hasJoined_ = true;
+    }
+    void updateRoster() // build [{name,connected,ping}] for NetMenu_SetRoster
+    {
+        std::string json = "[";
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            json += "{\"name\":" + jsonStr(myName_) + ",\"connected\":true,\"ping\":0}";
+            for (auto &kv : tokenToDevice_)
+            {
+                auto n = deviceName_.find(kv.second);
+                std::string nm = n != deviceName_.end() ? n->second : std::string("Player");
+                json += ",{\"name\":" + jsonStr(nm) + ",\"connected\":true,\"ping\":-1}";
+            }
+        }
+        json += "]";
+        std::lock_guard<std::mutex> lk(menuMtx_);
+        pendingRoster_ = json;
+        hasRoster_ = true;
+    }
+
     bool isHost_ = false;
     std::atomic<bool> running_{ false };
     std::atomic<bool> launched_{ false };
     bool attached_ = false;
+    bool signalingStarted_ = false;
+    bool isPublic_ = false;
+    bool localOnly_ = false;
+    bool autoLaunch_ = false;
     int myConnectIndex_ = 0;
     int minPlayers_ = 2;
-    std::string relay_, roomKey_, hostId_, myName_, myDeviceId_;
+    int maxPlayers_ = 8;
+    std::string roomKey_, hostId_, myName_, myDeviceId_, matchName_, invite_;
+    std::vector<std::string> relays_;
 
     std::unique_ptr<NostrClient> nostr_;
     std::unique_ptr<PeerManager> pm_;
@@ -378,7 +571,14 @@ private:
     std::deque<InboundItem> inbound_;
     std::map<int, std::string> tokenToDevice_;
     std::map<std::string, int> deviceToToken_;
+    std::map<std::string, std::string> deviceName_; // peer deviceId -> display name
     std::thread presenceThread_;
+
+    // Menu update queue (produced on worker threads, applied by menuPump on the game thread).
+    std::mutex menuMtx_;
+    std::string pendingStatus_, pendingRoster_;
+    int pendingJoined_ = -1;
+    bool hasStatus_ = false, hasRoster_ = false, hasJoined_ = false;
 };
 
 std::unique_ptr<NativeTransport> g_t;
@@ -394,8 +594,21 @@ void net_transport_init(void)
         return;
     rtc::InitLogger(rtc::LogLevel::Warning);
     g_t = std::make_unique<NativeTransport>();
-    if (!g_t->start())
-        g_t.reset(); // no NN_ROLE / bad config: run inert, exactly like the stub
+    bool ok = false;
+    try
+    {
+        ok = g_t->configure();
+    }
+    catch (const std::exception &e)
+    {
+        nnlog(std::string("configure() threw: ") + e.what());
+    }
+    catch (...)
+    {
+        nnlog("configure() threw: unknown");
+    }
+    if (!ok)
+        g_t.reset(); // setup failed: run inert, exactly like the stub
     g_inited = true;
 }
 
@@ -439,6 +652,30 @@ void net_native_mark_launched(void)
 {
     if (g_t)
         g_t->markLaunched();
+}
+
+// ── Menu action bridge (called from menus.cpp on native; see NETMENU) ────────
+void net_native_host(int isPublic, const char *name, int maxPlayers, const char *player, int localOnly)
+{
+    if (g_t)
+        g_t->hostMatch(isPublic, name ? name : "", maxPlayers, player ? player : "", localOnly);
+}
+void net_native_join_code(const char *code, const char *player)
+{
+    if (g_t)
+        g_t->joinMatch(code ? code : "", player ? player : "");
+}
+void net_native_leave(void)
+{
+    if (g_t)
+        g_t->leave();
+}
+void net_native_browse(int /*start*/) { /* native public-match browse not wired yet */ }
+void net_native_set_ingame(int /*in_game*/) { /* native advert / accept-gate not wired yet */ }
+void net_native_menu_pump(void)
+{
+    if (g_t)
+        g_t->menuPump();
 }
 
 } // extern "C"

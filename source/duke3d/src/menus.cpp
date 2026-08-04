@@ -39,12 +39,20 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "joystick.h"
 
 // In-engine WebRTC/Nostr multiplayer menu (eduke32-wasm). Everything it adds is gated
-// on NETMENU_WASM so the flag-OFF deploy build stays byte-identical; the guard is only
+// on NETMENU so the flag-OFF deploy build stays byte-identical; the guard is only
 // ever defined for the Emscripten NetDuke32 build.
-#if defined(NETDUKE32) && defined(__EMSCRIPTEN__)
-# define NETMENU_WASM 1
-# include <emscripten.h>
+// The in-engine WebRTC/Nostr multiplayer menu is available in BOTH the Emscripten
+// build (JS transport) and the native NETNATIVE build (C++ transport). The menu
+// structure + the NetMenu_* setters are shared (NETMENU); only the action bridge
+// (how a menu action reaches the transport) differs per platform.
+#if defined(NETDUKE32) && (defined(__EMSCRIPTEN__) || defined(NETNATIVE))
+# define NETMENU 1
 # include "sjson.h"
+# ifdef __EMSCRIPTEN__
+#  include <emscripten.h>
+# else
+#  define EMSCRIPTEN_KEEPALIVE   // emscripten export attribute: a no-op on native
+# endif
 #endif
 
 #ifndef __ANDROID__
@@ -379,7 +387,7 @@ MAKE_MENU_TOP_ENTRYLINK( "End Game", MEF_MainMenu, MAIN_QUITTOTITLE, MENU_QUITTO
 MAKE_MENU_TOP_ENTRYLINK( "Quit", MEF_MainMenu, MAIN_QUIT, MENU_QUIT );
 #ifndef EDUKE32_RETAIL_MENU
 MAKE_MENU_TOP_ENTRYLINK( "Quit Game", MEF_MainMenu, MAIN_QUITGAME, MENU_QUIT );
-#ifdef NETMENU_WASM
+#ifdef NETMENU
 MAKE_MENU_TOP_ENTRYLINK( "Multiplayer", MEF_MainMenu, MAIN_MULTIPLAYER, MENU_NETWORK );
 #endif
 #endif
@@ -387,7 +395,7 @@ MAKE_MENU_TOP_ENTRYLINK( "Multiplayer", MEF_MainMenu, MAIN_MULTIPLAYER, MENU_NET
 static MenuEntry_t *MEL_MAIN[] = {
     &ME_MAIN_NEWGAME,
     &ME_MAIN_LOADGAME,
-#ifdef NETMENU_WASM
+#ifdef NETMENU
     &ME_MAIN_MULTIPLAYER,
 #endif
     &ME_MAIN_OPTIONS,
@@ -1519,7 +1527,7 @@ static MenuEntry_t *MEL_NETJOIN[] = {
     &ME_NETJOIN_CONNECT,
 };
 
-#ifdef NETMENU_WASM
+#ifdef NETMENU
 // ===========================================================================
 //  In-engine WebRTC/Nostr multiplayer menu (eduke32-wasm) — a thin renderer over
 //  window.DukeNet. JS pushes lobby/roster/status/progress through the NetMenu_*
@@ -1587,51 +1595,109 @@ static void netmenu_js_quote(char *dst, int dstsize, const char *src)
     dst[j] = 0;
 }
 
-// --- action bridge (C -> window.DukeNet / window.NetMenu) ------------------
+// --- action bridge (C -> transport) ----------------------------------------
+// Browser: run_script into window.NetMenu (the JS transport). Native: call the
+// C++ transport API directly (net_transport_native.cpp), which drives the same
+// NetMenu_* setters back into this menu.
+#ifdef NETNATIVE
+extern "C" {
+    void net_native_host(int isPublic, const char *name, int maxPlayers, const char *player, int localOnly);
+    void net_native_join_code(const char *code, const char *player);
+    void net_native_leave(void);
+    void net_native_browse(int start);
+    void net_native_set_ingame(int in_game);
+    void net_native_menu_pump(void);   // apply queued menu updates on the game thread
+}
+#endif
+
 static void netmenu_host(void)
 {
+#ifdef __EMSCRIPTEN__
     char name[80], player[80], script[256];
     netmenu_js_quote(name, sizeof name, s_netMatchName);
     netmenu_js_quote(player, sizeof player, szPlayerName);
     Bsnprintf(script, sizeof script, "window.NetMenu&&window.NetMenu.host(%d,%s,%d,%s,%d)",
               s_netHostPublic ? 1 : 0, name, (int)s_netMaxPlayers, player, s_netLocalOnly ? 1 : 0);
     emscripten_run_script(script);
+#else
+    net_native_host(s_netHostPublic ? 1 : 0, s_netMatchName, (int)s_netMaxPlayers, szPlayerName, s_netLocalOnly ? 1 : 0);
+#endif
 }
 static void netmenu_join_row(int idx)
 {
+#ifdef __EMSCRIPTEN__
     char player[80], script[160];
     netmenu_js_quote(player, sizeof player, szPlayerName);
     Bsnprintf(script, sizeof script, "window.NetMenu&&window.NetMenu.joinRow(%d,%s)", idx, player);
     emscripten_run_script(script);
+#else
+    (void)idx;   // native public-match browse not wired yet
+#endif
 }
 static void netmenu_join_code(void)
 {
+#ifdef __EMSCRIPTEN__
     char code[176], player[80], script[320];
     netmenu_js_quote(code, sizeof code, s_netJoinCode);
     netmenu_js_quote(player, sizeof player, szPlayerName);
     Bsnprintf(script, sizeof script, "window.NetMenu&&window.NetMenu.joinCode(%s,%s)", code, player);
     emscripten_run_script(script);
+#else
+    net_native_join_code(s_netJoinCode, szPlayerName);
+#endif
 }
 static void netmenu_set_ping(int idx)
-{ char s[96]; Bsnprintf(s, sizeof s, "window.NetMenu&&window.NetMenu.setPing(%d)", idx); emscripten_run_script(s); }
+{
+#ifdef __EMSCRIPTEN__
+    char s[96]; Bsnprintf(s, sizeof s, "window.NetMenu&&window.NetMenu.setPing(%d)", idx); emscripten_run_script(s);
+#else
+    (void)idx;
+#endif
+}
 static void netmenu_set_share(int shareOn)
-{ char s[96]; Bsnprintf(s, sizeof s, "window.NetMenu&&window.NetMenu.setAllowDl(%d)", shareOn ? 0 : 1); emscripten_run_script(s); }
+{
+#ifdef __EMSCRIPTEN__
+    char s[96]; Bsnprintf(s, sizeof s, "window.NetMenu&&window.NetMenu.setAllowDl(%d)", shareOn ? 0 : 1); emscripten_run_script(s);
+#else
+    (void)shareOn;   // native GRP sharing not wired yet
+#endif
+}
 static void netmenu_browse(int start)
-{ emscripten_run_script(start ? "window.NetMenu&&window.NetMenu.startBrowse()" : "window.NetMenu&&window.NetMenu.stopBrowse()"); }
+{
+#ifdef __EMSCRIPTEN__
+    emscripten_run_script(start ? "window.NetMenu&&window.NetMenu.startBrowse()" : "window.NetMenu&&window.NetMenu.stopBrowse()");
+#else
+    net_native_browse(start);
+#endif
+}
 static void netmenu_leave(void)
-{ emscripten_run_script("window.NetMenu&&window.NetMenu.leave()"); }
+{
+#ifdef __EMSCRIPTEN__
+    emscripten_run_script("window.NetMenu&&window.NetMenu.leave()");
+#else
+    net_native_leave();
+#endif
+}
 static void netmenu_pull_grp_labels(void)
 {
+#ifdef __EMSCRIPTEN__
     const char *s = emscripten_run_script_string(
         "(function(){try{var g=window.DukeNet&&DukeNet.getLocalGrp();return g&&g.labels?g.labels.join(', '):'';}catch(e){return '';}})()");
     netmenu_clamp(s_netGrpLabels, sizeof s_netGrpLabels, s);
+#else
+    s_netGrpLabels[0] = 0;   // native GRP advert not wired yet
+#endif
 }
 
 // Engine lifecycle -> JS advert/accept-gate (called from network.cpp / game.cpp too).
 extern "C" void NetMenu_SetInGame(int in_game)
 {
+#ifdef __EMSCRIPTEN__
     emscripten_run_script(in_game ? "window.DukeNet&&window.DukeNet.setInGame(true)"
                                   : "window.DukeNet&&window.DukeNet.setInGame(false)");
+#else
+    net_native_set_ingame(in_game);
+#endif
 }
 
 // --- screen layout (framework-native: same fonts/macros/formats as neighbours) ---
@@ -1695,7 +1761,7 @@ static MenuEntry_t *MEL_NET_JOINCODE[] = { &ME_NET_JOINCODE, &ME_NET_JOINCODE_CO
 static MenuLink_t MEO_NET_LOBBY_LEAVE = { MENU_NETWORK, MA_Return, };
 static MenuEntry_t ME_NET_LOBBY_LEAVE = MAKE_MENUENTRY( "Leave", &MF_Redfont, &MEF_NetLobby, &MEO_NET_LOBBY_LEAVE, Link );
 static MenuEntry_t *MEL_NET_LOBBY[] = { &ME_NETHOST_LAUNCH, &ME_NET_LOBBY_LEAVE, };
-#endif // NETMENU_WASM
+#endif // NETMENU
 
 
 #define NoTitle NULL
@@ -1745,7 +1811,7 @@ static MenuMenu_t M_SAVE = MAKE_MENUMENU_CUSTOMSIZE( s_SaveGame, &MMF_LoadSave, 
 static MenuMenu_t M_SOUND = MAKE_MENUMENU( "Sound Setup", &MMF_BigOptions, MEL_SOUND );
 static MenuMenu_t M_SOUND_DEVSETUP = MAKE_MENUMENU( "Device Configuration", &MMF_BigOptions, MEL_SOUND_DEVSETUP );
 static MenuMenu_t M_SAVESETUP = MAKE_MENUMENU( "Save Setup", &MMF_BigOptions, MEL_SAVESETUP );
-#ifdef NETMENU_WASM
+#ifdef NETMENU
 static MenuMenu_t M_NETWORK = MAKE_MENUMENU( "Multiplayer", &MMF_Top_Joystick_Network, MEL_NETWORK_ND );
 #else
 static MenuMenu_t M_NETWORK = MAKE_MENUMENU( "Network Game", &MMF_Top_Joystick_Network, MEL_NETWORK );
@@ -1755,7 +1821,7 @@ static MenuMenu_t M_MACROS = MAKE_MENUMENU( "Multiplayer Macros", &MMF_Macros, M
 static MenuMenu_t M_NETHOST = MAKE_MENUMENU( "Host Network Game", &MMF_SmallOptionsNarrow, MEL_NETHOST );
 static MenuMenu_t M_NETOPTIONS = MAKE_MENUMENU( "Net Game Options", &MMF_NetSetup, MEL_NETOPTIONS );
 static MenuMenu_t M_NETJOIN = MAKE_MENUMENU( "Join Network Game", &MMF_SmallOptionsNarrow, MEL_NETJOIN );
-#ifdef NETMENU_WASM
+#ifdef NETMENU
 static MenuMenu_t M_NET_HOSTCFG  = MAKE_MENUMENU( "Host Game", &MMF_SmallOptions, MEL_NET_HOSTCFG );
 static MenuMenu_t M_NET_BROWSE   = MAKE_MENUMENU_CUSTOMSIZE( "Browse Public Games", &MMF_NetBrowse, MEL_NET_BROWSE );
 static MenuMenu_t M_NET_JOINCODE = MAKE_MENUMENU( "Join by Code", &MMF_SmallOptions, MEL_NET_JOINCODE );
@@ -1906,7 +1972,7 @@ static Menu_t Menus[] = {
     { &M_NETHOST, MENU_NETHOST, MENU_NETWORK, MA_Return, Menu },
     { &M_NETOPTIONS, MENU_NETOPTIONS, MENU_NETWORK, MA_Return, Menu },
     { &M_USERMAP, MENU_NETUSERMAP, MENU_NETOPTIONS, MA_Return, FileSelect },
-#ifdef NETMENU_WASM
+#ifdef NETMENU
     { &M_NET_HOSTCFG, MENU_NET_HOSTCFG, MENU_NETWORK, MA_Return, Menu },
     { &M_NET_BROWSE, MENU_NET_BROWSE, MENU_NETWORK, MA_Return, Menu },
     { &M_NET_JOINCODE, MENU_NET_JOINCODE, MENU_NETWORK, MA_Return, Menu },
@@ -1920,7 +1986,7 @@ static CONSTEXPR const uint16_t numMenus = ARRAY_SIZE(Menus);
 Menu_t *m_currentMenu = &Menus[0];
 static Menu_t *m_previousMenu = &Menus[0];
 
-#ifdef NETMENU_WASM
+#ifdef NETMENU
 // Rebuild the scrollable BROWSE list from the cached lobby rows. Uses a FIXED entry
 // array (never realloced) so each row's laid-out ytop survives lobby pushes and the
 // per-row columns drawn in Menu_PreDraw never flicker. Rows arrive already sorted by JS
@@ -2052,7 +2118,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void NetMenu_OnJoined(int myConnectIndex)
     if (g_player[myconnectindex].ps->gm & MODE_MENU)
         Menu_Change(MENU_NET_LOBBY);
 }
-#endif // NETMENU_WASM
+#endif // NETMENU
 static Menu_t * m_parentMenu;
 
 MenuID_t g_currentMenu;
@@ -3126,7 +3192,7 @@ static void Menu_Pre(MenuID_t cm)
         MEL_NETOPTIONS[5] = (g_gametypeFlags[ud.m_coop] & (GAMETYPE_PLAYERSFRIENDLY|GAMETYPE_TDM)) ? &ME_NETOPTIONS_FRFIRE : &ME_NETOPTIONS_MAPEXITS;
         break;
 
-#ifdef NETMENU_WASM
+#ifdef NETMENU
     case MENU_NET_LOBBY:
         // Only the host (connectindex 0) may launch the game; guests just wait.
         MenuEntry_HideOnCondition(&ME_NETHOST_LAUNCH, s_netMyConnectIndex != 0);
@@ -3321,7 +3387,7 @@ static void msaveloadtext(const vec2_t& origin, int level, int volume, int skill
     }
 }
 
-#ifdef NETMENU_WASM
+#ifdef NETMENU
 // Right-aligned minifont (mminitext is left-only) for the browse "ping" column.
 static void netmenu_mtext_r(int32_t x, int32_t y, char const *t, int32_t pal)
 {
@@ -3423,7 +3489,7 @@ static void Menu_PreDraw(MenuID_t cm, MenuEntry_t* entry, const vec2_t origin)
         }
         break;
 
-#ifdef NETMENU_WASM
+#ifdef NETMENU
     case MENU_NET_HOSTCFG:
         // Read-only info BELOW the Name/MaxPlayers/Sharing/Start entries (which end
         // ~y+95) and above the status line (y+176), so nothing overlaps the START row.
@@ -4422,7 +4488,7 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
         break;
     }
 
-#ifdef NETMENU_WASM
+#ifdef NETMENU
     case MENU_NETWORK:
         // HOST PUBLIC / HOST PRIVATE record the mode, then the link advances to config.
         if (entry == &ME_NET_ROOT_HOSTPUB || entry == &ME_NET_ROOT_HOSTPRIV)
@@ -4579,7 +4645,7 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
 #endif
     else if (entry == &ME_NETHOST_LAUNCH)
     {
-#ifdef NETMENU_WASM
+#ifdef NETMENU
         // WebRTC host launch. Only the host reaches this entry (hidden for guests via
         // HideOnCondition on s_netMyConnectIndex != 0). Works at any player count.
         //
@@ -4629,7 +4695,7 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
         }
 #endif
     }
-#ifdef NETMENU_WASM
+#ifdef NETMENU
     else if (entry == &ME_NET_CFG_START)
     {
         s_netMyConnectIndex = 0;           // hosting -> connectindex 0
@@ -4762,7 +4828,7 @@ static int32_t Menu_EntryOptionModify(MenuEntry_t *entry, int32_t newOption)
             }
         }
     }
-#ifdef NETMENU_WASM
+#ifdef NETMENU
     else if (entry == &ME_NET_MAXPING)
         netmenu_set_ping(newOption);       // cycles DukeNet.pingPresets()[newOption]
     else if (entry == &ME_NET_CFG_SHARE)
@@ -5800,7 +5866,7 @@ static void Menu_AboutToStartDisplaying(Menu_t * m)
             Menu_RefreshSoundProperties();
         break;
 
-#ifdef NETMENU_WASM
+#ifdef NETMENU
     case MENU_NET_BROWSE:
         // Populate the list (>=1 active entry) BEFORE the type-switch validates the
         // selection below, so an empty lobby shows the placeholder instead of asserting.
@@ -5851,7 +5917,7 @@ static void Menu_ChangingTo(Menu_t * m)
             m->parentID = g_previousMenu;
         break;
 
-#ifdef NETMENU_WASM
+#ifdef NETMENU
     case MENU_NET_BROWSE:
         netmenu_browse(1);            // subscribe to the public lobby
         break;
@@ -8712,6 +8778,9 @@ void M_DisplayMenus(void)
     vec2_t origin = { 0, 0 }, previousOrigin = { 0, 0 };
 
     Net_GetPackets();
+#ifdef NETNATIVE
+    net_native_menu_pump(); // apply queued transport -> NetMenu_* updates on the game thread
+#endif
 
     if ((g_player[myconnectindex].ps->gm&MODE_MENU) == 0)
     {
