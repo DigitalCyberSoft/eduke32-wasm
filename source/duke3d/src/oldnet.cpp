@@ -1013,8 +1013,22 @@ void Net_SetLocalIndex(int slot)
     if ((unsigned)slot >= MAXPLAYERS)
         return;
 
+    // The local player's IDENTITY moves to the host-assigned slot -- but the
+    // pre-game UI mode bits (gm: MODE_MENU/MODE_TYPE) are PER-PLAYER state.
+    // The new slot's player starts with gm==0, so switching without carrying
+    // gm across silently closes the joiner's menu: M_DisplayMenus early-outs
+    // on (gm & MODE_MENU)==0 and NetMenu_OnJoined's MODE_MENU gate then skips
+    // the advance to the lobby. The joiner ends up staring at the background
+    // wallpaper while fully joined on the wire.
+    int const prev = myconnectindex;
     myconnectindex = screenpeek = slot;
     g_player[slot].connected    = 1;
+    if (slot != prev && g_player[slot].ps != NULL && g_player[prev].ps != NULL
+        && !(g_player[slot].ps->gm & MODE_GAME))
+    {
+        g_player[slot].ps->gm = g_player[prev].ps->gm;
+        g_player[prev].ps->gm = 0;
+    }
     Net_RebuildConnectChain();
 }
 

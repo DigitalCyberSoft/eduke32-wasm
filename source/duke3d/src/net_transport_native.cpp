@@ -456,7 +456,7 @@ private:
         if (type == "join" && isHost_)
             hostHandleJoin(peer, joinName);
         else if (type == "join_ok" && !isHost_)
-            guestHandleJoinOk(peer, yourSlot, hostSlot);
+            guestHandleJoinOk(peer, yourSlot, hostSlot, joinName); // joinName = host's name
         // rtt_ping/pong + kick: later refinement; not needed to establish a game.
     }
 
@@ -488,7 +488,8 @@ private:
         setStatus("Player joined - press Launch Game to start.");
     }
 
-    void guestHandleJoinOk(const std::string &peer, int yourSlot, int hostSlot)
+    void guestHandleJoinOk(const std::string &peer, int yourSlot, int hostSlot,
+                           const std::string &hostName)
     {
         if (yourSlot < 0)
             return;
@@ -511,10 +512,15 @@ private:
             inbound_.push_back(std::move(up));
             attached_ = true;
         }
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            deviceName_[peer] = hostName.empty() ? "Host" : hostName;
+        }
         pm_->setAttached(peer, true);
         printf("[nnet] guest: joined host %s as slot %d\n", peer.c_str(), yourSlot);
         fflush(stdout);
         setJoined(yourSlot); // NetMenu_OnJoined -> advance the menu to the lobby
+        updateRoster();      // guests list [host, me] (star: peers via presence later)
         setStatus("Connected - waiting for the host to start...");
     }
 
@@ -552,17 +558,25 @@ private:
         pendingJoined_ = slot;
         hasJoined_ = true;
     }
-    void updateRoster() // build [{name,connected,ping}] for NetMenu_SetRoster
+    void updateRoster() // build [{name,connected,ping}] in SLOT order for NetMenu_SetRoster
     {
         std::string json = "[";
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            json += "{\"name\":" + jsonStr(myName_) + ",\"connected\":true,\"ping\":0}";
+            std::map<int, std::string> rows; // slot -> display name
             for (auto &kv : tokenToDevice_)
             {
                 auto n = deviceName_.find(kv.second);
-                std::string nm = n != deviceName_.end() ? n->second : std::string("Player");
-                json += ",{\"name\":" + jsonStr(nm) + ",\"connected\":true,\"ping\":-1}";
+                rows[kv.first] = n != deviceName_.end() ? n->second : std::string("Player");
+            }
+            rows[myConnectIndex_] = myName_; // self at the host-assigned slot
+            bool first = true;
+            for (auto &kv : rows)
+            {
+                if (!first) json += ",";
+                first = false;
+                json += "{\"name\":" + jsonStr(kv.second) + ",\"connected\":true,\"ping\":" +
+                        (kv.first == myConnectIndex_ ? std::string("0") : std::string("-1")) + "}";
             }
         }
         json += "]";
