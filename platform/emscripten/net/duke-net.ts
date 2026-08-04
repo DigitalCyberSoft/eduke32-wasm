@@ -703,10 +703,81 @@ declare global {
   }
 }
 
+// ── in-engine multiplayer menu bridge (eduke32-wasm) ──────────────────────────
+// Forwards every DukeNet event into the C menu's NetMenu_* setters, and exposes
+// window.NetMenu for the C action handlers to call back. EVERY ccall is guarded so
+// the flag-OFF deploy build (no NetMenu_* exports, no ccall yet) is a silent no-op
+// and its boot is unaffected.
+function wireInEngineMenu(): void {
+  const call = (fn: string, sig: string[], args: unknown[]): void => {
+    try {
+      const mod = (globalThis as unknown as { Module?: { ccall?: (...a: unknown[]) => unknown } }).Module;
+      if (mod && typeof mod.ccall === "function") mod.ccall(fn, null, sig, args);
+    } catch {
+      /* export absent (flag-off) or runtime not ready yet -> no-op */
+    }
+  };
+  const setStatus = (s: string): void => call("NetMenu_SetStatus", ["string"], [s]);
+  const fail = (e: unknown, what: string): void => setStatus("!" + ((e as Error)?.message || what));
+
+  const rowForMenu = (r: LobbyRow) => ({
+    matchId: r.matchId,
+    name: r.name,
+    players: r.players,
+    maxPlayers: r.maxPlayers,
+    ping: r.ping == null ? -1 : Math.round(r.ping),
+    grpState: r.haveGrp ? "have" : r.needsPaidGrp ? "paid" : "download",
+  });
+
+  let lastRows: LobbyRow[] = [];
+  dukeNet.on({
+    onStatus: (s) => setStatus(s),
+    onError: (s) => setStatus("!" + s),
+    onLobby: (rows) => {
+      lastRows = rows;
+      call("NetMenu_SetLobby", ["string"], [JSON.stringify(rows.map(rowForMenu))]);
+    },
+    onRoster: (ps) =>
+      call("NetMenu_SetRoster", ["string"], [JSON.stringify(ps.map((p) => ({ name: p.name, connected: p.connected })))]),
+    onGrpProgress: (f, l) => call("NetMenu_SetProgress", ["number", "string"], [Math.round(f * 100), l]),
+    onJoined: (i) => call("NetMenu_OnJoined", ["number"], [i.myConnectIndex]),
+  });
+
+  const NetMenu = {
+    host(isPublic: number, name: string, maxPlayers: number, player: string): void {
+      try { if (player) dukeNet.setPlayerName(player); } catch { /* keep last name */ }
+      Promise.resolve(dukeNet.host({ name, isPublic: !!isPublic, maxPlayers }))
+        .then((r) => { if (!isPublic && r?.inviteCode) setStatus("Invite code: " + r.inviteCode); })
+        .catch((e) => fail(e, "Host failed"));
+    },
+    joinRow(idx: number, player: string): void {
+      try { if (player) dukeNet.setPlayerName(player); } catch { /* keep last name */ }
+      const row = lastRows[idx];
+      if (!row) { setStatus("!That match is no longer listed"); return; }
+      Promise.resolve(dukeNet.join(row.raw)).catch((e) => fail(e, "Join failed"));
+    },
+    joinCode(code: string, player: string): void {
+      try { if (player) dukeNet.setPlayerName(player); } catch { /* keep last name */ }
+      Promise.resolve(dukeNet.join(code)).catch((e) => fail(e, "Join failed"));
+    },
+    setPing(idx: number): void {
+      const presets = dukeNet.pingPresets();
+      const p = presets[idx] ?? presets[0];
+      if (p) dukeNet.setPingFilter(p.maxMs);
+    },
+    setAllowDl(dontAllow: number): void { dukeNet.setAllowGrpDownload(!dontAllow); },
+    startBrowse(): void { try { dukeNet.startLobby(); } catch (e) { fail(e, "Lobby unavailable"); } },
+    stopBrowse(): void { try { dukeNet.stopLobby(); } catch { /* nothing to stop */ } },
+    leave(): void { try { dukeNet.leave(); } catch { /* already gone */ } },
+  };
+  (window as unknown as { NetMenu: typeof NetMenu }).NetMenu = NetMenu;
+}
+
 if (typeof window !== "undefined") {
   window.DukeNet = dukeNet;
   // Surface the local device id for diagnostics / the in-engine menu.
   (window as unknown as { DUKE_DEVICE_ID: string }).DUKE_DEVICE_ID = DEVICE_ID;
+  wireInEngineMenu();
 }
 
 export { DukeNet };
