@@ -31,6 +31,13 @@ import { sanitizeText, sanitizeName } from "./sanitize";
 export type Role = "host" | "guest";
 export type MatchStatus = "open" | "starting" | "playing";
 
+/** Capacity predicate (pure, unit-tested): does an OPEN match with `rosterSize`
+ *  members (self included) have room for one more under `maxPlayers`? A match that
+ *  has started (status !== "open") has room for nobody new. */
+export function matchHasOpenSlot(rosterSize: number, maxPlayers: number, status: MatchStatus): boolean {
+  return status === "open" && rosterSize < maxPlayers;
+}
+
 export interface MatchInfo {
   v: number;
   matchId: string;
@@ -96,6 +103,7 @@ export class Match {
   private _pruneTimer: ReturnType<typeof setInterval> | null = null;
   private _unsubSignaling: (() => void) | null = null;
   private _status: MatchStatus = "open";
+  private _announceScheduled = false;
 
   private constructor(init: MatchInit) {
     this.role = init.role;
@@ -243,9 +251,12 @@ export class Match {
     this._emitRoster();
   }
 
-  /** STAR gate: the host accepts every peer; a guest accepts ONLY the host. */
+  /** STAR + capacity gate: a guest accepts ONLY the host. The host accepts a peer it
+   *  already knows (reconnect) and, for a NEW peer, only while the match is open and
+   *  has a free slot — so a full or in-progress game stops taking joiners. */
   private _acceptsPeer(peerId: string): boolean {
-    return this.role === "host" || peerId === this.hostId;
+    if (this.role !== "host") return peerId === this.hostId;
+    return this.roster.has(peerId) || matchHasOpenSlot(this.roster.size, this.maxPlayers, this._status);
   }
 
   private _onPresence(from: string, name: string): void {
@@ -256,7 +267,12 @@ export class Match {
       existing.lastSeen = Date.now();
       existing.connected = this.peers.isConnected(from);
     } else {
+      // Host capacity/started gate: admit a NEW joiner only while open with a free
+      // slot. Guests keep tracking every room member for the roster display; they
+      // only ever *connect* to the host (see _acceptsPeer).
+      if (this.role === "host" && !matchHasOpenSlot(this.roster.size, this.maxPlayers, this._status)) return;
       this.roster.set(from, { deviceId: from, name: nm, connected: this.peers.isConnected(from), lastSeen: Date.now() });
+      if (this.isPublic) this._announceSoon(); // player count changed -> refresh the advert now
     }
     // STAR: host dials every guest; a guest dials only the host. PeerManager.connect
     // only offers when our id is smaller, so exactly one side of the pair initiates.
@@ -274,12 +290,27 @@ export class Match {
         changed = true;
       }
     }
-    if (changed) this._emitRoster();
+    if (changed) {
+      this._emitRoster();
+      if (this.isPublic) this._announceSoon(); // a player dropped -> refresh the advert
+    }
   }
 
   private async _announce(): Promise<void> {
     if (!this.isPublic) return;
     await publishReplaceable(LOBBY_KIND, PUBLIC_LOBBY_KEY, this.matchId, this.info(), this.relays);
+  }
+
+  /** Coalesced re-announce: a roster/state change refreshes the public advert within
+   *  ~500ms instead of waiting for the 15s tick, so the listed player count and the
+   *  open/full state track reality. No-op for private matches. */
+  private _announceSoon(): void {
+    if (!this.isPublic || this._announceScheduled) return;
+    this._announceScheduled = true;
+    setTimeout(() => {
+      this._announceScheduled = false;
+      void this._announce();
+    }, 500);
   }
 
   private _emitRoster(): void {
@@ -321,7 +352,10 @@ export class Match {
     if (this._pruneTimer) clearInterval(this._pruneTimer);
     this._unsubSignaling?.();
     this.peers.closeAll();
-    if (this.isPublic) this._status = "playing"; // last announcement goes stale -> drops
+    if (this.isPublic) {
+      this._status = "playing"; // not "open" -> filtered out of the public list
+      void this._announce();    // publish the final non-open record NOW so consumers drop it immediately instead of waiting the 60s TTL
+    }
   }
 }
 

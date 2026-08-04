@@ -194,6 +194,15 @@ class DukeNet {
     return this.myConnectIndex;
   }
 
+  /** The engine calls this when the local match actually starts (true) or ends
+   *  (false). On a public HOST it flips the advertised status to "playing", which
+   *  both removes the match from the public list and closes the host's accept gate
+   *  (Match._acceptsPeer keys on status === "open"), so late joiners cannot land in a
+   *  lockstep game already in progress. No-op for guests and outside a match. */
+  setInGame(inGame: boolean): void {
+    this.match?.setStatus(inGame ? "playing" : "open");
+  }
+
   // ── Hosting ────────────────────────────────────────────────────────────────
 
   async host(cfg: HostConfig): Promise<{ matchId: string; inviteCode: string; inviteUrl: string }> {
