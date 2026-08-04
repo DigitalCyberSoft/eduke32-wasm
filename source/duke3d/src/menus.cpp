@@ -3417,9 +3417,12 @@ static void Menu_PreDraw(MenuID_t cm, MenuEntry_t* entry, const vec2_t origin)
 
 #ifdef NETMENU_WASM
     case MENU_NET_HOSTCFG:
-        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (94<<16), "Advertised GRP:", MF_Minifont.pal_deselected);
-        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (102<<16), s_netGrpLabels[0] ? s_netGrpLabels : "(set on boot)", MF_Minifont.pal_selected);
-        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (114<<16), "GRP Sharing Off: others cannot download your GRP.", MF_Minifont.pal_deselected);
+        // Read-only info BELOW the Name/MaxPlayers/Sharing/Start entries (which end
+        // ~y+95) and above the status line (y+176), so nothing overlaps the START row.
+        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (128<<16), "Advertised GRP:", MF_Minifont.pal_deselected);
+        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (138<<16), s_netGrpLabels[0] ? s_netGrpLabels : "(set on boot)", MF_Minifont.pal_selected);
+        if (!s_netShareGrp)
+            mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (150<<16), "GRP Sharing Off: others cannot download your GRP.", MF_Minifont.pal_deselected);
         netmenu_draw_status(origin);
         break;
 
@@ -4574,11 +4577,20 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
             Net_SendNewGame(1, NULL);
 #endif
         }
+#ifdef NETMENU_WASM
+        else
+        {
+            // WebRTC lobby: no map-vote system. Lockstep needs every player present
+            // at tic 0, so the host can only launch once a guest has joined.
+            NetMenu_SetStatus("!Waiting for a player to join before you can launch.");
+        }
+#else
         else if (voting == -1)
         {
             Net_SendMapVoteInitiate();
             Menu_Change(MENU_NETWAITVOTES);
         }
+#endif
     }
 #ifdef NETMENU_WASM
     else if (entry == &ME_NET_CFG_START)

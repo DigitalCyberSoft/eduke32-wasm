@@ -36,6 +36,7 @@ import {
   prepareGrpSend,
   setFingerprint,
   fingerprintFsFile,
+  scanFsGrps,
   type EmscriptenFS,
 } from "./grp";
 import { classifyByCrc } from "./grptable";
@@ -720,6 +721,23 @@ function wireInEngineMenu(): void {
   const setStatus = (s: string): void => call("NetMenu_SetStatus", ["string"], [s]);
   const fail = (e: unknown, what: string): void => setStatus("!" + ((e as Error)?.message || what));
 
+  // Fingerprint the loaded GRP the first time we host/join/browse. Nothing else
+  // initializes it, and dukeNet.host()/join() THROW without it; the engine has the
+  // GRP preloaded in Module.FS, so find the main one and hand its bytes to the
+  // transport. Idempotent (no-op once set), so it is cheap to await on every path.
+  const ensureLocalGrp = async (): Promise<void> => {
+    if (dukeNet.getLocalGrp()) return;
+    const FS = (globalThis as unknown as { Module?: { FS?: EmscriptenFS } }).Module?.FS;
+    if (!FS) return;
+    const grps = scanFsGrps(FS);
+    if (!grps.length) return;
+    let mainPath: string | null = null;
+    for (const cand of ["/" + grps[0].filename, "/data/" + grps[0].filename]) {
+      try { FS.stat(cand); mainPath = cand; break; } catch { /* try the next dir */ }
+    }
+    if (mainPath) await dukeNet.setLocalGrpFromFs(FS, [mainPath]);
+  };
+
   const rowForMenu = (r: LobbyRow) => ({
     matchId: r.matchId,
     name: r.name,
@@ -746,7 +764,8 @@ function wireInEngineMenu(): void {
   const NetMenu = {
     host(isPublic: number, name: string, maxPlayers: number, player: string): void {
       try { if (player) dukeNet.setPlayerName(player); } catch { /* keep last name */ }
-      Promise.resolve(dukeNet.host({ name, isPublic: !!isPublic, maxPlayers }))
+      ensureLocalGrp()
+        .then(() => dukeNet.host({ name, isPublic: !!isPublic, maxPlayers }))
         .then((r) => { if (!isPublic && r?.inviteCode) setStatus("Invite code: " + r.inviteCode); })
         .catch((e) => fail(e, "Host failed"));
     },
@@ -754,11 +773,11 @@ function wireInEngineMenu(): void {
       try { if (player) dukeNet.setPlayerName(player); } catch { /* keep last name */ }
       const row = lastRows[idx];
       if (!row) { setStatus("!That match is no longer listed"); return; }
-      Promise.resolve(dukeNet.join(row.raw)).catch((e) => fail(e, "Join failed"));
+      ensureLocalGrp().then(() => dukeNet.join(row.raw)).catch((e) => fail(e, "Join failed"));
     },
     joinCode(code: string, player: string): void {
       try { if (player) dukeNet.setPlayerName(player); } catch { /* keep last name */ }
-      Promise.resolve(dukeNet.join(code)).catch((e) => fail(e, "Join failed"));
+      ensureLocalGrp().then(() => dukeNet.join(code)).catch((e) => fail(e, "Join failed"));
     },
     setPing(idx: number): void {
       const presets = dukeNet.pingPresets();
@@ -766,7 +785,7 @@ function wireInEngineMenu(): void {
       if (p) dukeNet.setPingFilter(p.maxMs);
     },
     setAllowDl(dontAllow: number): void { dukeNet.setAllowGrpDownload(!dontAllow); },
-    startBrowse(): void { try { dukeNet.startLobby(); } catch (e) { fail(e, "Lobby unavailable"); } },
+    startBrowse(): void { void ensureLocalGrp().then(() => dukeNet.startLobby()).catch((e) => fail(e, "Lobby unavailable")); },
     stopBrowse(): void { try { dukeNet.stopLobby(); } catch { /* nothing to stop */ } },
     leave(): void { try { dukeNet.leave(); } catch { /* already gone */ } },
   };
