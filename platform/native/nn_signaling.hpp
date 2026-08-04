@@ -38,10 +38,12 @@ inline std::string buildIceMsg(const std::string &from, const std::string &to, c
            ",\"sdpMid\":" + jsonStr(mid) + ",\"sdpMLineIndex\":null,\"ts\":" + std::to_string(nowMs()) + "}";
 }
 
-inline std::string buildPresenceMsg(const std::string &from, const std::string &name)
+// `isHost` lets a guest that joined with only the room key discover which peer is
+// the star center (so the invite code need not carry the host device id).
+inline std::string buildPresenceMsg(const std::string &from, const std::string &name, bool isHost = false)
 {
-    return "{\"type\":\"presence\",\"from\":" + jsonStr(from) + ",\"name\":" + jsonStr(name) + ",\"ts\":" +
-           std::to_string(nowMs()) + "}";
+    return "{\"type\":\"presence\",\"from\":" + jsonStr(from) + ",\"name\":" + jsonStr(name) +
+           ",\"host\":" + (isHost ? "true" : "false") + ",\"ts\":" + std::to_string(nowMs()) + "}";
 }
 
 struct SignalMsg
@@ -53,6 +55,7 @@ struct SignalMsg
     std::string candidate;
     std::string sdpMid;
     std::string name;
+    bool host = false;  // presence: is the sender the match host?
 };
 
 // Parse a decrypted signaling payload. Returns false on malformed input.
@@ -73,6 +76,7 @@ inline bool parseSignal(sjson_context *ctx, const std::string &json, SignalMsg &
     out.candidate = get("candidate");
     out.sdpMid = get("sdpMid");
     out.name = get("name");
+    out.host = sjson_get_bool(root, "host", false);
     return true;
 }
 

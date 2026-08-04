@@ -41,7 +41,9 @@ if (!hostId) {
   process.exit(1);
 }
 
-const guest = launch("guest", { NN_ROLE: "guest", NN_KEY: KEY, NN_HOSTID: hostId, NN_RELAY: url, NN_NAME: "Guest" });
+// Join with ONLY the room key (no NN_HOSTID) - the guest must discover the host via
+// its host-flagged presence, exactly like the Multiplayer menu's Join by Code.
+const guest = launch("guest", { NN_ROLE: "guest", NN_KEY: KEY, NN_RELAY: url, NN_NAME: "Guest" });
 
 const [h, g] = await Promise.all([host.done(), guest.done()]);
 wss.close();

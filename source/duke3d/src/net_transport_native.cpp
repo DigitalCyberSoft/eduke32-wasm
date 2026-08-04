@@ -125,8 +125,8 @@ public:
         else if (role && std::string(role) == "guest")
         {
             std::string key = envOr("NN_KEY", ""), hid = envOr("NN_HOSTID", "");
-            if (!key.empty() && !hid.empty())
-                joinWithKey(key, hid, myName_);
+            if (!key.empty())
+                joinWithKey(key, hid, myName_); // hid may be empty -> discover the host via presence
         }
         return true;
     }
@@ -153,23 +153,31 @@ public:
 
     void joinMatch(const std::string &code, const std::string &player)
     {
-        std::string key, hid, name;
-        if (!parseInvite(code, key, hid, name))
+        std::string key;
+        for (char c : code)
+            if (!isspace((unsigned char)c))
+                key += c;
+        Bytes raw;
+        if (key.empty() || !base64Decode(key, raw) || raw.size() != 32)
         {
             setStatus("!Invalid invite code");
             return;
         }
-        joinWithKey(key, hid, player);
+        joinWithKey(key, "", player); // host id discovered via presence
     }
 
     void joinWithKey(const std::string &key, const std::string &hid, const std::string &player)
     {
         isHost_ = false;
         roomKey_ = key;
-        hostId_ = hid;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            hostId_ = hid;
+        }
         myName_ = player.empty() ? "Guest" : player;
         ensureSignaling();
-        pm_->connect(hostId_);
+        if (!hid.empty())
+            pm_->connect(hid);
         setStatus("Connecting to host...");
     }
 
@@ -321,9 +329,17 @@ private:
         {
             try
             {
-                nostr_->publishEphemeral(SIGNALING_KIND, roomKey_, buildPresenceMsg(myDeviceId_, myName_));
-                if (!isHost_ && !hostId_.empty())
-                    pm_->connect(hostId_); // guest dials the star center
+                nostr_->publishEphemeral(SIGNALING_KIND, roomKey_, buildPresenceMsg(myDeviceId_, myName_, isHost_));
+                if (!isHost_)
+                {
+                    std::string h;
+                    {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        h = hostId_;
+                    }
+                    if (!h.empty())
+                        pm_->connect(h); // guest dials the discovered star center
+                }
             }
             catch (const std::exception &e)
             {
@@ -349,9 +365,19 @@ private:
             return; // own echo
         if (m.type == "presence")
         {
-            // Host dials every guest it hears; guests only ever dial the host.
             if (isHost_)
+            {
+                pm_->connect(m.from); // host dials every guest it hears
+            }
+            else if (m.host) // a host announced itself: this is our star center
+            {
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    if (hostId_.empty())
+                        hostId_ = m.from;
+                }
                 pm_->connect(m.from);
+            }
             return;
         }
         if (m.to != myDeviceId_)
@@ -366,9 +392,18 @@ private:
 
     void onChannelsReady(const std::string &peer)
     {
-        // Guest: once the data channels to the host open, request a slot.
-        if (!isHost_ && peer == hostId_)
-            pm_->sendControl(peer, "{\"t\":\"join\",\"name\":" + jsonStr(myName_) + ",\"grp\":{\"crc\":0}}");
+        if (isHost_)
+            return; // host waits for the guest's join control message
+        // Guest: in a STAR topology the peer we connected to IS the host, so send join
+        // unconditionally (do NOT gate on hostId_ == peer: the host's OFFER can arrive and
+        // open channels BEFORE its presence is processed, leaving hostId_ momentarily empty
+        // -> the join was never sent -> the host never assigned a slot. That was the race).
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (hostId_.empty())
+                hostId_ = peer;
+        }
+        pm_->sendControl(peer, "{\"t\":\"join\",\"name\":" + jsonStr(myName_) + ",\"grp\":{\"crc\":0}}");
     }
 
     void onControl(const std::string &peer, const std::string &ctrl)
@@ -476,46 +511,9 @@ private:
             presenceThread_ = std::thread([this] { presenceLoop(); });
     }
 
-    // URL-safe base64 of {roomKey,hostId,name,maxPlayers} (matches the browser invite shape).
-    std::string makeInvite()
-    {
-        std::string json = "{\"v\":1,\"roomKey\":" + jsonStr(roomKey_) + ",\"hostId\":" + jsonStr(myDeviceId_) +
-                           ",\"name\":" + jsonStr(matchName_) + ",\"maxPlayers\":" + std::to_string(maxPlayers_) + "}";
-        std::string b64 = base64Encode((const uint8_t *)json.data(), json.size());
-        for (char &c : b64) { if (c == '+') c = '-'; else if (c == '/') c = '_'; }
-        while (!b64.empty() && b64.back() == '=')
-            b64.pop_back();
-        return b64;
-    }
-
-    bool parseInvite(const std::string &code, std::string &key, std::string &hid, std::string &name)
-    {
-        std::string t;
-        for (char c : code)
-            if (!isspace((unsigned char)c))
-                t += c;
-        for (char &c : t) { if (c == '-') c = '+'; else if (c == '_') c = '/'; }
-        while (t.size() % 4)
-            t += '=';
-        Bytes raw;
-        if (!base64Decode(t, raw) || raw.empty())
-            return false;
-        std::string json((const char *)raw.data(), raw.size());
-        std::lock_guard<std::mutex> lk(sigMtx_);
-        sjson_reset_context(sigCtx_);
-        sjson_node *root = sjson_decode(sigCtx_, json.c_str());
-        if (!root || root->tag != SJSON_OBJECT)
-            return false;
-        const char *k = sjson_get_string(root, "roomKey", nullptr);
-        const char *h = sjson_get_string(root, "hostId", nullptr);
-        if (!k || !h)
-            return false;
-        key = k;
-        hid = h;
-        const char *n = sjson_get_string(root, "name", "Duke Match");
-        name = n ? n : "Duke Match";
-        return true;
-    }
+    // The invite IS the room key (base64, ~44 chars: fits the 80-char join field). The
+    // joiner discovers the host via presence (host flag), so the code needs no host id.
+    std::string makeInvite() { return roomKey_; }
 
     void setStatus(const std::string &s)
     {

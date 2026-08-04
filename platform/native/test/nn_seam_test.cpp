@@ -53,6 +53,11 @@ extern "C" void Net_SetLocalIndex(int slot)
     fflush(stdout);
 }
 
+// menus.cpp provides these in the engine; stub them for the standalone seam test.
+extern "C" void NetMenu_SetStatus(const char *) {}
+extern "C" void NetMenu_SetRoster(const char *) {}
+extern "C" void NetMenu_OnJoined(int) {}
+
 int main()
 {
     net_transport_init(); // reads NN_ROLE/NN_KEY/NN_RELAY/NN_HOSTID, starts host or guest
