@@ -38,8 +38,9 @@ function runPeer(args) {
 }
 
 async function main() {
-  const { wss, url } = await startRelay(0);
-  console.log("local relay:", url);
+  const lossRate = Number(process.env.LOSS) || 0;
+  const { wss, url, stats } = await startRelay(0, { lossRate });
+  console.log("local relay:", url, lossRate ? `(signaling loss ${lossRate * 100}%)` : "");
   let ok = false, host, guest;
   try {
     host = runPeer(["host", url]);
@@ -56,7 +57,8 @@ async function main() {
   } finally {
     host?.proc.kill(); guest?.proc.kill(); wss.close();
   }
-  console.log(ok ? "\nPASS: connect + join over werift + local relay" : "\nFAIL");
+  console.log(`relay dropped ${stats.dropped} / forwarded ${stats.forwarded} signaling events`);
+  console.log(ok ? "\nPASS: connect + join over werift + local relay" : "\nFAIL: guest did not join (stall)");
   process.exit(ok ? 0 : 1);
 }
 main();

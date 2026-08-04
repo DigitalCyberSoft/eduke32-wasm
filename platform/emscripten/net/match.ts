@@ -246,6 +246,10 @@ export class Match {
     );
 
     void sendPresence(this.roomKey, this.myName, this.relays);
+    // Presence burst: re-announce a few times in the first seconds so a peer is discovered
+    // quickly even if the first presence is lost on a flaky relay (the steady interval
+    // below is only every 5 s, and the host only offers once it has heard the guest).
+    for (const t of [900, 2200, 4200]) setTimeout(() => void sendPresence(this.roomKey, this.myName, this.relays), t);
     this._presenceTimer = setInterval(() => void sendPresence(this.roomKey, this.myName, this.relays), PRESENCE_INTERVAL_MS);
     this._pruneTimer = setInterval(() => this._prune(), PRESENCE_INTERVAL_MS);
     this._emitRoster();

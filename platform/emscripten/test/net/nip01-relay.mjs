@@ -28,7 +28,9 @@ function matchFilter(e, f) {
   return true;
 }
 
-export function startRelay(port = 0) {
+export function startRelay(port = 0, opts = {}) {
+  const lossRate = opts.lossRate || 0; // fraction of EPHEMERAL (signaling) events to drop
+  const stats = { dropped: 0, forwarded: 0 };
   const store = new Map();
   const subs = new Map();
   const wss = new WebSocketServer({ port });
@@ -39,6 +41,15 @@ export function startRelay(port = 0) {
       const [type, ...rest] = msg;
       if (type === "EVENT") {
         const e = rest[0];
+        // Model a lossy public relay: ACK the sender but silently DON'T forward a
+        // fraction of ephemeral signaling (offers/answers/ICE). This is how a real
+        // relay loses ephemeral events (never stored, no replay).
+        if (lossRate > 0 && isEphemeral(e.kind) && Math.random() < lossRate) {
+          stats.dropped++;
+          if (ws.readyState === 1) ws.send(JSON.stringify(["OK", e.id, true, ""]));
+          return;
+        }
+        if (isEphemeral(e.kind)) stats.forwarded++;
         if (!isEphemeral(e.kind)) {
           const k = storeKey(e), prev = store.get(k);
           if (!prev || prev.created_at <= e.created_at) store.set(k, e);
@@ -61,7 +72,7 @@ export function startRelay(port = 0) {
     ws.on("close", () => subs.delete(ws));
   });
   return new Promise((resolve) => wss.on("listening", () =>
-    resolve({ wss, port: wss.address().port, url: `ws://127.0.0.1:${wss.address().port}` })));
+    resolve({ wss, stats, port: wss.address().port, url: `ws://127.0.0.1:${wss.address().port}` })));
 }
 
 // Runnable standalone: `node nip01-relay.mjs [port]` for a local/LAN Duke relay.

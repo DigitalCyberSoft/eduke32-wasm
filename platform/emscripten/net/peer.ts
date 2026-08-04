@@ -22,6 +22,12 @@ import { DEVICE_ID } from "./identity";
 import { sendOffer, sendAnswer, sendIceCandidate } from "./signaling";
 
 const MAX_BACKOFF_MS = 60_000;
+// Non-trickle resend: a lost ephemeral offer/answer on a public relay would otherwise
+// stall the handshake until ICE times out (~30 s). Wait for ICE gathering so the SDP
+// carries its own candidates, then resend that self-contained SDP on a short timer
+// until a channel opens. Reproduced + verified in test/net (LOSS=0.6).
+const RESEND_INTERVAL_MS = 1200;
+const RESEND_MAX = 12; // ~14 s of resends before deferring to _scheduleReconnect
 
 interface Conn {
   pc: RTCPeerConnection;
@@ -34,6 +40,7 @@ interface Conn {
   remoteDescSet: boolean;
   attached: boolean; // false = transport lobby protocol; true = raw netcode frames
   readyFired: boolean; // onChannelsReady emitted once all 3 channels opened
+  resendTimer: ReturnType<typeof setInterval> | null; // periodic offer/answer resend until connected
   lastHeard: number;
 }
 
@@ -71,6 +78,7 @@ export class PeerManager {
       remoteDescSet: false,
       attached: false,
       readyFired: false,
+      resendTimer: null,
       lastHeard: Date.now(),
     };
     this._conns.set(peerId, conn);
@@ -108,6 +116,7 @@ export class PeerManager {
 
     dc.onopen = () => {
       conn.lastHeard = Date.now();
+      this._clearResend(peerId); // connected: stop resending the offer/answer
       console.log(`[dnet] channel '${label}' open to ${peerId.slice(0, 8)}`);
       // Re-announce the connection so listeners see the now-usable channel (the pc
       // reaches "connected" before the channels open).
@@ -172,25 +181,43 @@ export class PeerManager {
     for (const label of DC_LABELS) this._setupDc(peerId, conn.pc.createDataChannel(label, DC_INIT[label]));
     const offer = await conn.pc.createOffer();
     await conn.pc.setLocalDescription(offer);
-    await sendOffer(conn.encKey, peerId, offer, conn.relays);
+    // Non-trickle: wait for candidates so the SDP is self-contained, then resend it until
+    // connected so a lost ephemeral offer self-heals instead of stalling.
+    await this._awaitIceGathering(conn.pc);
+    const send = () =>
+      void sendOffer(conn.encKey, peerId, { type: "offer", sdp: conn.pc.localDescription?.sdp ?? offer.sdp }, conn.relays).catch(() => {});
+    send();
     console.log(`[dnet] -> offer sent to ${peerId.slice(0, 8)}`);
+    this._armResend(peerId, send);
   }
 
   async handleOffer(peerId: string, offer: RTCSessionDescriptionInit, encKey: string, relays: readonly string[]): Promise<void> {
-    console.log(`[dnet] <- offer from ${peerId.slice(0, 8)}, answering`);
     const conn = this._ensure(peerId, encKey, relays);
+    // Duplicate offer (relay resent it, or our answer was the lost message): if we
+    // already answered, just re-send that answer rather than renegotiating.
+    if (conn.remoteDescSet && conn.pc.signalingState === "stable" && conn.pc.localDescription?.type === "answer") {
+      void sendAnswer(encKey, peerId, { type: "answer", sdp: conn.pc.localDescription.sdp }, relays).catch(() => {});
+      return;
+    }
+    console.log(`[dnet] <- offer from ${peerId.slice(0, 8)}, answering`);
     await conn.pc.setRemoteDescription(new RTCSessionDescription(offer));
     conn.remoteDescSet = true;
     await this._flushIce(peerId);
     const answer = await conn.pc.createAnswer();
     await conn.pc.setLocalDescription(answer);
-    await sendAnswer(encKey, peerId, answer, relays);
+    await this._awaitIceGathering(conn.pc);
+    const send = () =>
+      void sendAnswer(encKey, peerId, { type: "answer", sdp: conn.pc.localDescription?.sdp ?? answer.sdp }, relays).catch(() => {});
+    send();
+    this._armResend(peerId, send);
   }
 
   async handleAnswer(peerId: string, answer: RTCSessionDescriptionInit): Promise<void> {
-    console.log(`[dnet] <- answer from ${peerId.slice(0, 8)}`);
     const conn = this._conns.get(peerId);
     if (!conn) return;
+    if (conn.pc.signalingState === "stable") return; // duplicate answer (resend); already applied
+    console.log(`[dnet] <- answer from ${peerId.slice(0, 8)}`);
+    this._clearResend(peerId); // answer arrived; stop resending our offer
     await conn.pc.setRemoteDescription(new RTCSessionDescription(answer));
     conn.remoteDescSet = true;
     await this._flushIce(peerId);
@@ -296,6 +323,42 @@ export class PeerManager {
     return Date.now() - conn.lastHeard;
   }
 
+  /** Resolve when ICE gathering completes (all candidates in the SDP) or a timeout, so
+   *  the offer/answer we (re)send is self-contained. Bounded so a slow/blocked STUN
+   *  server cannot hang the handshake. Polls to stay portable across WebRTC impls. */
+  private _awaitIceGathering(pc: RTCPeerConnection, timeoutMs = 2500): Promise<void> {
+    return new Promise((resolve) => {
+      if (pc.iceGatheringState === "complete") return resolve();
+      const t0 = Date.now();
+      const iv = setInterval(() => {
+        if (pc.iceGatheringState === "complete" || Date.now() - t0 > timeoutMs) { clearInterval(iv); resolve(); }
+      }, 80);
+    });
+  }
+
+  /** Resend a signaling payload on a short timer until a channel opens (bounded), so a
+   *  lost ephemeral offer/answer self-heals instead of stalling. */
+  private _armResend(peerId: string, send: () => void): void {
+    const conn = this._conns.get(peerId);
+    if (!conn) return;
+    if (conn.resendTimer) clearInterval(conn.resendTimer);
+    let attempts = 0;
+    conn.resendTimer = setInterval(() => {
+      const c = this._conns.get(peerId);
+      if (!c) return;
+      if (DC_LABELS.some((l) => c.dcs.get(l)?.readyState === "open") || ++attempts > RESEND_MAX) {
+        this._clearResend(peerId);
+        return;
+      }
+      send();
+    }, RESEND_INTERVAL_MS);
+  }
+
+  private _clearResend(peerId: string): void {
+    const conn = this._conns.get(peerId);
+    if (conn?.resendTimer) { clearInterval(conn.resendTimer); conn.resendTimer = null; }
+  }
+
   private _scheduleReconnect(peerId: string): void {
     const conn = this._conns.get(peerId);
     if (!conn || conn.reconnectTimer) return;
@@ -313,6 +376,7 @@ export class PeerManager {
     const conn = this._conns.get(peerId);
     if (!conn) return;
     if (conn.reconnectTimer) clearTimeout(conn.reconnectTimer);
+    if (conn.resendTimer) clearInterval(conn.resendTimer);
     for (const dc of conn.dcs.values())
       try {
         dc.close();
