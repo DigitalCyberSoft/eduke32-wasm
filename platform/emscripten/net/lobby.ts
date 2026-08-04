@@ -73,10 +73,17 @@ export function buildLobbyRows(matches: MatchInfo[], opts: LobbyBuildOpts): Lobb
 
   const visible = rows.filter((r) => passesPingFilter(r.ping, maxMs));
 
-  // GRP-we-have to the TOP; then lower ping first (unknown last but still shown);
-  // then fuller rooms, then freshest.
+  // Sort order (mirrored by the in-engine BROWSE list, which draws rows as given):
+  //   (1) rooms whose GRP we HAVE, to the top — joinable without a download;
+  //   (2) joinable-now: rooms with an OPEN slot before FULL ones (availability);
+  //   (3) lower ping first; unknown ("?") sorts last but is never filtered out;
+  //   (4) among equal-ping rooms, more-populated first (likelier to get a game going);
+  //   (5) freshest last-seen first.
   visible.sort((a, b) => {
     if (a.haveGrp !== b.haveGrp) return a.haveGrp ? -1 : 1;
+    const aOpen = a.players < a.maxPlayers;
+    const bOpen = b.players < b.maxPlayers;
+    if (aOpen !== bOpen) return aOpen ? -1 : 1;
     const pa = a.ping ?? Number.POSITIVE_INFINITY;
     const pb = b.ping ?? Number.POSITIVE_INFINITY;
     if (pa !== pb) return pa - pb;

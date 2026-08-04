@@ -71,6 +71,22 @@ describe("buildLobbyRows — the user's lobby rules", () => {
     expect(rows.find((r) => r.matchId === "mine")!.ping).toBe(5);
   });
 
+  it("sinks a FULL have-GRP room below a non-full have-GRP room (availability beats ping)", () => {
+    // Both hold our GRP set, so tier (1) ties. The FULL room has the better ping (10 vs 90),
+    // but "joinable-now" (an open slot) outranks ping, so the non-full room sorts first.
+    const full = { ...mk("full", swFp("SW"), 10), players: 8, maxPlayers: 8 };
+    const open = { ...mk("open", swFp("SW"), 90), players: 2, maxPlayers: 8 };
+    const rows = buildLobbyRows([full, open], { localGrp: local, myRelayRttMs: 0 });
+    expect(rows.map((r) => r.matchId)).toEqual(["open", "full"]);
+  });
+
+  it("orders by ping within the same availability tier", () => {
+    const slow = { ...mk("slow", swFp("SW"), 200), players: 2, maxPlayers: 8 };
+    const fast = { ...mk("fast", swFp("SW"), 20), players: 2, maxPlayers: 8 };
+    const rows = buildLobbyRows([slow, fast], { localGrp: local, myRelayRttMs: 0 });
+    expect(rows.map((r) => r.matchId)).toEqual(["fast", "slow"]);
+  });
+
   it("the high-ping filter excludes slow rows but keeps unknown ('?')", () => {
     const rows = buildLobbyRows(matches, { localGrp: local, myRelayRttMs: 10, pingFilterMaxMs: 35 });
     const ids = rows.map((r) => r.matchId);
