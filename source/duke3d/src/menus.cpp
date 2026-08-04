@@ -1533,7 +1533,7 @@ static MenuEntry_t *MEL_NETJOIN[] = {
 #define NET_NAME_MAX   32
 
 typedef struct { char name[NET_NAME_MAX]; int players, maxPlayers, ping; int grpState; } netlobbyrow_t; // grpState: 0 have, 1 download, 2 paid
-typedef struct { char name[NET_NAME_MAX]; int connected; } netrosterrow_t;
+typedef struct { char name[NET_NAME_MAX]; int connected, ping; } netrosterrow_t; // ping: ms, -1 = unmeasured/self
 typedef struct { char id[40]; char name[48]; int size, shareware, present, isDefault; } netgrprow_t;
 
 static netlobbyrow_t s_netLobby[NET_BROWSE_MAX];   static int s_netLobbyCount;
@@ -2004,6 +2004,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void NetMenu_SetRoster(const char *json)
             netrosterrow_t *p = &s_netRoster[s_netRosterCount++];
             netmenu_clamp(p->name, sizeof p->name, sjson_get_string(it, "name", "Duke"));
             p->connected = sjson_get_bool(it, "connected", true) ? 1 : 0;
+            p->ping = sjson_get_int(it, "ping", -1);
         }
     }
 }
@@ -3477,6 +3478,12 @@ static void Menu_PreDraw(MenuID_t cm, MenuEntry_t* entry, const vec2_t origin)
             Bsnprintf(tempbuf, sizeof tempbuf, "%d. %s%s", i, s_netRoster[i].name, s_netRoster[i].connected ? "" : " (connecting)");
             mminitext(origin.x + ((MENU_MARGIN_REGULAR+8)<<16), origin.y + (y<<16), tempbuf,
                       s_netRoster[i].connected ? MF_Minifont.pal_selected : MF_Minifont.pal_disabled);
+            // real data-channel RTT to this peer, right-aligned; blank for self / unmeasured (ping < 0)
+            if (s_netRoster[i].connected && s_netRoster[i].ping >= 0)
+            {
+                Bsnprintf(tempbuf, sizeof tempbuf, "%d ms", s_netRoster[i].ping);
+                netmenu_mtext_r(origin.x + (262<<16), origin.y + (y<<16), tempbuf, MF_Minifont.pal_deselected);
+            }
         }
         if (s_netRosterCount == 0)
             mminitext(origin.x + ((MENU_MARGIN_REGULAR+8)<<16), origin.y + (82<<16), "(nobody has joined yet)", MF_Minifont.pal_disabled);
@@ -4565,28 +4572,42 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
 #endif
     else if (entry == &ME_NETHOST_LAUNCH)
     {
+#ifdef NETMENU_WASM
+        // WebRTC host launch. Only the host reaches this entry (hidden for guests via
+        // HideOnCondition on s_netMyConnectIndex != 0).
+        if (numplayers > 1)
+        {
+            // 2+ players: broadcast NEW_GAME to the guests. NOTE: end-to-end 2-peer
+            // launch (guest level-entry + the tic-0 Net_WaitForPlayers barrier over the
+            // WASM transport) is NOT yet wired, so the host does NOT enter the level
+            // here -- that would block in Net_WaitForPlayers forever waiting for a guest
+            // that has no level-entry path yet (Net_WaitForPlayers has no ESC exit).
+            // Kept on the old broadcast so nothing hangs. TODO(netcode): host
+            // G_NewGame_EnterLevel once the guest path + barrier are verified end-to-end.
+            Net_SendNewGame(0);
+            NetMenu_SetInGame(1);
+        }
+        else
+        {
+            // SOLO: no peers, and the tic-0 barrier (Net_WaitForPlayers) no-ops at
+            // numplayers < 2, so start the level immediately. This is exactly what the
+            // previous branch was missing -- it only messaged guests and never started
+            // the host's own game, so "Launch" did nothing.
+            NetMenu_SetInGame(1);
+            G_NewGame_EnterLevel();
+        }
+#else
         // master does whatever it wants
         if (g_netServer)
         {
-#ifdef NETDUKE32
+# ifdef NETDUKE32
             Net_SendNewGame(0);  // lockstep: host broadcasts NEW_GAME to guests
-# ifdef NETMENU_WASM
-            NetMenu_SetInGame(1); // host commits: stop advertising + close the accept gate
-# endif
-#else
+# else
             Net_FillNewGame(&pendingnewgame, 1);
             Net_StartNewGame();
             Net_SendNewGame(1, NULL);
-#endif
+# endif
         }
-#ifdef NETMENU_WASM
-        else
-        {
-            // WebRTC lobby: no map-vote system. Lockstep needs every player present
-            // at tic 0, so the host can only launch once a guest has joined.
-            NetMenu_SetStatus("!Need another player to launch.");
-        }
-#else
         else if (voting == -1)
         {
             Net_SendMapVoteInitiate();

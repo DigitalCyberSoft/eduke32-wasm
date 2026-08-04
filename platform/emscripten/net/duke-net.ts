@@ -158,6 +158,12 @@ class DukeNet {
     this._refreshLobby();
   }
 
+  /** Measured data-channel RTT (ms) to a peer by device id, or null if unmeasured
+   *  (or our own row). The lobby roster shows this real ping, never the relay proxy. */
+  rttFor(deviceId: string): number | null {
+    return this.trueRtt.get(deviceId) ?? null;
+  }
+
   // ── Local GRP fingerprint ────────────────────────────────────────────────
 
   /** Set the fingerprint of the GRP set THIS client is running. Pass the ordered
@@ -374,7 +380,10 @@ class DukeNet {
         break;
       case "rtt_pong": {
         const rtt = this.ping.onPong(peerId, msg.id);
-        if (rtt != null && m.role === "guest" && peerId === m.hostId) this.trueRtt.set(m.hostId, rtt);
+        // Record RTT for ANY peer (host measures each guest, guest measures the
+        // host) so the lobby roster shows a real per-player ping. Keyed by device
+        // id, which is what the roster rows join on.
+        if (rtt != null) this.trueRtt.set(peerId, rtt);
         break;
       }
     }
@@ -564,8 +573,12 @@ class DukeNet {
     this.rttTimer = setInterval(() => {
       const m = this.match;
       if (!m) return;
+      // Ping EVERY connected peer, attached or not. Peers attach at JOIN time (in
+      // the lobby), so the old `isAttached` skip meant the lobby never measured a
+      // real RTT and the roster/rows fell back to the worthless relay proxy. The
+      // netcode surfaces no RTT of its own, so this loop is the only source; a 2 s
+      // control-channel ping does not perturb the lockstep game frames.
       for (const id of m.peers.connectedPeers()) {
-        if (m.peers.isAttached(id)) continue; // in-game RTT is the netcode's concern
         const pid = this.ping.startPing(id);
         m.peers.sendControl(id, { t: "rtt_ping", id: pid } as Ctl);
       }
@@ -743,7 +756,7 @@ function wireInEngineMenu(): void {
     name: r.name,
     players: r.players,
     maxPlayers: r.maxPlayers,
-    ping: r.ping == null ? -1 : Math.round(r.ping),
+    ping: r.rttMs == null ? -1 : Math.round(r.rttMs), // browse shows real RTT only ("?" until connected), not the relay proxy
     grpState: r.haveGrp ? "have" : r.needsPaidGrp ? "paid" : "download",
   });
 
@@ -756,7 +769,11 @@ function wireInEngineMenu(): void {
       call("NetMenu_SetLobby", ["string"], [JSON.stringify(rows.map(rowForMenu))]);
     },
     onRoster: (ps) =>
-      call("NetMenu_SetRoster", ["string"], [JSON.stringify(ps.map((p) => ({ name: p.name, connected: p.connected })))]),
+      call("NetMenu_SetRoster", ["string"], [JSON.stringify(ps.map((p) => ({
+        name: p.name,
+        connected: p.connected,
+        ping: dukeNet.rttFor(p.deviceId) ?? -1, // real data-channel RTT; -1 = unmeasured / self
+      })))]),
     onGrpProgress: (f, l) => call("NetMenu_SetProgress", ["number", "string"], [Math.round(f * 100), l]),
     onJoined: (i) => call("NetMenu_OnJoined", ["number"], [i.myConnectIndex]),
   });

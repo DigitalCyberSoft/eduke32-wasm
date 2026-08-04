@@ -31,7 +31,8 @@ export interface LobbyRow {
   haveGrp: boolean; // our GRP set matches the host's
   canDownload: boolean; // host GRP is shareable (firewall lets it be transferred)
   needsPaidGrp: boolean; // we lack it and it is paid -> unjoinable without buying it
-  ping: number | null; // ms, or null for unknown ("?")
+  ping: number | null; // ms (real RTT if measured, else relay-proxy estimate) — drives sort + filter
+  rttMs: number | null; // real data-channel RTT ONLY (null until connected); the browse list DISPLAYS this, not the relay proxy
   ts: number;
   raw: MatchInfo;
 }
@@ -66,6 +67,7 @@ export function buildLobbyRows(matches: MatchInfo[], opts: LobbyBuildOpts): Lobb
       canDownload: !haveGrp && cls.shareable,
       needsPaidGrp: !haveGrp && !cls.shareable,
       ping: ping ?? null,
+      rttMs: trueRtt.get(m.hostId) ?? null,
       ts: m.ts,
       raw: m,
     };

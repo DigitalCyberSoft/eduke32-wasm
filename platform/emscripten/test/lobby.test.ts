@@ -71,6 +71,13 @@ describe("buildLobbyRows — the user's lobby rules", () => {
     expect(rows.find((r) => r.matchId === "mine")!.ping).toBe(5);
   });
 
+  it("rttMs is the real data-channel RTT only, null without a measurement (never the relay proxy)", () => {
+    const trueRtt = new Map([["host-mine", 5]]);
+    const rows = buildLobbyRows(matches, { localGrp: local, myRelayRttMs: 10, trueRtt });
+    expect(rows.find((r) => r.matchId === "mine")!.rttMs).toBe(5); // measured -> shown in browse
+    expect(rows.find((r) => r.matchId === "paid")!.rttMs).toBeNull(); // proxy-only host -> "?" (not a fake host ping)
+  });
+
   it("sinks a FULL have-GRP room below a non-full have-GRP room (availability beats ping)", () => {
     // Both hold our GRP set, so tier (1) ties. The FULL room has the better ping (10 vs 90),
     // but "joinable-now" (an open slot) outranks ping, so the non-full room sorts first.

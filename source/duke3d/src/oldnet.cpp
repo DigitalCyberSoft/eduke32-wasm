@@ -1495,6 +1495,13 @@ void Net_WaitForPlayers()
         //if (quitevent) G_GameExit(""); // This sucks
         gameHandleEvents();
 
+        // WASM transport: drain the seam each frame so peers' PACKET_TYPE_PLAYER_READY
+        // is processed (net_poll -> Net_ReceiveFrame runs the packet switch inline).
+        // Without this the tic-0 barrier never observes the others as ready and spins
+        // forever; videoNextPage below yields to the browser so new frames arrive
+        // between iterations. Mirrors the net_poll drain in Net_GetPackets.
+        net_poll();
+
         if (!engineFPSLimit())
             continue;
 
