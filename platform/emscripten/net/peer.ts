@@ -130,8 +130,10 @@ export class PeerManager {
       conn.lastHeard = Date.now();
       const data = e.data;
       if (typeof data === "string") {
-        // Transport control JSON (pre-attach only). Never surfaced to the netcode.
-        if (conn.attached) return;
+        // Transport control JSON. Strings are ALWAYS control (netcode frames are binary),
+        // so they are safe to process even AFTER attach -- this is what keeps rtt_ping/
+        // rtt_pong (the real per-peer ping) and the local-only kick working once a peer has
+        // joined. Never surfaced to the netcode.
         try {
           this.onControl?.(peerId, JSON.parse(data));
         } catch {

@@ -51,7 +51,14 @@ async function main() {
     console.log("guest JOINED at slot", joined.slot);
     const roster2 = await host.waitFor((e) => e.ev === "roster" && e.count >= 2, 6000).catch(() => null);
     console.log("host sees roster>=2:", !!roster2);
-    ok = true;
+    if (process.env.LOCALONLY === "1") {
+      // local-only enforcement is post-connect (RTT-based), so wait past the ~2s ping cycle.
+      const kicked = await guest.waitFor((e) => e.ev === "error" && /kick/i.test(String(e.s || "")), 12000).catch(() => null);
+      console.log("local-only kick fired:", !!kicked, kicked ? `- ${kicked.s}` : "");
+      ok = !!kicked;
+    } else {
+      ok = true;
+    }
   } catch (e) {
     console.error("FAIL:", e.message);
   } finally {

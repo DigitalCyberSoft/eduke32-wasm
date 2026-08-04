@@ -1549,6 +1549,7 @@ static char s_netMatchName[NET_NAME_MAX] = "Duke Match";
 static char s_netJoinCode[80];
 static int32_t s_netMaxPlayers = 8;
 static int32_t s_netShareGrp = 1;       // On => let others download our shareware GRP (default)
+static int32_t s_netLocalOnly = 0;      // On => host boots guests whose real ping exceeds the local threshold
 static int32_t s_netPingIdx  = 0;       // index into the ping presets
 static int s_netHostPublic = 1;         // set by the root HOST PUBLIC/PRIVATE choice
 static int s_netMyConnectIndex = 0;     // 0 = host; guest learns its slot via NetMenu_OnJoined
@@ -1592,8 +1593,8 @@ static void netmenu_host(void)
     char name[80], player[80], script[256];
     netmenu_js_quote(name, sizeof name, s_netMatchName);
     netmenu_js_quote(player, sizeof player, szPlayerName);
-    Bsnprintf(script, sizeof script, "window.NetMenu&&window.NetMenu.host(%d,%s,%d,%s)",
-              s_netHostPublic ? 1 : 0, name, (int)s_netMaxPlayers, player);
+    Bsnprintf(script, sizeof script, "window.NetMenu&&window.NetMenu.host(%d,%s,%d,%s,%d)",
+              s_netHostPublic ? 1 : 0, name, (int)s_netMaxPlayers, player, s_netLocalOnly ? 1 : 0);
     emscripten_run_script(script);
 }
 static void netmenu_join_row(int idx)
@@ -1660,10 +1661,12 @@ static MenuRangeInt32_t MEO_NET_CFG_MAXPLAYERS = MAKE_MENURANGE( &s_netMaxPlayer
 static MenuEntry_t ME_NET_CFG_MAXPLAYERS = MAKE_MENUENTRY( "Max Players", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_MAXPLAYERS, RangeInt32 );
 static MenuOption_t MEO_NET_CFG_SHARE = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_OffOn, &s_netShareGrp );
 static MenuEntry_t ME_NET_CFG_SHARE = MAKE_MENUENTRY( "GRP Sharing", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_SHARE, Option );
+static MenuOption_t MEO_NET_CFG_LOCALONLY = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_OffOn, &s_netLocalOnly );
+static MenuEntry_t ME_NET_CFG_LOCALONLY = MAKE_MENUENTRY( "Local Only", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_LOCALONLY, Option );
 static MenuLink_t MEO_NET_CFG_START = { MENU_NET_LOBBY, MA_Advance, };
 static MenuEntry_t ME_NET_CFG_START = MAKE_MENUENTRY( "Start", &MF_Redfont, &MEF_VideoSetup_Apply, &MEO_NET_CFG_START, Link );
 static MenuEntry_t *MEL_NET_HOSTCFG[] = {
-    &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_SHARE, &ME_NET_CFG_START,
+    &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_SHARE, &ME_NET_CFG_LOCALONLY, &ME_NET_CFG_START,
 };
 
 // BROWSE PUBLIC GAMES — Max Ping control + a dynamic, scrollable match list
@@ -3420,10 +3423,10 @@ static void Menu_PreDraw(MenuID_t cm, MenuEntry_t* entry, const vec2_t origin)
     case MENU_NET_HOSTCFG:
         // Read-only info BELOW the Name/MaxPlayers/Sharing/Start entries (which end
         // ~y+95) and above the status line (y+176), so nothing overlaps the START row.
-        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (128<<16), "Advertised GRP:", MF_Minifont.pal_deselected);
-        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (138<<16), s_netGrpLabels[0] ? s_netGrpLabels : "(set on boot)", MF_Minifont.pal_selected);
+        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (140<<16), "Advertised GRP:", MF_Minifont.pal_deselected);
+        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (150<<16), s_netGrpLabels[0] ? s_netGrpLabels : "(set on boot)", MF_Minifont.pal_selected);
         if (!s_netShareGrp)
-            mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (150<<16), "GRP Sharing Off: others cannot download your GRP.", MF_Minifont.pal_deselected);
+            mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (162<<16), "GRP Sharing Off: others cannot download your GRP.", MF_Minifont.pal_deselected);
         netmenu_draw_status(origin);
         break;
 

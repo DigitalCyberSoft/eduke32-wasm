@@ -36,6 +36,8 @@ g.indexedDB = { open() { const r: Record<string, unknown> = {}; queueMicrotask((
 
 const [role, relayUrl, inviteCode] = process.argv.slice(2);
 const emit = (o: unknown) => process.stdout.write(JSON.stringify(o) + "\n");
+// test hooks: force a low local-only threshold so a localhost peer trips the RTT gate.
+if (process.env.LO_MAX) g.__DUKE_LO_MAX_MS__ = Number(process.env.LO_MAX);
 
 const dukeNet = (await import("../../net/duke-net.ts")).default;
 const { setRelayOverride } = await import("../../net/netconfig.ts");
@@ -57,7 +59,7 @@ dukeNet.on({
 });
 
 if (role === "host") {
-  const r = await dukeNet.host({ name: "HeadlessDM", isPublic: false, maxPlayers: 8 });
+  const r = await dukeNet.host({ name: "HeadlessDM", isPublic: false, maxPlayers: 8, localOnly: process.env.LOCALONLY === "1" });
   emit({ ev: "hosted", role, inviteCode: r.inviteCode, matchId: r.matchId });
 } else {
   await dukeNet.join(inviteCode);

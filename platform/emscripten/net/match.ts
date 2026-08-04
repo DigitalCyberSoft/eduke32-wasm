@@ -49,6 +49,7 @@ export interface MatchInfo {
   status: MatchStatus;
   grp: GrpFingerprint; // GRP set fingerprint — join gating + transfer eligibility
   pingHint: number | null; // host median relay RTT (ms) for the list-wide proxy
+  localOnly?: boolean; // host boots guests whose real (data-channel) RTT exceeds the local threshold
   ts: number;
 }
 
@@ -79,6 +80,7 @@ interface MatchInit {
   myName: string;
   grp: GrpFingerprint;
   pingHint: number | null;
+  localOnly: boolean;
   relays: readonly string[];
 }
 
@@ -90,6 +92,7 @@ export class Match {
   readonly hostId: string;
   readonly maxPlayers: number;
   readonly isPublic: boolean;
+  readonly localOnly: boolean;
   readonly relays: readonly string[];
   readonly peers = new PeerManager();
   private readonly myName: string;
@@ -113,6 +116,7 @@ export class Match {
     this.hostId = init.hostId;
     this.maxPlayers = init.maxPlayers;
     this.isPublic = init.isPublic;
+    this.localOnly = init.localOnly;
     this.relays = init.relays;
     this.myName = init.myName;
     this.grp = init.grp;
@@ -122,7 +126,7 @@ export class Match {
 
   // ── Factories ────────────────────────────────────────────────────────────
 
-  static async createPrivate(name: string, maxPlayers: number, myName: string, grp: GrpFingerprint, pingHint: number | null, relays = activeRelays()): Promise<Match> {
+  static async createPrivate(name: string, maxPlayers: number, myName: string, grp: GrpFingerprint, pingHint: number | null, localOnly = false, relays = activeRelays()): Promise<Match> {
     const m = new Match({
       role: "host",
       roomKey: await generateRoomKey(),
@@ -134,13 +138,14 @@ export class Match {
       myName: sanitizeName(myName),
       grp,
       pingHint,
+      localOnly,
       relays,
     });
     await m._open();
     return m;
   }
 
-  static async createPublic(name: string, maxPlayers: number, myName: string, grp: GrpFingerprint, pingHint: number | null, relays = activeRelays()): Promise<Match> {
+  static async createPublic(name: string, maxPlayers: number, myName: string, grp: GrpFingerprint, pingHint: number | null, localOnly = false, relays = activeRelays()): Promise<Match> {
     const m = new Match({
       role: "host",
       roomKey: await generateRoomKey(),
@@ -152,6 +157,7 @@ export class Match {
       myName: sanitizeName(myName),
       grp,
       pingHint,
+      localOnly,
       relays,
     });
     await m._open();
@@ -172,6 +178,7 @@ export class Match {
       myName: sanitizeName(myName),
       grp,
       pingHint: null,
+      localOnly: info.localOnly ?? false,
       relays,
     });
     await m._open();
@@ -194,6 +201,7 @@ export class Match {
       status: this._status,
       grp: this.grp,
       pingHint: this.pingHint,
+      localOnly: this.localOnly,
       ts: Date.now(),
     };
   }

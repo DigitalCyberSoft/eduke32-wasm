@@ -57,7 +57,8 @@ type Ctl =
   | { t: "grp_end" }
   | { t: "grp_deny"; reason: "paid" | "optout" | "notplaying" | "mismatch" }
   | { t: "rtt_ping"; id: number }
-  | { t: "rtt_pong"; id: number };
+  | { t: "rtt_pong"; id: number }
+  | { t: "kick"; reason: string };
 
 // Persistence keys:
 //   GAMEGRP_KEY (localStorage): the player's CURRENT GRP choice {crc, filename}. A
@@ -68,10 +69,17 @@ type Ctl =
 const GAMEGRP_KEY = "eduke32-net-gamegrp";
 const REJOIN_KEY = "eduke32-net-rejoin";
 
+// Local-only matches boot a guest whose real data-channel RTT exceeds this. LAN is
+// <1 ms, same-region fiber <~20 ms; 30 ms keeps it "local/regional" without being so
+// strict that a same-city LAN party fails. (Test hook: the headless harness may lower
+// it via globalThis.__DUKE_LO_MAX_MS__; that global is never set in the browser build.)
+const LOCAL_ONLY_MAX_MS = ((globalThis as Record<string, unknown>).__DUKE_LO_MAX_MS__ as number | undefined) ?? 30;
+
 export interface HostConfig {
   name: string;
   isPublic: boolean;
   maxPlayers: number;
+  localOnly?: boolean; // boot guests whose real (data-channel) RTT exceeds the threshold
 }
 
 export interface DukeNetEvents {
@@ -219,8 +227,8 @@ class DukeNet {
     const name = sanitizeText(cfg.name) || "Duke Match";
     const max = clampInt(cfg.maxPlayers, 2, 16);
     this.match = cfg.isPublic
-      ? await Match.createPublic(name, max, this.myName, this.localGrp, this.myRelayRtt)
-      : await Match.createPrivate(name, max, this.myName, this.localGrp, this.myRelayRtt);
+      ? await Match.createPublic(name, max, this.myName, this.localGrp, this.myRelayRtt, cfg.localOnly ?? false)
+      : await Match.createPrivate(name, max, this.myName, this.localGrp, this.myRelayRtt, cfg.localOnly ?? false);
     this.myConnectIndex = 0;
     this.slots.clear();
     this._wireMatch();
@@ -366,6 +374,10 @@ class DukeNet {
       case "join_deny":
         this._guestHandleJoinDeny(peerId, msg);
         break;
+      case "kick":
+        this.events.onError?.(`Kicked: ${msg.reason}`);
+        this.leave();
+        break;
       case "grp_req":
         this._hostHandleGrpReq(peerId);
         break;
@@ -387,6 +399,13 @@ class DukeNet {
         // host) so the lobby roster shows a real per-player ping. Keyed by device
         // id, which is what the roster rows join on.
         if (rtt != null) this.trueRtt.set(peerId, rtt);
+        // Local-only enforcement (post-connect: a real RTT must exist first). The host
+        // boots an admitted guest whose measured RTT exceeds the local threshold.
+        if (rtt != null && m.role === "host" && m.localOnly && rtt > LOCAL_ONLY_MAX_MS && this.slots.has(peerId)) {
+          this.events.onStatus?.(`Dropped a player: ${Math.round(rtt)} ms > ${LOCAL_ONLY_MAX_MS} ms (local-only)`);
+          m.peers.sendControl(peerId, { t: "kick", reason: `local-only match (your ping ${Math.round(rtt)} ms)` } as Ctl);
+          setTimeout(() => m.peers.close(peerId), 300); // let the kick flush, then drop
+        }
         break;
       }
     }
@@ -790,10 +809,10 @@ function wireInEngineMenu(): void {
   });
 
   const NetMenu = {
-    host(isPublic: number, name: string, maxPlayers: number, player: string): void {
+    host(isPublic: number, name: string, maxPlayers: number, player: string, localOnly: number): void {
       try { if (player) dukeNet.setPlayerName(player); } catch { /* keep last name */ }
       ensureLocalGrp()
-        .then(() => dukeNet.host({ name, isPublic: !!isPublic, maxPlayers }))
+        .then(() => dukeNet.host({ name, isPublic: !!isPublic, maxPlayers, localOnly: !!localOnly }))
         .then((r) => { if (!isPublic && r?.inviteCode) setStatus("Invite code: " + r.inviteCode); })
         .catch((e) => fail(e, "Host failed"));
     },
