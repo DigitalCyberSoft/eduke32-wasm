@@ -71,11 +71,19 @@ extern int botNameSeed;
 #define g_netServer (numplayers > 1 && myconnectindex == connecthead)
 #define g_netClient (numplayers > 1 && myconnectindex != connecthead)
 
-// Snapshot per-sprite network tracking has no lockstep equivalent (the sim is
-// deterministic and replays identically on every peer); no-op, exactly as under
-// mainline's NETCODE_DISABLE.
+// Snapshot per-sprite network TRACKING has no lockstep equivalent (the sim is
+// deterministic and replays identically on every peer) -- but the snapshot
+// functions did more than track. Net_InsertSprite's insertion duty is handled
+// by A_InsertSprite's NETDUKE32 branch (game.cpp calls insertsprite directly),
+// so the insert hook reduces to a true no-op. Net_DeleteSprite's delete duty
+// does NOT: mainline deletes the sprite in every branch (solo deletesprite,
+// client hide, server tracked delete). Stubbing it to ((void)0) silently
+// disabled EVERY A_DeleteSprite in the game -- one-shot actors (e.g. the E1L1
+// DUKECAR cinematic) re-ran their death blocks each tic, flooding the sprite
+// list to MAXSPRITES within seconds and corrupting memory at the cap. Lockstep
+// semantics = plain local delete on all peers, classic mmulti style.
 #define Net_InsertSprite(...) ((void)0)
-#define Net_DeleteSprite(...) ((void)0)
+#define Net_DeleteSprite(spriteNum) deletesprite(spriteNum)
 
 // Snapshot world-state machinery has no lockstep equivalent (deterministic
 // replay needs no world snapshots) -> no-op, as under mainline NETCODE_DISABLE.

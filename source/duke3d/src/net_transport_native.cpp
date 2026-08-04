@@ -45,6 +45,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unistd.h>   // getpid (per-process nnlog path)
 #include <vector>
 
 using namespace nn;
@@ -61,9 +62,22 @@ namespace {
 
 // Temporary boot tracing (file-based so it survives any engine stdout handling).
 // TODO(netcode): remove once native launch is confirmed live.
+inline const char *nnlogPath()
+{
+    // Per-process file so a host and a guest running side by side don't interleave
+    // into one log (that made a barrier trace look self-contradictory). Keyed on
+    // NN_ROLE when the harness sets it; PID otherwise.
+    static std::string path = [] {
+        const char *role = getenv("NN_ROLE");
+        if (role && *role)
+            return std::string("/tmp/nnet_debug.") + role + ".log";
+        return std::string("/tmp/nnet_debug.") + std::to_string((long)getpid()) + ".log";
+    }();
+    return path.c_str();
+}
 inline void nnlog(const std::string &m)
 {
-    if (FILE *f = fopen("/tmp/nnet_debug.log", "a"))
+    if (FILE *f = fopen(nnlogPath(), "a"))
     {
         fprintf(f, "%s\n", m.c_str());
         fclose(f);
@@ -146,6 +160,17 @@ public:
         invite_ = makeInvite();
         printf("[nnet] HOSTID %s\n[nnet] KEY %s\n[nnet] INVITE %s\n", myDeviceId_.c_str(), roomKey_.c_str(), invite_.c_str());
         fflush(stdout);
+        // Mark our OWN slot 0 connected (game thread, via net_poll) so Net_RebuildConnectChain
+        // makes connecthead=0. Without this g_player[0].connected stays 0, connecthead != 0, and
+        // Net_SendNewGame's `myconnectindex != connecthead` guard drops the NEW_GAME broadcast.
+        // (The guest already does this via Net_SetLocalIndex on join_ok; the host needs it too.)
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            InboundItem sli;
+            sli.kind = InboundItem::SetLocalIndex;
+            sli.peer = 0;
+            inbound_.push_back(std::move(sli));
+        }
         ensureSignaling();
         setStatus("Hosting. Invite code (share it): " + invite_);
         updateRoster();

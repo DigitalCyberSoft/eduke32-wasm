@@ -1606,7 +1606,9 @@ extern "C" {
     void net_native_leave(void);
     void net_native_browse(int start);
     void net_native_set_ingame(int in_game);
-    void net_native_menu_pump(void);   // apply queued menu updates on the game thread
+    void net_native_menu_pump(void);       // apply queued menu updates on the game thread
+    int net_native_should_launch(void);    // headless auto-launch (NN_AUTOLAUNCH): host is ready
+    void net_native_mark_launched(void);
 }
 #endif
 
@@ -8780,6 +8782,45 @@ void M_DisplayMenus(void)
     Net_GetPackets();
 #ifdef NETNATIVE
     net_native_menu_pump(); // apply queued transport -> NetMenu_* updates on the game thread
+    // Native match entry MUST live here, not in app_main's main loop: at the menu the engine
+    // runs the attract-mode loop (G_PlaybackDemo), which calls M_DisplayMenus but never reaches
+    // app_main's do-loop. So both the host launch and the guest's deferred NEW_GAME are entered
+    // here (safely outside net_poll, which ran in Net_GetPackets above).
+    {
+        auto &nngm = g_player[myconnectindex].ps->gm;
+        // HOST: headless auto-launch (NN_AUTOLAUNCH) or, interactively, ME_NETHOST_LAUNCH does this.
+        if (net_native_should_launch() && (nngm & MODE_MENU))
+        {
+            net_native_mark_launched();
+            ud.m_volume_number      = (NetEpisode >= 0 && NetEpisode < MAXVOLUMES) ? NetEpisode : 0;
+            ud.multimode            = numplayers;
+            g_mostConcurrentPlayers = ud.multimode;
+            ud.m_coop               = 0;
+            ud.m_monsters_off       = 1;
+            ud.m_player_skill       = 0;
+            if (numplayers > 1)
+                Net_SendNewGame(0);
+            NetMenu_SetInGame(1);
+            G_NewGame_EnterLevel();
+            return; // level is entering; skip the rest of this menu frame
+        }
+        // GUEST: the NEW_GAME packet handler (oldnet.cpp, inside net_poll) deferred MODE_NEWGAME.
+        // Enter the same level the host chose (ud.m_* were set from the packet). numplayers>1,
+        // so G_NewGame_EnterLevel runs the tic-0 barrier that rendezvouses with the host.
+        if (nngm & MODE_NEWGAME)
+        {
+            // Pin the session size at ENTRY time, mirroring the host block above.
+            // The NEW_GAME handler staged it too, but ud.multimode has no m_*
+            // staging slot (premap.cpp:1897-1904 copies coop/monsters_off/etc.,
+            // never multimode), so a demo RECHECK between the packet and this
+            // frame could restore playback state over it.
+            ud.multimode            = numplayers;
+            g_mostConcurrentPlayers = ud.multimode;
+            NetMenu_SetInGame(1);
+            G_NewGame_EnterLevel(); // sets gm = MODE_GAME (clears NEWGAME), premap.cpp:2046
+            return;
+        }
+    }
 #endif
 
     if ((g_player[myconnectindex].ps->gm&MODE_MENU) == 0)

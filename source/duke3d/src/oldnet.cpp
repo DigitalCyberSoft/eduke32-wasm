@@ -981,6 +981,22 @@ static void Net_RebuildConnectChain(void)
 
     connecthead = (head < 0) ? 0 : head;
     numplayers  = max(count, 1);
+
+    // Session size follows the live lobby, established at CONNECT time exactly
+    // like the classic connect path did via PACKET_TYPE_INIT_SETTINGS (which
+    // nothing on the transport track sends). This matters twice over:
+    // 1. demo.cpp:505 gates attract-demo playback on `ud.multimode < 2` -- a
+    //    connected guest still at multimode=1 keeps looping SP attract demos,
+    //    whose restored playback state overwrites live ud.* between the
+    //    NEW_GAME packet and level entry.
+    // 2. prelevel keys ALL multiplayer map setup off `(g_netServer ||
+    //    ud.multimode > 1)` (premap.cpp:147/215/548/610/788), and g_netServer
+    //    is false on guests -- multimode=1 there means a single-player world
+    //    that immediately desyncs from the host's.
+    // Never resize a running match: mid-game drops keep the session size they
+    // started with (the entry paths pin multimode again at launch anyway).
+    if (g_player[myconnectindex].ps == NULL || !(g_player[myconnectindex].ps->gm & MODE_GAME))
+        ud.multimode = numplayers;
 }
 
 void Net_PeerEvent(int peerToken, int eventType)
@@ -1427,6 +1443,12 @@ void Net_ClearFIFO(void)
     mymaxlag = otherminlag = 0;
     movefifoplc = movefifosendplc = predictfifoplc = 0;
 
+    // Capture the live sprite array pointer BEFORE Net_InitializePrediction ->
+    // Net_ResetPredictionData memcpys from it. Nothing else in the transport
+    // tree calls Net_InitializeStructPointers, and an uncaptured (NULL)
+    // original_sprite is restored into the global `sprite` pointer by
+    // Net_UseOriginalPointers at the end of every prediction pass.
+    Net_InitializeStructPointers();
     Net_InitializePrediction();
 
     for (int32_t i = 0; i < MAXPLAYERS; i++)
@@ -1506,6 +1528,15 @@ void Net_WaitForPlayers()
 
     if (numplayers < 2)
         return;
+
+    // Tic-0 lockstep state reset. The classic connect path ran Net_ClearFIFO when
+    // the netgame formed; on the transport track NOTHING called it, so
+    // Net_InitializePrediction never ran: originalPlayer stayed NULL and the first
+    // G_MoveLoop prediction pass (game.cpp:7450) restored g_player[..].ps = NULL
+    // and sprite = NULL on every GUEST (the host never predicts), crashing within
+    // frames of entry. Every peer passes through this barrier at level entry with
+    // numplayers already correct, so init here is symmetric on host and guests.
+    Net_ClearFIFO();
 
     g_player[myconnectindex].playerreadyflag++;
     packbuf[0] = PACKET_TYPE_PLAYER_READY;
