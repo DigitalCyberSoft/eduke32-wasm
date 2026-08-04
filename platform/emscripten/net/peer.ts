@@ -148,8 +148,17 @@ export class PeerManager {
    *  responsibility (which peers this is invoked for). */
   connect(peerId: string, encKey: string, relays: readonly string[]): void {
     const conn = this._ensure(peerId, encKey, relays);
+    if (DEVICE_ID >= peerId) return; // only the smaller device id offers (glare avoidance)
     const anyOpen = DC_LABELS.some((l) => conn.dcs.get(l)?.readyState === "open");
-    if (DEVICE_ID < peerId && !anyOpen) this._createOffer(peerId).catch(() => {});
+    if (anyOpen) return;
+    // Do NOT stack offers. connect() is called on every ~5s presence tick; without this
+    // guard each call re-ran _createOffer, creating a SECOND (third, ...) set of data
+    // channels on the same pc and renegotiating -- duplicate channels piled up and wedged
+    // the handshake, which is the "Connecting to host" stall. Offer only when the
+    // connection is fresh (no channels yet, signalingState stable). A genuinely lost offer
+    // is retried on a fresh pc by _scheduleReconnect once ICE fails.
+    if (conn.dcs.size > 0 || conn.pc.signalingState !== "stable") return;
+    this._createOffer(peerId).catch(() => {});
   }
 
   private async _createOffer(peerId: string): Promise<void> {
