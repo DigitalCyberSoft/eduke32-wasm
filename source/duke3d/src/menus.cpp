@@ -4574,28 +4574,19 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
     {
 #ifdef NETMENU_WASM
         // WebRTC host launch. Only the host reaches this entry (hidden for guests via
-        // HideOnCondition on s_netMyConnectIndex != 0).
+        // HideOnCondition on s_netMyConnectIndex != 0). Works at any player count.
+        //
+        // With guests present, broadcast NEW_GAME so they enter at tic 0 (Net_SendNewGame
+        // no-ops at numplayers < 2, so solo skips it). Then DEFER our own level entry to
+        // the main loop by setting gm: this handler runs nested under M_DisplayMenus on the
+        // app_main stack, so it must not enter a level (or drive the tic-0 barrier) inline.
+        // app_main consumes MODE_NEWGAME (game.cpp:7186 -> 7044 G_NewGame -> 7189 ->
+        // G_EnterLevel -> Net_WaitForPlayers, which no-ops solo and rendezvous 2+ peers).
+        // Same deferred-restart idiom the `map` console command uses (osdcmds.cpp:293).
         if (numplayers > 1)
-        {
-            // 2+ players: broadcast NEW_GAME to the guests. NOTE: end-to-end 2-peer
-            // launch (guest level-entry + the tic-0 Net_WaitForPlayers barrier over the
-            // WASM transport) is NOT yet wired, so the host does NOT enter the level
-            // here -- that would block in Net_WaitForPlayers forever waiting for a guest
-            // that has no level-entry path yet (Net_WaitForPlayers has no ESC exit).
-            // Kept on the old broadcast so nothing hangs. TODO(netcode): host
-            // G_NewGame_EnterLevel once the guest path + barrier are verified end-to-end.
             Net_SendNewGame(0);
-            NetMenu_SetInGame(1);
-        }
-        else
-        {
-            // SOLO: no peers, and the tic-0 barrier (Net_WaitForPlayers) no-ops at
-            // numplayers < 2, so start the level immediately. This is exactly what the
-            // previous branch was missing -- it only messaged guests and never started
-            // the host's own game, so "Launch" did nothing.
-            NetMenu_SetInGame(1);
-            G_NewGame_EnterLevel();
-        }
+        NetMenu_SetInGame(1);                                        // stop advertising + close the accept gate
+        g_player[myconnectindex].ps->gm = MODE_RESTART|MODE_NEWGAME; // defer level entry to the main loop
 #else
         // master does whatever it wants
         if (g_netServer)

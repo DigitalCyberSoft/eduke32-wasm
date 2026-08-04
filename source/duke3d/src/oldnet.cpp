@@ -615,12 +615,17 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 ud.m_dmflags        = (int32_t)B_UNBUF32(&packbuf[j]);  j += sizeof(int32_t);
                 uint32_t flags      = (uint32_t)B_UNBUF32(&packbuf[j]); j += sizeof(int32_t);
                 // [NetDuke32 port] Upstream: G_NewGame(flags | NEWGAME_FROMSERVER).
-                // Our tree's G_NewGame takes (volume, level, skill); the server's
-                // choices were staged into ud.m_* just above, so start from those.
-                // TODO(netcode): upstream NEWGAME_* flag nuances (NOSEND/RESETALL)
-                // are not modeled by this tree's G_NewGame.
+                // TODO(netcode): upstream NEWGAME_* flag nuances (NOSEND/RESETALL) are
+                // not modeled by this tree's G_NewGame.
                 (void)flags;
-                G_NewGame(ud.m_volume_number, ud.m_level_number, ud.m_player_skill);
+                // Defer the level entry to the main loop instead of calling G_NewGame
+                // here: this runs INSIDE net_poll -> Net_ReceiveFrame with the shared
+                // packbuf mid-parse, so entering the level inline would re-enter net_poll
+                // and clobber packbuf. Setting MODE_NEWGAME lets app_main consume it off
+                // the packet stack (game.cpp:7186 -> 7044 G_NewGame -> 7189 -> G_EndOfLevel
+                // -> G_EnterLevel -> the tic-0 Net_WaitForPlayers rendezvous). The m_*
+                // values staged just above are what G_NewGame reads at game.cpp:7046.
+                g_player[myconnectindex].ps->gm = MODE_RESTART|MODE_NEWGAME;
                 break;
             }
             case PACKET_TYPE_NULL_PACKET:
