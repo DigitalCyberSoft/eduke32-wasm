@@ -213,7 +213,11 @@ private:
         NostrClient *self = this;
         ws->onOpen([self, wc]() {
             if (auto c = wc.lock())
+            {
+                printf("[nnet] relay up %s\n", c->url.c_str());
+                fflush(stdout);
                 self->onOpen(c.get());
+            }
         });
         ws->onMessage([self, wc](rtc::message_variant data) {
             if (!std::holds_alternative<std::string>(data))
@@ -223,10 +227,27 @@ private:
         });
         ws->onClosed([wc]() {
             if (auto c = wc.lock())
+            {
+                if (c->open.load())
+                    printf("[nnet] relay down %s\n", c->url.c_str());
                 c->open.store(false);
+            }
         });
-        ws->onError([](std::string) {});
-        try { ws->open(url); } catch (...) {}
+        // Never swallow relay errors silently again: three dead wss relays once looked
+        // like an empty room and cost a full debugging session.
+        ws->onError([wc](std::string e) {
+            if (auto c = wc.lock())
+            {
+                printf("[nnet] relay error %s: %s\n", c->url.c_str(), e.c_str());
+                fflush(stdout);
+            }
+        });
+        try { ws->open(url); }
+        catch (const std::exception &e)
+        {
+            printf("[nnet] relay open failed %s: %s\n", url.c_str(), e.what());
+            fflush(stdout);
+        }
     }
 
     void onOpen(Conn *c)

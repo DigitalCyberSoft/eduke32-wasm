@@ -46,7 +46,12 @@ const { fingerprintBytes } = await import("../../net/grp.ts");
 setRelayOverride([relayUrl]);
 
 // identical fake GRP on both peers -> matching fingerprint -> the host's GRP gate passes.
-const bytes = new Uint8Array([0x44, 0x55, 0x4b, 0x45, 1, 2, 3, 4]);
+// GRP_FILE=<path> loads real GRP bytes instead: cross-play tests against a native host
+// must present the real fingerprint (the native gate hashes the actual file).
+const grpFile = process.env.GRP_FILE;
+const bytes = grpFile
+  ? new Uint8Array((await import("node:fs")).readFileSync(grpFile))
+  : new Uint8Array([0x44, 0x55, 0x4b, 0x45, 1, 2, 3, 4]);
 const fp = await fingerprintBytes(bytes);
 await dukeNet.setLocalGrp([{ name: "DUKE3D.GRP", crc: fp.crc, sha256: fp.sha256, size: fp.size }], bytes);
 

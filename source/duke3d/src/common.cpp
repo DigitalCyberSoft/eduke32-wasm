@@ -1105,3 +1105,11 @@ void Duke_CommonCleanup(void)
     DO_FREE_AND_NULL(g_scriptNamePtr);
     DO_FREE_AND_NULL(g_rtsNamePtr);
 }
+
+// Seam for the native transport (net_transport_native.cpp compiles with
+// -fexceptions and must not include engine headers): path of the selected GRP,
+// used to fingerprint it for the cross-play join gate. NULL until selection.
+extern "C" const char *Net_NativeGrpPath(void)
+{
+    return (g_selectedGrp && g_selectedGrp->filename) ? g_selectedGrp->filename : NULL;
+}

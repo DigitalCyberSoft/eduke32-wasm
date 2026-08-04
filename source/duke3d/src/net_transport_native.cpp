@@ -29,6 +29,7 @@
 
 #ifdef NETNATIVE
 
+#include "nn_grp.hpp"
 #include "nn_relay.hpp"
 #include "nn_signaling.hpp"
 
@@ -56,6 +57,9 @@ extern "C" {
     void NetMenu_SetStatus(const char *s);
     void NetMenu_SetRoster(const char *json);
     void NetMenu_OnJoined(int myConnectIndex);
+    // Engine seam (common.cpp): path of the selected GRP, so this TU can fingerprint
+    // it without pulling engine headers into an -fexceptions translation unit.
+    const char *Net_NativeGrpPath(void);
 }
 
 namespace {
@@ -121,8 +125,18 @@ public:
         const char *relayEnv = getenv("NN_RELAY");
         if (relayEnv && *relayEnv)
             relays_ = { relayEnv };
-        else // default to a few public Nostr relays (same set as the browser transport)
-            relays_ = { "wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net" };
+        else
+        {
+            // Loopback relay FIRST (`npm run relay` / any NIP-01 relay on this machine):
+            // desktop<->browser signaling stays fully local, no third-party relay in the
+            // path. Public relays are the fallback for internet matches. KNOWN DEVIATION:
+            // libdatachannel 0.21.2 (Fedora RPM, GnuTLS backend) completes the TLS
+            // handshake on wss:// but WsTransport never receives the decrypted upgrade
+            // response, so the wss fallbacks are currently dead on native — reproduced
+            // with a 30-line rtc::WebSocket probe; see the relay up/error log lines.
+            relays_ = { "ws://127.0.0.1:7500",
+                        "wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net" };
+        }
 
         myDeviceId_ = "native-" + toHex(randomBytes(8));
         sigCtx_ = sjson_create_context(0, 0, nullptr);
@@ -157,7 +171,12 @@ public:
         roomKey_ = envOr("NN_KEY", "");
         if (roomKey_.empty())
             roomKey_ = base64Encode(randomBytes(32));
+        matchId_ = "m-" + toHex(randomBytes(6));
+        grpEnsure(); // fingerprint before the invite embeds it
         invite_ = makeInvite();
+        // KEY stays printed: 44 chars, still typeable for native<->native joins.
+        // INVITE is the browser-compatible base64url MatchInfo JSON (paste into the
+        // web build's Join by Code); menus.cpp also copies it to the clipboard.
         printf("[nnet] HOSTID %s\n[nnet] KEY %s\n[nnet] INVITE %s\n", myDeviceId_.c_str(), roomKey_.c_str(), invite_.c_str());
         fflush(stdout);
         // Mark our OWN slot 0 connected (game thread, via net_poll) so Net_RebuildConnectChain
@@ -172,7 +191,9 @@ public:
             inbound_.push_back(std::move(sli));
         }
         ensureSignaling();
-        setStatus("Hosting. Invite code (share it): " + invite_);
+        // menus.cpp copies the invite to the system clipboard right after hostMatch
+        // returns; the full string is also on stdout ([nnet] INVITE / [nnet] KEY).
+        setStatus("Hosting - invite copied to clipboard (KEY in terminal for native peers).");
         updateRoster();
     }
 
@@ -182,18 +203,53 @@ public:
         for (char c : code)
             if (!isspace((unsigned char)c))
                 key += c;
-        Bytes raw;
-        if (key.empty() || !base64Decode(key, raw) || raw.size() != 32)
+        if (key.empty())
         {
             setStatus("!Invalid invite code");
             return;
         }
-        joinWithKey(key, "", player); // host id discovered via presence
+        // Browser-shape invite: base64url(JSON MatchInfo) as emitted by the web build
+        // AND by makeInvite() here. Detect by decoding to a leading '{'.
+        Bytes raw;
+        if (base64Decode(b64FromUrl(key), raw) && !raw.empty() && raw[0] == '{')
+        {
+            std::string roomKey, hid;
+            {
+                std::lock_guard<std::mutex> lk(sigMtx_);
+                sjson_reset_context(sigCtx_);
+                std::string json((const char *)raw.data(), raw.size());
+                sjson_node *root = sjson_decode(sigCtx_, json.c_str());
+                if (root && root->tag == SJSON_OBJECT)
+                {
+                    const char *rk = sjson_get_string(root, "roomKey", nullptr);
+                    const char *hi = sjson_get_string(root, "hostId", nullptr);
+                    if (rk) roomKey = rk;
+                    if (hi) hid = hi;
+                }
+            }
+            if (!roomKey.empty())
+            {
+                grpEnsure();
+                joinWithKey(roomKey, hid, player); // hostId from the invite: direct connect
+                return;
+            }
+            setStatus("!Invalid invite code");
+            return;
+        }
+        // Bare room key (native short code, 32 bytes base64).
+        if (base64Decode(key, raw) && raw.size() == 32)
+        {
+            grpEnsure();
+            joinWithKey(key, "", player); // host id discovered via presence
+            return;
+        }
+        setStatus("!Invalid invite code");
     }
 
     void joinWithKey(const std::string &key, const std::string &hid, const std::string &player)
     {
         isHost_ = false;
+        grpEnsure(); // before signaling starts: workers read the fingerprint after this
         roomKey_ = key;
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -314,6 +370,14 @@ public:
     void markLaunched() { launched_ = true; }
     bool isHost() const { return isHost_; }
 
+    // Menu pulls (game thread only; the strings are not mutated concurrently).
+    const char *inviteCstr() { return invite_.c_str(); }
+    const char *grpLabelCstr()
+    {
+        grpEnsure();
+        return grpLabel_.c_str();
+    }
+
 private:
     static std::string envOr(const char *k, const std::string &def)
     {
@@ -428,14 +492,15 @@ private:
             if (hostId_.empty())
                 hostId_ = peer;
         }
-        pm_->sendControl(peer, "{\"t\":\"join\",\"name\":" + jsonStr(myName_) + ",\"grp\":{\"crc\":0}}");
+        pm_->sendControl(peer, "{\"t\":\"join\",\"name\":" + jsonStr(myName_) + ",\"grp\":" + grpJson() + "}");
     }
 
     void onControl(const std::string &peer, const std::string &ctrl)
     {
         // Parse under sigMtx_ (sjson is not thread-safe + the context is shared),
         // extract the fields we need, then release before touching other locks.
-        std::string type, joinName;
+        std::string type, joinName, joinGrpDigest, denyReason, denyGrpLabel;
+        bool denyGrpPaid = false;
         int yourSlot = -1, hostSlot = 0;
         {
             std::lock_guard<std::mutex> lk(sigMtx_);
@@ -452,31 +517,105 @@ private:
             const char *jn = sjson_get_string(root, "name", nullptr);
             if (jn)
                 joinName = jn;
+            // join: the guest's GRP fingerprint (browser-shape {setDigest,...})
+            sjson_node *g = sjson_find_member(root, "grp");
+            if (g && g->tag == SJSON_OBJECT)
+            {
+                const char *d = sjson_get_string(g, "setDigest", nullptr);
+                if (d)
+                    joinGrpDigest = d;
+            }
+            // join_deny: reason + what the host runs (for a useful error message)
+            const char *r = sjson_get_string(root, "reason", nullptr);
+            if (r)
+                denyReason = r;
+            sjson_node *hg = sjson_find_member(root, "hostGrp");
+            if (hg && hg->tag == SJSON_OBJECT)
+            {
+                denyGrpPaid = sjson_get_bool(hg, "officialPaid", false);
+                sjson_node *labels = sjson_find_member(hg, "labels");
+                if (labels && labels->tag == SJSON_ARRAY)
+                {
+                    sjson_node *fc = sjson_first_child(labels);
+                    if (fc && fc->tag == SJSON_STRING && fc->string_)
+                        denyGrpLabel = fc->string_;
+                }
+            }
         }
         if (type == "join" && isHost_)
-            hostHandleJoin(peer, joinName);
+            hostHandleJoin(peer, joinName, joinGrpDigest);
         else if (type == "join_ok" && !isHost_)
             guestHandleJoinOk(peer, yourSlot, hostSlot, joinName); // joinName = host's name
+        else if (type == "join_deny" && !isHost_)
+            guestHandleJoinDeny(denyReason, denyGrpPaid, denyGrpLabel);
+        else if (type == "grp_req" && isHost_)
+            // A browser guest asked to download our GRP (its deny handler auto-requests
+            // when the host GRP is shareable). Native cannot stream it yet: refuse
+            // cleanly so the guest shows an error instead of waiting forever.
+            pm_->sendControl(peer, "{\"t\":\"grp_deny\",\"reason\":\"the native host cannot share its GRP yet\"}");
         // rtt_ping/pong + kick: later refinement; not needed to establish a game.
     }
 
-    void hostHandleJoin(const std::string &peer, const std::string &name)
+    void guestHandleJoinDeny(const std::string &reason, bool hostPaid, const std::string &hostLabel)
     {
+        // Without this handler a denied native guest sat on "Connecting to host..."
+        // forever -- a deny MUST surface, not stall.
+        std::string msg;
+        if (reason == "grpmismatch")
+        {
+            msg = "!Join refused: the host runs different game data";
+            if (!hostLabel.empty())
+                msg += " (" + hostLabel + ")";
+            if (hostPaid)
+                msg += " - you need your own copy";
+        }
+        else
+            msg = "!Join refused: " + (reason.empty() ? std::string("(no reason)") : reason);
+        printf("[nnet] guest: join denied: %s\n", reason.c_str());
+        fflush(stdout);
+        setStatus(msg);
+    }
+
+    void hostHandleJoin(const std::string &peer, const std::string &name, const std::string &grpDigest)
+    {
+        // GRP gate, mirroring duke-net.ts _hostHandleJoin: identical GRP sets only.
+        // Gate only when our own fingerprint exists; a fingerprint-less host stays
+        // permissive (logged) rather than denying everyone.
+        if (grpFp_.valid && grpDigest != grpFp_.setDigest)
+        {
+            pm_->sendControl(peer, "{\"t\":\"join_deny\",\"reason\":\"grpmismatch\",\"hostGrp\":" + grpJson() + "}");
+            printf("[nnet] host: denied %s (grp digest %.12s != ours %.12s)\n",
+                   peer.c_str(), grpDigest.empty() ? "(none)" : grpDigest.c_str(), grpFp_.setDigest.c_str());
+            fflush(stdout);
+            setStatus("Denied a join: different game data");
+            return;
+        }
         int slot;
+        bool full = false;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (deviceToToken_.count(peer))
                 return; // already joined
-            slot = nextFreeSlot();
-            tokenToDevice_[slot] = peer;
-            deviceToToken_[peer] = slot;
-            deviceName_[peer] = name.empty() ? "Player" : name;
-            // NET_PEER_UP at connectindex==slot (drained on the game thread).
-            InboundItem up;
-            up.kind = InboundItem::PeerEvent;
-            up.peer = slot;
-            up.event = NET_PEER_UP;
-            inbound_.push_back(std::move(up));
+            full = (int)deviceToToken_.size() + 1 >= maxPlayers_; // +1 = us
+            slot = full ? -1 : nextFreeSlot();
+            if (!full)
+            {
+                tokenToDevice_[slot] = peer;
+                deviceToToken_[peer] = slot;
+                deviceName_[peer] = name.empty() ? "Player" : name;
+                // NET_PEER_UP at connectindex==slot (drained on the game thread).
+                InboundItem up;
+                up.kind = InboundItem::PeerEvent;
+                up.peer = slot;
+                up.event = NET_PEER_UP;
+                inbound_.push_back(std::move(up));
+            }
+        }
+        if (full)
+        {
+            // Sent OUTSIDE mtx_: never call into libdatachannel while holding our lock.
+            pm_->sendControl(peer, "{\"t\":\"join_deny\",\"reason\":\"full\"}");
+            return;
         }
         pm_->setAttached(peer, true);
         std::string ok = "{\"t\":\"join_ok\",\"yourSlot\":" + std::to_string(slot) +
@@ -542,9 +681,51 @@ private:
             presenceThread_ = std::thread([this] { presenceLoop(); });
     }
 
-    // The invite IS the room key (base64, ~44 chars: fits the 80-char join field). The
-    // joiner discovers the host via presence (host flag), so the code needs no host id.
-    std::string makeInvite() { return roomKey_; }
+    // Browser-compatible invite: base64url(JSON MatchInfo). Match.parseInvite
+    // (platform/emscripten/net/match.ts) requires roomKey+matchId+hostId+grp all
+    // truthy, so the web build can join a native host by pasting this. Native's
+    // joinMatch accepts BOTH this form and the bare 44-char room key (printed as
+    // KEY) for native<->native typing.
+    std::string makeInvite()
+    {
+        std::string j = "{\"roomKey\":" + jsonStr(roomKey_) +
+                        ",\"matchId\":" + jsonStr(matchId_) +
+                        ",\"hostId\":" + jsonStr(myDeviceId_) +
+                        ",\"name\":" + jsonStr(matchName_) +
+                        ",\"maxPlayers\":" + std::to_string(maxPlayers_) +
+                        ",\"grp\":" + grpJson() + "}";
+        Bytes b(j.begin(), j.end());
+        std::string out = b64ToUrl(base64Encode(b));
+        while (!out.empty() && out.back() == '=')
+            out.pop_back();
+        return out;
+    }
+
+    // GRP fingerprint (cross-play join gate). Computed once, on the game thread
+    // (menu actions / label pull), BEFORE signaling starts; worker threads only read.
+    void grpEnsure()
+    {
+        if (grpFp_.valid)
+            return; // success latches; failure retries (init can run before GRP selection)
+        grpFp_ = grpFingerprintFile(Net_NativeGrpPath());
+        if (grpFp_.valid)
+        {
+            grpLabel_ = grpFp_.name + (grpFp_.officialPaid ? " (registered)"
+                                       : grpFp_.shareable  ? " (shareware)" : "");
+            printf("[nnet] grp %s crc=0x%08x setDigest=%.12s...\n",
+                   grpFp_.name.c_str(), grpFp_.crc, grpFp_.setDigest.c_str());
+        }
+        else if (!grpTried_)
+            printf("[nnet] grp fingerprint unavailable (no gate; browser hosts will deny us)\n");
+        grpTried_ = true;
+        fflush(stdout);
+    }
+    std::string grpJson()
+    {
+        if (!grpFp_.valid)
+            return "{\"crc\":0}"; // truthy for parseInvite; browser hosts deny on digest
+        return grpFingerprintJson(grpFp_, [](const std::string &s) { return jsonStr(s); });
+    }
 
     void setStatus(const std::string &s)
     {
@@ -596,8 +777,11 @@ private:
     int myConnectIndex_ = 0;
     int minPlayers_ = 2;
     int maxPlayers_ = 8;
-    std::string roomKey_, hostId_, myName_, myDeviceId_, matchName_, invite_;
+    std::string roomKey_, hostId_, myName_, myDeviceId_, matchName_, invite_, matchId_;
     std::vector<std::string> relays_;
+    GrpFp grpFp_;              // cross-play join gate (game thread writes via grpEnsure,
+    bool grpTried_ = false;    //  workers read only after signaling starts)
+    std::string grpLabel_;     // "DUKE3D.GRP (registered)" for the HOSTCFG screen
 
     std::unique_ptr<NostrClient> nostr_;
     std::unique_ptr<PeerManager> pm_;
@@ -707,6 +891,8 @@ void net_native_leave(void)
     if (g_t)
         g_t->leave();
 }
+const char *net_native_invite(void) { return g_t ? g_t->inviteCstr() : ""; }
+const char *net_native_grp_label(void) { return g_t ? g_t->grpLabelCstr() : ""; }
 void net_native_browse(int /*start*/) { /* native public-match browse not wired yet */ }
 void net_native_set_ingame(int /*in_game*/) { /* native advert / accept-gate not wired yet */ }
 void net_native_menu_pump(void)

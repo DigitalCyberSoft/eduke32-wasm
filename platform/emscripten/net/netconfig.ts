@@ -21,6 +21,12 @@ export const PROTOCOL_VERSION = 1;
 /** Public Nostr relays used as the signaling rendezvous. Same proven set as the
  *  source stack: multiple relays so a single outage does not block discovery. */
 export const NOSTR_RELAYS: readonly string[] = [
+  // Loopback relay FIRST: `npm run relay` (or any NIP-01 relay) on the player's own
+  // machine makes desktop<->browser signaling fully local — no third-party relay in
+  // the path. Browsers exempt loopback from mixed-content blocking, so an https page
+  // may open ws://127.0.0.1; when nothing listens it fails in milliseconds and the
+  // public relays below take over.
+  "ws://127.0.0.1:7500",
   "wss://relay.damus.io",
   "wss://nos.lol",
   "wss://relay.snort.social",

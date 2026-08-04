@@ -48,6 +48,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #if defined(NETDUKE32) && (defined(__EMSCRIPTEN__) || defined(NETNATIVE))
 # define NETMENU 1
 # include "sjson.h"
+# include "sdl_inc.h"   // clipboard (invite copy on host; Paste Code on join)
 # ifdef __EMSCRIPTEN__
 #  include <emscripten.h>
 # else
@@ -1554,7 +1555,7 @@ static char s_netGrpLabels[128];    // advertised GRP set, pulled for the HOST C
 
 // Host/join config, bound to the menu widgets below.
 static char s_netMatchName[NET_NAME_MAX] = "Duke Match";
-static char s_netJoinCode[80];
+static char s_netJoinCode[1024];    // fits a full browser-shape invite (base64url JSON, ~500 chars), not just the 44-char room key
 static int32_t s_netMaxPlayers = 8;
 static int32_t s_netShareGrp = 1;       // On => let others download our shareware GRP (default)
 static int32_t s_netLocalOnly = 0;      // On => host boots guests whose real ping exceeds the local threshold
@@ -1603,6 +1604,8 @@ static void netmenu_js_quote(char *dst, int dstsize, const char *src)
 extern "C" {
     void net_native_host(int isPublic, const char *name, int maxPlayers, const char *player, int localOnly);
     void net_native_join_code(const char *code, const char *player);
+    const char *net_native_invite(void);     // browser-compatible invite (set by host)
+    const char *net_native_grp_label(void);  // "DUKE3D.GRP (registered)" for HOSTCFG
     void net_native_leave(void);
     void net_native_browse(int start);
     void net_native_set_ingame(int in_game);
@@ -1623,6 +1626,11 @@ static void netmenu_host(void)
     emscripten_run_script(script);
 #else
     net_native_host(s_netHostPublic ? 1 : 0, s_netMatchName, (int)s_netMaxPlayers, szPlayerName, s_netLocalOnly ? 1 : 0);
+    // hostMatch is synchronous: the invite exists now. Hand it to the system clipboard
+    // so the user can paste it straight into the web build's Join screen (typing a
+    // ~500-char base64url invite is not an option).
+    if (net_native_invite()[0])
+        SDL_SetClipboardText(net_native_invite());
 #endif
 }
 static void netmenu_join_row(int idx)
@@ -1639,7 +1647,10 @@ static void netmenu_join_row(int idx)
 static void netmenu_join_code(void)
 {
 #ifdef __EMSCRIPTEN__
-    char code[176], player[80], script[320];
+    // Static: a full invite is ~500 chars and js_quote can double it; the old
+    // code[176]/script[320] silently truncated every real invite into "invalid code".
+    static char code[2112], script[2304];
+    char player[80];
     netmenu_js_quote(code, sizeof code, s_netJoinCode);
     netmenu_js_quote(player, sizeof player, szPlayerName);
     Bsnprintf(script, sizeof script, "window.NetMenu&&window.NetMenu.joinCode(%s,%s)", code, player);
@@ -1687,7 +1698,7 @@ static void netmenu_pull_grp_labels(void)
         "(function(){try{var g=window.DukeNet&&DukeNet.getLocalGrp();return g&&g.labels?g.labels.join(', '):'';}catch(e){return '';}})()");
     netmenu_clamp(s_netGrpLabels, sizeof s_netGrpLabels, s);
 #else
-    s_netGrpLabels[0] = 0;   // native GRP advert not wired yet
+    netmenu_clamp(s_netGrpLabels, sizeof s_netGrpLabels, net_native_grp_label());
 #endif
 }
 
@@ -1757,7 +1768,11 @@ static MenuString_t MEO_NET_JOINCODE = MAKE_MENUSTRING( s_netJoinCode, &MF_Bluef
 static MenuEntry_t ME_NET_JOINCODE = MAKE_MENUENTRY( "Code", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_JOINCODE, String );
 static MenuLink_t MEO_NET_JOINCODE_CONNECT = { MENU_NULL, MA_None, };
 static MenuEntry_t ME_NET_JOINCODE_CONNECT = MAKE_MENUENTRY( "Connect", &MF_Redfont, &MEF_VideoSetup_Apply, &MEO_NET_JOINCODE_CONNECT, Link );
-static MenuEntry_t *MEL_NET_JOINCODE[] = { &ME_NET_JOINCODE, &ME_NET_JOINCODE_CONNECT, };
+// Paste: invites are far too long to type (see s_netJoinCode); fills the field from the
+// system clipboard (on the web build, SDL's clipboard mirrors the page's paste events).
+static MenuLink_t MEO_NET_JOINCODE_PASTE = { MENU_NULL, MA_None, };
+static MenuEntry_t ME_NET_JOINCODE_PASTE = MAKE_MENUENTRY( "Paste Code", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_JOINCODE_PASTE, Link );
+static MenuEntry_t *MEL_NET_JOINCODE[] = { &ME_NET_JOINCODE, &ME_NET_JOINCODE_PASTE, &ME_NET_JOINCODE_CONNECT, };
 
 // LOBBY (host + guest). Reuses the NetDuke32-aware ME_NETHOST_LAUNCH for the host launch.
 static MenuLink_t MEO_NET_LOBBY_LEAVE = { MENU_NETWORK, MA_Return, };
@@ -3493,14 +3508,19 @@ static void Menu_PreDraw(MenuID_t cm, MenuEntry_t* entry, const vec2_t origin)
 
 #ifdef NETMENU
     case MENU_NET_HOSTCFG:
-        // Read-only info BELOW the Name/MaxPlayers/Sharing/Start entries (which end
-        // ~y+95) and above the status line (y+176), so nothing overlaps the START row.
-        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (140<<16), "Advertised GRP:", MF_Minifont.pal_deselected);
-        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (150<<16), s_netGrpLabels[0] ? s_netGrpLabels : "(set on boot)", MF_Minifont.pal_selected);
+    {
+        // Read-only info anchored BELOW the last entry. The entry list has grown twice
+        // (Level, Local Only) and fixed y offsets ended up overlapping the START row, so
+        // derive the base from the laid-out geometry instead (ybottom is 16.16, filled in
+        // by entry layout; fall back on the first frame). Status lines sit at y+176/186.
+        int32_t const ybase = ME_NET_CFG_START.ybottom ? ME_NET_CFG_START.ybottom + (6<<16) : (152<<16);
+        mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + ybase, "Advertised GRP:", MF_Minifont.pal_deselected);
+        mminitext(origin.x + ((MENU_MARGIN_WIDE+62)<<16), origin.y + ybase, s_netGrpLabels[0] ? s_netGrpLabels : "(set on boot)", MF_Minifont.pal_selected);
         if (!s_netShareGrp)
-            mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + (162<<16), "GRP Sharing Off: others cannot download your GRP.", MF_Minifont.pal_deselected);
+            mminitext(origin.x + (MENU_MARGIN_WIDE<<16), origin.y + ybase + (10<<16), "GRP Sharing Off: others cannot download your GRP.", MF_Minifont.pal_deselected);
         netmenu_draw_status(origin);
         break;
+    }
 
     case MENU_NET_BROWSE:
     {
@@ -4709,6 +4729,24 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
             netmenu_join_code();
         else
             NetMenu_SetStatus("!Enter an invite code first");
+    }
+    else if (entry == &ME_NET_JOINCODE_PASTE)
+    {
+        char *clip = SDL_GetClipboardText();
+        if (clip && clip[0])
+        {
+            // Copy, dropping whitespace/newlines (terminal copies carry a trailing \n).
+            size_t j = 0;
+            for (char const *p = clip; *p && j < sizeof(s_netJoinCode) - 1; ++p)
+                if (!isspace((unsigned char)*p))
+                    s_netJoinCode[j++] = *p;
+            s_netJoinCode[j] = 0;
+            NetMenu_SetStatus(j ? "Code pasted - press Connect." : "!Clipboard is empty");
+        }
+        else
+            NetMenu_SetStatus("!Clipboard is empty");
+        if (clip)
+            SDL_free(clip);
     }
     else if (entry == &ME_NET_LOBBY_LEAVE)
     {
