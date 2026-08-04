@@ -362,6 +362,10 @@ NETCODE ?= 1
 # NetDuke32 lockstep+prediction+sync netcode over the pluggable transport seam
 # (net_transport.h). Default OFF keeps the stock build byte-for-byte unchanged.
 NETDUKE32 ?= 0
+# Native (non-Emscripten) WebRTC/Nostr transport backend (libdatachannel +
+# libsecp256k1 + miniupnpc). Default OFF: the native build keeps the no-op stub,
+# so it links without those libs. Meaningful only with NETDUKE32=1, non-Emscripten.
+NETNATIVE ?= 0
 STARTUP_WINDOW ?= 1
 RETAIL_MENU ?= 0
 POLYMER ?= 1
@@ -908,6 +912,12 @@ ifeq (0,$(NETCODE))
 endif
 ifeq (1,$(NETDUKE32))
     COMPILERFLAGS += -DNETDUKE32
+    ifeq (1,$(NETNATIVE))
+        # Native transport: libdatachannel (no pkg-config file on most distros) +
+        # libsecp256k1 + miniupnpc (both ship .pc). Replaces net_transport_stub.cpp.
+        COMPILERFLAGS += -DNETNATIVE $(shell $(PKG_CONFIG) --cflags libsecp256k1 miniupnpc 2>/dev/null)
+        LIBS += -ldatachannel $(shell $(PKG_CONFIG) --libs libsecp256k1 miniupnpc 2>/dev/null)
+    endif
 endif
 ifneq (0,$(STARTUP_WINDOW))
     COMPILERFLAGS += -DSTARTUP_WINDOW

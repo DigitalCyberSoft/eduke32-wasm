@@ -563,6 +563,7 @@ duke3d_excl := \
 ifneq (1,$(NETDUKE32))
     duke3d_excl += \
         net_transport_stub.cpp \
+        net_transport_native.cpp \
         oldnet.cpp \
         net_predict.cpp \
         sync.cpp \
@@ -572,8 +573,26 @@ else
     # NetDuke32 lockstep netcode replaces the mainline snapshot netcode.
     duke3d_excl += network.cpp
     ifeq ($(PLATFORM),EMSCRIPTEN)
+        # browser: the JS --js-library seam replaces the stub; native impl excluded
+        duke3d_excl += net_transport_stub.cpp net_transport_native.cpp
+    else ifeq (1,$(NETNATIVE))
+        # native WebRTC/Nostr transport (libdatachannel) replaces the no-op stub
         duke3d_excl += net_transport_stub.cpp
+    else
+        # default native build: no-op stub only; exclude the libdatachannel impl
+        duke3d_excl += net_transport_native.cpp
     endif
+endif
+
+# net_transport_native.cpp is the ONE duke3d unit that must build at C++17 with
+# exceptions + RTTI: libdatachannel is a modern C++ API that throws. The rest of
+# the engine stays gnu++14 -fno-exceptions -fno-rtti. COMPILER_CXX is a recursive
+# (=) variable, so this target-specific override re-expands ONLY for this object's
+# compile recipe; global compile flags and the link command are untouched. The
+# extern "C" seam swallows every exception internally, so none crosses back into
+# the -fno-exceptions engine.
+ifeq (1,$(NETNATIVE))
+$(obj)/duke3d/net_transport_native.$(o): CXXONLYFLAGS := -std=c++17 -frtti -fexceptions
 endif
 
 duke3d_game_objs := $(call getfiltered,duke3d,*.cpp) \
