@@ -618,6 +618,9 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 // TODO(netcode): upstream NEWGAME_* flag nuances (NOSEND/RESETALL) are
                 // not modeled by this tree's G_NewGame.
                 (void)flags;
+#ifdef __EMSCRIPTEN__
+                // WASM (WebRTC/seam) build ONLY -- native NetDuke32 keeps the original
+                // G_NewGame() in the #else, so this does not touch native multiplayer.
                 // The guest runs SINGLE-PLAYER logic without this: g_netServer is a macro
                 // that is FALSE on a guest (not connecthead, oldnet.h:71), and the NEW_GAME
                 // packet carries m_coop/skill/level but NOT multimode or monsters_off. Set
@@ -635,6 +638,10 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 // BEFORE the MODE_NEWGAME check at 7186, so this flag is consumed the same
                 // frame. G_NewGame reads the m_* staged above at game.cpp:7046.
                 g_player[myconnectindex].ps->gm = MODE_RESTART|MODE_NEWGAME;
+#else
+                // Native NetDuke32 (non-Emscripten): unchanged upstream behavior.
+                G_NewGame(ud.m_volume_number, ud.m_level_number, ud.m_player_skill);
+#endif
                 break;
             }
             case PACKET_TYPE_NULL_PACKET:
@@ -1509,12 +1516,15 @@ void Net_WaitForPlayers()
         //if (quitevent) G_GameExit(""); // This sucks
         gameHandleEvents();
 
-        // WASM transport: drain the seam each frame so peers' PACKET_TYPE_PLAYER_READY
-        // is processed (net_poll -> Net_ReceiveFrame runs the packet switch inline).
-        // Without this the tic-0 barrier never observes the others as ready and spins
-        // forever; videoNextPage below yields to the browser so new frames arrive
-        // between iterations. Mirrors the net_poll drain in Net_GetPackets.
+#ifdef __EMSCRIPTEN__
+        // WASM (seam) transport ONLY: drain the seam each frame so peers'
+        // PACKET_TYPE_PLAYER_READY is processed (net_poll -> Net_ReceiveFrame runs the
+        // packet switch inline). Without this the tic-0 barrier never observes the others
+        // as ready and spins forever; videoNextPage below yields to the browser so new
+        // frames arrive between iterations. Mirrors the net_poll drain in Net_GetPackets.
+        // Guarded so native NetDuke32's barrier loop is byte-for-byte unchanged.
         net_poll();
+#endif
 
         if (!engineFPSLimit())
             continue;
