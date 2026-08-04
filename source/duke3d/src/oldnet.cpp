@@ -202,6 +202,12 @@ void Net_GetPackets(void)
 
     ChatPipe_Poll();
 
+    // Always drain the transport FIRST: NET_PEER_UP/DOWN events bootstrap numplayers
+    // (the first guest joining takes it 1 -> 2). This MUST run even when numplayers < 2,
+    // otherwise net_poll (gated in Net_ParsePackets below) never fires, numplayers is
+    // stuck at 1, and the host can never reach the >1 state its lobby/launch gate needs.
+    net_poll();
+
     if (numplayers < 2 || g_networkBroadcastMode == NETMODE_OFFLINE)
         return;
 

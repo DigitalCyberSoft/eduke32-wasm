@@ -3480,6 +3480,8 @@ static void Menu_PreDraw(MenuID_t cm, MenuEntry_t* entry, const vec2_t origin)
         }
         if (s_netRosterCount == 0)
             mminitext(origin.x + ((MENU_MARGIN_REGULAR+8)<<16), origin.y + (82<<16), "(nobody has joined yet)", MF_Minifont.pal_disabled);
+        if (s_netMyConnectIndex != 0)   // a joining player only waits; the host controls the start
+            mminitext(origin.x + (MENU_MARGIN_REGULAR<<16), origin.y + (150<<16), "Waiting for the host to start the match...", MF_Minifont.pal_deselected);
         netmenu_draw_status(origin);
         break;
     }
