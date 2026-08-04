@@ -343,8 +343,11 @@ class DukeNet {
   private _onChannelsReady(peerId: string): void {
     const m = this.match;
     if (!m) return;
+    console.log(`[dnet] channels ready with ${peerId.slice(0, 8)} (role=${m.role})`);
     if (m.role === "guest" && peerId === m.hostId) {
       // Guest -> host: request to join (GRP-gated on the host side).
+      console.log(`[dnet] -> sending join to host`);
+      this.events.onStatus?.("Connecting to host… (joining)");
       m.peers.sendControl(peerId, { t: "join", name: this.myName, grp: this.localGrp } as Ctl);
     }
     // Host waits for each guest's {t:'join'}.
@@ -394,6 +397,7 @@ class DukeNet {
   private _hostHandleJoin(peerId: string, msg: { grp: GrpFingerprint; name: string }): void {
     const m = this.match;
     if (!m || m.role !== "host") return;
+    console.log(`[dnet] <- join request from ${peerId.slice(0, 8)} name=${msg.name}`);
     const hostFp = m.grpFingerprint();
     if (!msg.grp || msg.grp.setDigest !== hostFp.setDigest) {
       // GRP GATING: only identical-GRP-set players may join. Offer the fingerprint so
@@ -419,6 +423,7 @@ class DukeNet {
   private _guestHandleJoinOk(peerId: string, msg: { yourSlot: number; hostSlot: number }): void {
     const m = this.match;
     if (!m || m.role !== "guest" || peerId !== m.hostId) return;
+    console.log(`[dnet] <- join_ok slot=${msg.yourSlot} -> entering lobby`);
     this.myConnectIndex = msg.yourSlot | 0;
     // Tell the netcode our authoritative slot (host is 0; we are a guest at
     // yourSlot). Reaches the page's Emscripten Module — ccall is exported via
@@ -442,6 +447,7 @@ class DukeNet {
   private _guestHandleJoinDeny(peerId: string, msg: { reason: string; hostGrp?: GrpFingerprint }): void {
     const m = this.match;
     if (!m || peerId !== m.hostId) return;
+    console.log(`[dnet] <- join_deny reason=${msg.reason}`);
     if (msg.reason === "grpmismatch" && msg.hostGrp) {
       const cls = classifyByCrc(msg.hostGrp.mainGrp.crc);
       if (cls.shareable) {
@@ -553,6 +559,11 @@ class DukeNet {
   private _onConnection(peerId: string, state: RTCPeerConnectionState): void {
     const m = this.match;
     if (!m) return;
+    console.log(`[dnet] conn ${peerId.slice(0, 8)} -> ${state} (role=${m.role})`);
+    // While a guest is still dialing its host (not yet attached == no join_ok yet),
+    // surface the handshake stage on-screen so a stall is diagnosable from the status.
+    if (m.role === "guest" && peerId === m.hostId && !m.peers.isAttached(peerId))
+      this.events.onStatus?.(`Connecting to host… (${state})`);
     if (state === "failed" || state === "closed" || state === "disconnected") {
       if (m.peers.isAttached(peerId)) {
         this.seam.enqueuePeerEventByDevice(peerId, false);

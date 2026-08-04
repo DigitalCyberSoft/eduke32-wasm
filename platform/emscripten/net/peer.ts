@@ -80,10 +80,12 @@ export class PeerManager {
     };
     pc.onconnectionstatechange = () => {
       const s = pc.connectionState;
+      console.log(`[dnet] pc ${peerId.slice(0, 8)} connectionState=${s}`);
       this.onConnectionChange?.(peerId, s);
       if (s === "connected") conn.backoff = 2000;
       else if (s === "failed" || s === "disconnected") this._scheduleReconnect(peerId);
     };
+    pc.oniceconnectionstatechange = () => console.log(`[dnet] pc ${peerId.slice(0, 8)} iceConnectionState=${pc.iceConnectionState}`);
     pc.ondatachannel = (e) => this._setupDc(peerId, e.channel);
     return conn;
   }
@@ -106,6 +108,7 @@ export class PeerManager {
 
     dc.onopen = () => {
       conn.lastHeard = Date.now();
+      console.log(`[dnet] channel '${label}' open to ${peerId.slice(0, 8)}`);
       // Re-announce the connection so listeners see the now-usable channel (the pc
       // reaches "connected" before the channels open).
       this.onConnectionChange?.(peerId, conn.pc.connectionState);
@@ -170,9 +173,11 @@ export class PeerManager {
     const offer = await conn.pc.createOffer();
     await conn.pc.setLocalDescription(offer);
     await sendOffer(conn.encKey, peerId, offer, conn.relays);
+    console.log(`[dnet] -> offer sent to ${peerId.slice(0, 8)}`);
   }
 
   async handleOffer(peerId: string, offer: RTCSessionDescriptionInit, encKey: string, relays: readonly string[]): Promise<void> {
+    console.log(`[dnet] <- offer from ${peerId.slice(0, 8)}, answering`);
     const conn = this._ensure(peerId, encKey, relays);
     await conn.pc.setRemoteDescription(new RTCSessionDescription(offer));
     conn.remoteDescSet = true;
@@ -183,6 +188,7 @@ export class PeerManager {
   }
 
   async handleAnswer(peerId: string, answer: RTCSessionDescriptionInit): Promise<void> {
+    console.log(`[dnet] <- answer from ${peerId.slice(0, 8)}`);
     const conn = this._conns.get(peerId);
     if (!conn) return;
     await conn.pc.setRemoteDescription(new RTCSessionDescription(answer));

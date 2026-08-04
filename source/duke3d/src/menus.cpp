@@ -4576,17 +4576,21 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
         // WebRTC host launch. Only the host reaches this entry (hidden for guests via
         // HideOnCondition on s_netMyConnectIndex != 0). Works at any player count.
         //
-        // With guests present, broadcast NEW_GAME so they enter at tic 0 (Net_SendNewGame
-        // no-ops at numplayers < 2, so solo skips it). Then DEFER our own level entry to
-        // the main loop by setting gm: this handler runs nested under M_DisplayMenus on the
-        // app_main stack, so it must not enter a level (or drive the tic-0 barrier) inline.
-        // app_main consumes MODE_NEWGAME (game.cpp:7186 -> 7044 G_NewGame -> 7189 ->
-        // G_EnterLevel -> Net_WaitForPlayers, which no-ops solo and rendezvous 2+ peers).
-        // Same deferred-restart idiom the `map` console command uses (osdcmds.cpp:293).
+        // No in-menu map picker yet, so launch the shareware start map (E1L1) -- a map
+        // guaranteed to exist, so G_EnterLevel cannot blank on a missing level.
+        // TODO(netcode): drive volume/level from a HOST CONFIG map selector.
+        ud.m_volume_number = 0;
+        ud.m_level_number  = 0;
         if (numplayers > 1)
-            Net_SendNewGame(0);
-        NetMenu_SetInGame(1);                                        // stop advertising + close the accept gate
-        g_player[myconnectindex].ps->gm = MODE_RESTART|MODE_NEWGAME; // defer level entry to the main loop
+            Net_SendNewGame(0);   // guests enter the same map at tic 0 (reads ud.m_* above)
+        NetMenu_SetInGame(1);     // stop advertising + close the accept gate
+        // Enter the level DIRECTLY, exactly like the single-player New Game path
+        // (G_NewGame_EnterLevel at menus.cpp:4229/4386). The deferred-gm approach set the
+        // flag from this menu-stack handler AFTER the main loop's MODE_NEWGAME check
+        // (game.cpp:7186) had already run for the frame, so the menu closed but the level
+        // never entered -> blank screen. For 2+ players the tic-0 Net_WaitForPlayers
+        // barrier runs as a nested modal loop (pumping net_poll); it no-ops solo.
+        G_NewGame_EnterLevel();
 #else
         // master does whatever it wants
         if (g_netServer)
