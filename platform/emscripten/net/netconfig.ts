@@ -20,13 +20,25 @@ export const PROTOCOL_VERSION = 1;
 
 /** Public Nostr relays used as the signaling rendezvous. Same proven set as the
  *  source stack: multiple relays so a single outage does not block discovery. */
+// Loopback relay (`npm run relay` or any NIP-01 relay on the player's machine) makes
+// desktop<->browser signaling fully local — no third-party relay in the path. Only
+// offered when the PAGE is already local or ?localrelay=1 is passed: Chrome's Local
+// Network Access policy blocks (headless) or permission-prompts (headed) a PUBLIC
+// https page opening loopback sockets, so the live site must not try it by default.
+const LOCAL_RELAY = "ws://127.0.0.1:7500";
+function localRelayWanted(): boolean {
+  try {
+    if (typeof location === "undefined") return true; // Node harness: always
+    const h = location.hostname;
+    if (h === "localhost" || h === "127.0.0.1" || h === "[::1]") return true;
+    return new URLSearchParams(location.search).has("localrelay");
+  } catch {
+    return false;
+  }
+}
+
 export const NOSTR_RELAYS: readonly string[] = [
-  // Loopback relay FIRST: `npm run relay` (or any NIP-01 relay) on the player's own
-  // machine makes desktop<->browser signaling fully local — no third-party relay in
-  // the path. Browsers exempt loopback from mixed-content blocking, so an https page
-  // may open ws://127.0.0.1; when nothing listens it fails in milliseconds and the
-  // public relays below take over.
-  "ws://127.0.0.1:7500",
+  ...(localRelayWanted() ? [LOCAL_RELAY] : []),
   "wss://relay.damus.io",
   "wss://nos.lol",
   "wss://relay.snort.social",
