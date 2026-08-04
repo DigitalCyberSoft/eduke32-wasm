@@ -91,7 +91,7 @@
 <div id="diag"></div>
 <div id="settings" role="dialog" aria-modal="true">
   <div class="panel">
-    <h3><span class="brand">eduke32</span>-wasm <span class="ver" id="ver">Duke Nukem 3D &middot; WebAssembly</span></h3>
+    <h3><span class="brand">eduke32</span>-wasm <span class="ver" id="ver">Duke Nukem 3D &middot; WebAssembly</span> <span class="ver" id="build">build __BUILD_ID__</span></h3>
     <section>
       <h4>Loaded GRP files</h4>
       <ul id="grplist"><li class="empty">&hellip;</li></ul>
@@ -201,11 +201,18 @@
   }
   // ---------------------------------------------------------------------------
 
+  window.__BUILD__ = "__BUILD_ID__";  // replaced at deploy time (CI 'Assemble site'); cache-buster + on-page build tag
   var Module = {
     canvas: (function(){ var c = document.getElementById('canvas');
       c.addEventListener('webglcontextlost', function(e){ alert('WebGL context lost.'); e.preventDefault(); }, false);
       return c; })(),
     arguments: ['-nosetup'],
+    // Cache-bust the wasm with the deploy build id so a fresh deploy is never served
+    // from a stale browser/CDN cache. The 11 MB .data is intentionally NOT busted
+    // (rarely changes; busting it would re-download the whole pack every deploy).
+    locateFile: function (path, prefix) {
+      return prefix + path + (path.slice(-5) === '.wasm' ? '?v=' + window.__BUILD__ : '');
+    },
     // Emscripten calls setStatus for wasm/data download + init. "(x/y)" carries bytes.
     setStatus: function (text) {
       if (!text) { setPct(100); statusEl.textContent = 'Starting…'; if (started) hideLoader(); return; }
@@ -318,7 +325,7 @@
       if (t - lastT >= 500) {
         var fps = Math.round(frames * 1000 / (t - lastT)); frames = 0; lastT = t;
         var c = $('canvas');
-        diagEl.textContent = fps + ' fps  ' + c.width + 'x' + c.height + (window.__e32ver ? '  ' + window.__e32ver : '');
+        diagEl.textContent = fps + ' fps  ' + c.width + 'x' + c.height + (window.__e32ver ? '  ' + window.__e32ver : '') + (window.__BUILD__ ? '  build ' + window.__BUILD__ : '');
       }
       raf = requestAnimationFrame(diagLoop);
     }
@@ -375,7 +382,7 @@
 <!-- eduke32-net addition: the WebRTC+Nostr multiplayer transport (window.DukeNet).
      A deferred, self-contained ES module built by platform/emscripten esbuild;
      independent of the wasm graph. Must be served beside eduke32.js. -->
-<script type="module" src="eduke32-net.js"></script>
-<script src="eduke32.js"></script>
+<script type="module" src="eduke32-net.js?v=__BUILD_ID__"></script>
+<script src="eduke32.js?v=__BUILD_ID__"></script>
 </body>
 </html>
