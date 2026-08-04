@@ -915,7 +915,7 @@ ifeq (1,$(NETDUKE32))
     ifeq (1,$(NETNATIVE))
         # Native transport: libdatachannel (no pkg-config file on most distros) +
         # libsecp256k1 + miniupnpc (both ship .pc). Replaces net_transport_stub.cpp.
-        COMPILERFLAGS += -DNETNATIVE $(shell $(PKG_CONFIG) --cflags libsecp256k1 miniupnpc 2>/dev/null)
+        COMPILERFLAGS += -DNETNATIVE -Iplatform/native $(shell $(PKG_CONFIG) --cflags libsecp256k1 miniupnpc 2>/dev/null)
         LIBS += -ldatachannel $(shell $(PKG_CONFIG) --libs libsecp256k1 miniupnpc 2>/dev/null)
     endif
 endif
