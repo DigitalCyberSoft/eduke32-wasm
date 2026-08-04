@@ -4582,7 +4582,7 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
         {
             // WebRTC lobby: no map-vote system. Lockstep needs every player present
             // at tic 0, so the host can only launch once a guest has joined.
-            NetMenu_SetStatus("!Waiting for a player to join before you can launch.");
+            NetMenu_SetStatus("!Need another player to launch.");
         }
 #else
         else if (voting == -1)

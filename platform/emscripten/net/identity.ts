@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// IDENTITY — a stable per-browser device id + small helpers.
+// IDENTITY — a stable per-tab device id + small helpers.
 //
 // Reused ~as-is from the scorchedearth-multi transport. The device id is the Nostr
 // signaling address; it is NOT the Duke connectindex (that peerToken is assigned by
@@ -14,16 +14,22 @@ export function uid(): string {
 }
 
 function readDeviceId(): string {
+  // PER-TAB id via sessionStorage, NOT localStorage: two tabs in the same browser
+  // must get DIFFERENT ids, otherwise each discards the other's signaling as its own
+  // echo (signaling.ts `msg.from === DEVICE_ID`) and the WebRTC handshake never
+  // completes (stuck at "Connecting to host"). sessionStorage survives a same-tab
+  // reload (e.g. the GRP-download relaunch, which also uses sessionStorage) but is
+  // isolated per tab, so two clients on one machine can host+join each other.
   let d: string | null = null;
   try {
-    d = localStorage.getItem(DID_KEY);
+    d = sessionStorage.getItem(DID_KEY);
   } catch {
     d = null;
   }
   if (!d) {
     d = uid() + "-" + uid();
     try {
-      localStorage.setItem(DID_KEY, d);
+      sessionStorage.setItem(DID_KEY, d);
     } catch {
       /* private mode / no storage: ephemeral id for this session */
     }
@@ -31,7 +37,8 @@ function readDeviceId(): string {
   return d;
 }
 
-/** This browser's stable device id (ephemeral if storage is blocked). */
+/** This tab's stable device id (per-tab so two tabs on one machine never collide;
+ *  ephemeral if storage is blocked). */
 export const DEVICE_ID = typeof window !== "undefined" ? readDeviceId() : "node-" + uid();
 
 /** Unix seconds (Nostr created_at unit). */
