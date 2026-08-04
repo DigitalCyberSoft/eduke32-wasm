@@ -39,14 +39,28 @@ jobs:
       - name: Verify toolchain
         run: emcc --version
 
-      - name: Build (classic software renderer, multi-file)
-        run: make PLATFORM=EMSCRIPTEN EM_SINGLE_FILE=0 -j"$(nproc)"
+      - name: Set up Node (multiplayer transport bundle)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build + test multiplayer transport (eduke32-net.js)
+        working-directory: platform/emscripten
+        run: |
+          npm ci
+          npm test
+          npm run build:net
+
+      - name: Build (classic software renderer, multi-file, NetDuke32 multiplayer)
+        run: make PLATFORM=EMSCRIPTEN EM_SINGLE_FILE=0 NETDUKE32=1 -j"$(nproc)"
 
       - name: Assemble site
         run: |
           mkdir -p _site
           cp eduke32.js eduke32.wasm eduke32.data _site/
           cp platform/emscripten/index.html _site/index.html
+          cp platform/emscripten/eduke32-net.js _site/eduke32-net.js
+          cp platform/emscripten/grp-manifest.json _site/grp-manifest.json
           ls -la _site
 
       - name: Upload Pages artifact
