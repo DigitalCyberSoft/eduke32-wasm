@@ -21,6 +21,7 @@ echo "== build native transport test CLIs (prefix=$PREFIX) =="
 $CXX $INC "$ROOT/platform/native/test/nn_crypto_test.cpp" -o "$OUT/crypto_test" $LIBDIRS -lsecp256k1 -lcrypto
 $CXX $INC "$ROOT/platform/native/test/nn_nostr_test.cpp"  -o "$OUT/nostr_test"  $LIBDIRS -lsecp256k1 -lcrypto
 $CXX $INC "$ROOT/platform/native/test/nn_relay_test.cpp"  -o "$OUT/relay_test"  $LIBDIRS -ldatachannel -lsecp256k1 -lcrypto -lpthread
+$CXX $INC "$ROOT/platform/native/test/nn_peer_test.cpp"   -o "$OUT/peer_test"   $LIBDIRS -ldatachannel -lsecp256k1 -lcrypto -lpthread
 
 export LD_LIBRARY_PATH="$PREFIX/usr/lib64:$PREFIX/lib64:${LD_LIBRARY_PATH:-}"
 
@@ -32,6 +33,8 @@ echo "== nostr event interop vs nostr-tools verifyEvent =="
 node "$ROOT/platform/native/test/nostr_check.mjs" "$OUT/nostr_test"
 echo "== relay end-to-end interop (native <-> browser stack) =="
 node "$ROOT/platform/native/test/relay_e2e.mjs" "$OUT/relay_test"
+echo "== WebRTC two-peer connect (presence -> offer/answer -> 3 channels) =="
+node "$ROOT/platform/native/test/peer_e2e.mjs" "$OUT/peer_test"
 
 echo
 echo "ALL NATIVE TRANSPORT TESTS PASSED"
