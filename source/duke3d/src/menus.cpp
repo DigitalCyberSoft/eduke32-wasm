@@ -415,6 +415,9 @@ static MenuEntry_t *MEL_MAIN_INGAME[] = {
 #endif
     &ME_MAIN_SAVEGAME,
     &ME_MAIN_LOADGAME,
+#ifdef NETMENU
+    &ME_MAIN_MULTIPLAYER,   // reachable from ESC in-game too (live request)
+#endif
     &ME_MAIN_OPTIONS,
     &ME_MAIN_HELP,
     &ME_MAIN_QUITTOTITLE,
@@ -8818,14 +8821,19 @@ void M_DisplayMenus(void)
     vec2_t origin = { 0, 0 }, previousOrigin = { 0, 0 };
 
     Net_GetPackets();
-#ifdef NETNATIVE
-    net_native_menu_pump(); // apply queued transport -> NetMenu_* updates on the game thread
-    // Native match entry MUST live here, not in app_main's main loop: at the menu the engine
-    // runs the attract-mode loop (G_PlaybackDemo), which calls M_DisplayMenus but never reaches
-    // app_main's do-loop. So both the host launch and the guest's deferred NEW_GAME are entered
-    // here (safely outside net_poll, which ran in Net_GetPackets above).
+#ifdef NETMENU
+    // Match entry MUST live here, not in app_main's main loop: at the menu the engine
+    // runs the attract-mode loop (G_PlaybackDemo), which calls M_DisplayMenus but never
+    // reaches app_main's do-loop. So the native host launch AND the guest's deferred
+    // NEW_GAME are entered here (safely outside net_poll, which ran in Net_GetPackets
+    // above). The guest block below is NETMENU-wide: the oldnet.cpp NEW_GAME handler
+    // defers on BOTH transports, and guarding this consumer NETNATIVE-only left the
+    // BROWSER guest with its menu flag cleared and nobody to enter the level -- the
+    // live-reported "guest sits on the wallpaper while the host waits for players".
     {
         auto &nngm = g_player[myconnectindex].ps->gm;
+#ifdef NETNATIVE
+        net_native_menu_pump(); // apply queued transport -> NetMenu_* updates on the game thread
         // HOST: headless auto-launch (NN_AUTOLAUNCH) or, interactively, ME_NETHOST_LAUNCH does this.
         if (net_native_should_launch() && (nngm & MODE_MENU))
         {
@@ -8842,6 +8850,7 @@ void M_DisplayMenus(void)
             G_NewGame_EnterLevel();
             return; // level is entering; skip the rest of this menu frame
         }
+#endif // NETNATIVE
         // GUEST: the NEW_GAME packet handler (oldnet.cpp, inside net_poll) deferred MODE_NEWGAME.
         // Enter the same level the host chose (ud.m_* were set from the packet). numplayers>1,
         // so G_NewGame_EnterLevel runs the tic-0 barrier that rendezvouses with the host.

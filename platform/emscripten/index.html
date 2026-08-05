@@ -42,10 +42,12 @@
   #err { color:#ff7a5c; max-width:640px; font-size:13px; white-space:pre-wrap; }
 
   /* --- Web-wrapper settings panel (separate from the in-game menu) --- */
-  #gear { position:fixed; top:12px; right:12px; z-index:20; width:40px; height:40px; border-radius:8px;
+  #gear, #mute { position:fixed; top:12px; right:12px; z-index:20; width:40px; height:40px; border-radius:8px;
     border:1px solid #3a3a42; background:rgba(20,20,24,.7); color:#e8e2d6; font-size:20px; line-height:1; cursor:pointer;
     display:none; align-items:center; justify-content:center; }
-  #gear:hover { background:rgba(42,42,50,.92); }
+  #gear:hover, #mute:hover { background:rgba(42,42,50,.92); }
+  #mute { right:60px; }
+  #mute.muted { opacity:.55; }
   #diag { position:fixed; top:10px; left:10px; z-index:15; font-family:monospace; font-size:12px; color:#9effa0;
     background:rgba(0,0,0,.5); padding:4px 8px; border-radius:6px; display:none; white-space:pre; pointer-events:none; }
   #settings { position:fixed; inset:0; z-index:30; display:none; align-items:center; justify-content:center;
@@ -88,6 +90,7 @@
   <div id="err"></div>
 </div>
 <button id="gear" title="Settings" aria-label="Settings">&#9881;</button>
+<button id="mute" title="Sound on/off" aria-label="Sound on/off">&#128266;</button>
 <div id="diag"></div>
 <div id="settings" role="dialog" aria-modal="true">
   <div class="panel">
@@ -202,6 +205,26 @@
   // ---------------------------------------------------------------------------
 
   window.__BUILD__ = "__BUILD_ID__";  // replaced at deploy time (CI 'Assemble site'); cache-buster + on-page build tag
+
+  // STALE-PAGE SELF-HEAL. GitHub Pages serves everything with max-age=600 and a
+  // plain navigation within that window gets the CACHED document -- no request at
+  // all -- so a player can sit a full build behind while a deploy is "live" (every
+  // asset is ?v=-busted, but only off a fresh document). Revalidate the document at
+  // boot; if the server's copy names a different build, reload once (sessionStorage
+  // guard: never loops). Costs one conditional request; incognito behavior and a
+  // fresh cache are unaffected.
+  (function () {
+    try {
+      fetch(location.pathname, { cache: 'no-cache' }).then(function (r) { return r.text(); }).then(function (t) {
+        var m = t.match(/__BUILD__ = "([^"]+)"/);
+        if (!m || m[1] === window.__BUILD__) return;
+        var key = 'e32-reloaded-' + m[1];
+        if (sessionStorage.getItem(key)) return;
+        sessionStorage.setItem(key, '1');
+        location.reload();
+      }).catch(function () {});
+    } catch (e) {}
+  })();
   var Module = {
     canvas: (function(){ var c = document.getElementById('canvas');
       c.addEventListener('webglcontextlost', function(e){ alert('WebGL context lost.'); e.preventDefault(); }, false);
@@ -382,6 +405,29 @@
 <!-- eduke32-net addition: the WebRTC+Nostr multiplayer transport (window.DukeNet).
      A deferred, self-contained ES module built by platform/emscripten esbuild;
      independent of the wasm graph. Must be served beside eduke32.js. -->
+<script>
+// Mute toggle (persisted): suspends/resumes the SDL WebAudio context, killing music
+// AND sfx in one place. The context appears only after engine audio init, and the
+// autoplay-unlock handler resumes it on any input -- a watchdog re-asserts a
+// persisted mute so neither of those can un-mute the page.
+(function () {
+  var btn = document.getElementById('mute');
+  if (!btn) return;
+  var muted = false;
+  try { muted = localStorage.getItem('e32-muted') === '1'; } catch (e) {}
+  function ctx() { var s = window.Module && window.Module.SDL2; return s && s.audioContext; }
+  function paint() { btn.innerHTML = muted ? '&#128263;' : '&#128266;'; btn.classList.toggle('muted', muted); }
+  function apply() { var c = ctx(); if (c) { if (muted) c.suspend(); else c.resume(); } paint(); }
+  btn.addEventListener('click', function () {
+    muted = !muted;
+    try { localStorage.setItem('e32-muted', muted ? '1' : '0'); } catch (e) {}
+    apply();
+  });
+  paint();
+  var boot = setInterval(function () { if (ctx()) { clearInterval(boot); apply(); } }, 500);
+  setInterval(function () { var c = ctx(); if (c && muted && c.state === 'running') c.suspend(); }, 1500);
+})();
+</script>
 <script type="module" src="eduke32-net.js?v=__BUILD_ID__"></script>
 <script src="eduke32.js?v=__BUILD_ID__"></script>
 </body>
