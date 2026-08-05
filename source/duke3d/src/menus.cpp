@@ -29,6 +29,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "compat.h"
 #include "demo.h"
 #include "duke3d.h"
+#ifdef NETDUKE32
+# include "net_predict.h"  // predictfifoplc (telemetry surface)
+#endif
 #include "in_android.h"
 #include "input.h"
 #include "osdcmds.h"
@@ -8985,7 +8988,7 @@ void M_DisplayMenus(void)
                 }
                 extern int32_t g_netPumpCalls, g_netGateC1, g_netGateC2, g_mainLoopIter, g_demoLoopIter;
                 Bsnprintf(scr, sizeof scr,
-                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d,%d,%d],o1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d,in:[%d,%d],ap1:[%d,%d,%d],gate1:[%d,%d,%d],snr:%d,ep:%d,epd:%d,sc:%d,du:%d,gp:%d,st:%d}",
+                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d,%d,%d],o1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d,in:[%d,%d],ap1:[%d,%d,%d],gate1:[%d,%d,%d],snr:%d,ep:%d,epd:%d,sc:%d,du:%d,gp:%d,st:%d,pf:%d}",
                           menuOpen, (int)m_currentMenu->menuID, inGame, (int)nngm,
                           (int)numplayers, (int)myconnectindex, (g_foundSyncError || Net_SyncErrorDetected()) ? 1 : 0, (int)sel,
                           p0x, p0y, p1x, p1y, p1z, p1a, o1x, o1y,
@@ -9004,7 +9007,8 @@ void M_DisplayMenus(void)
                           (int)g_netMoveEpoch, (int)g_netEpochDrops,
                           (int)(({ extern int32_t g_netSyncCompares; g_netSyncCompares; }) % 1000000),
                           (int)(g_netDupTics % 1000000), (int)(g_netGapDrops % 1000000),
-                          g_netStallSince ? 1 : 0);
+                          g_netStallSince ? 1 : 0,
+                          (int)(predictfifoplc % 10000000));
                 // NEVER eval a truncated script: Bsnprintf cuts mid-expression, the
                 // SyntaxError unwinds through callUserCallback -> doRewind and KILLS
                 // the ASYNCIFY resume -- the engine hard-freezes while the page stays

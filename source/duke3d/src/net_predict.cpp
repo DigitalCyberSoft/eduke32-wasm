@@ -195,6 +195,38 @@ void Net_UsePredictedPointers(void)
     using_predicted_pointers = true;
 }
 
+// ── Predicted VIEW ──────────────────────────────────────────────────────────
+// Swap ONLY the local player's ps pointer for RENDERING (camera + weapon
+// drawing), so the player's own movement/turning/weapon feel is zero-latency
+// while the authoritative lockstep runs bufferjitter+RTT behind. World arrays
+// stay authoritative: everyone ELSE renders at confirmed positions, exactly
+// like Quake's client prediction. Callers must pair Begin/End tightly around
+// pure DISPLAY code -- never around simulation or menu consumers (the menus
+// run snapshot saves and gm transitions that must see the real player).
+static DukePlayer_t *s_viewSwapSaved;
+
+void Net_BeginPredictedView(void)
+{
+    if (s_viewSwapSaved != NULL || numplayers < 2 || screenpeek != myconnectindex
+        || originalPlayer == NULL || ud.pause_on)
+        return;
+    auto &ps = g_player[myconnectindex].ps;
+    if (ps != originalPlayer || !(ps->gm & MODE_GAME) || (ps->gm & (MODE_EOL | MODE_RESTART | MODE_NEWGAME)))
+        return;
+    // Mode/UI bits stay authoritative under the swap (display code tests them).
+    predictedPlayer.gm = ps->gm;
+    s_viewSwapSaved = ps;
+    ps = &predictedPlayer;
+}
+
+void Net_EndPredictedView(void)
+{
+    if (s_viewSwapSaved == NULL)
+        return;
+    g_player[myconnectindex].ps = s_viewSwapSaved;
+    s_viewSwapSaved = NULL;
+}
+
 void Net_UseOriginalPointers(void)
 {
     if (numplayers < 2)

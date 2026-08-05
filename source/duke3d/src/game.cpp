@@ -6510,7 +6510,19 @@ void drawframe_do(void)
 
     int const smoothratio = calc_smoothratio(totalclock, ototalclock);
 
+#ifdef NETDUKE32
+    // MP: the local first-person CAMERA renders from the PREDICTED player, so
+    // your own movement/turning never waits on the lockstep (Quake-style
+    // client prediction). The world itself stays authoritative. Weapon drawing
+    // gets the same treatment inside G_DisplayRest (screens.cpp); the swap is
+    // NOT held across G_DisplayRest itself, whose menu consumers must see the
+    // real player (snapshot saves, gm transitions).
+    Net_BeginPredictedView();
     G_DrawRooms(screenpeek, smoothratio);
+    Net_EndPredictedView();
+#else
+    G_DrawRooms(screenpeek, smoothratio);
+#endif
 
     if (videoGetRenderMode() >= REND_POLYMOST)
         G_DrawBackground();
@@ -6541,7 +6553,21 @@ void dukeFillInputForTic(void)
 {
     // this is where we fill the input_t struct that is actually processed by P_ProcessInput()
     auto const pPlayer = g_player[myconnectindex].ps;
+#ifdef NETDUKE32
+    // MP: rotate fvel/svel by the PREDICTED facing -- the angle the player is
+    // LOOKING AT on screen -- not the authoritative one that lags a
+    // round-trip behind. With the delayed angle, "forward" right after a turn
+    // walks along the old facing on every peer (the rotation is baked into
+    // the transmitted input), which feels like ice-skating. Classic DOS Duke
+    // rotated by the predicted `myang` for exactly this reason. Deterministic:
+    // the input CONTENT is what travels, and every peer replays it verbatim.
+    auto const q16ang = fix16_to_int((numplayers > 1 && originalPlayer != NULL
+                                      && g_player[myconnectindex].ps == originalPlayer
+                                      && (pPlayer->gm & MODE_GAME))
+                                     ? predictedPlayer.q16ang : pPlayer->q16ang);
+#else
     auto const q16ang  = fix16_to_int(pPlayer->q16ang);
+#endif
     input_t input;
 
     input = localInput;
@@ -7436,7 +7462,15 @@ int G_DoMoveThings(void)
     if (ud.pause_on == 0)
         G_MoveWorld();
 
-//    Net_CorrectPrediction();
+#ifdef NETDUKE32
+    // Reconcile prediction against the tic that just became authoritative:
+    // snap the predicted copies back to the real state and replay the still-
+    // pending local inputs. Without this the predicted view free-runs and
+    // never absorbs remote effects on the local player (knockback, damage,
+    // moving sectors). Sounds fired during the replay are centrally
+    // suppressed (sounds.cpp oldnet_predicting guards).
+    Net_CorrectPrediction();
+#endif
 
     if (g_netServer)
         Net_SendServerUpdates();

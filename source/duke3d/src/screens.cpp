@@ -35,6 +35,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "microprofile.h"
 #include "sbar.h"
 #include "screens.h"
+#ifdef NETDUKE32
+# include "net_predict.h"  // Net_Begin/EndPredictedView (weapon-draw swap)
+#endif
 
 #define COLOR_RED redcol
 #define COLOR_WHITE whitecol
@@ -1060,7 +1063,16 @@ void G_DisplayRest(int32_t smoothratio)
                 G_DrawCameraText(pp->newowner);
             else
             {
+#ifdef NETDUKE32
+                // MP: draw the weapon from the PREDICTED player so fire/reload
+                // animation starts on the click, not a round-trip later. Narrow
+                // pair -- P_DisplayWeapon is display-only (no anim-state writes).
+                Net_BeginPredictedView();
                 P_DisplayWeapon();
+                Net_EndPredictedView();
+#else
+                P_DisplayWeapon();
+#endif
 #ifdef SPLITSCREEN_MOD_HACKS
                 if (pp2)  // HACK
                 {

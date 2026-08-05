@@ -58,6 +58,8 @@ void Net_SwapPredictedLinkedLists(void);
 void Net_DoPrediction(int state);
 void Net_UsePredictedPointers(void);
 void Net_UseOriginalPointers(void);
+void Net_BeginPredictedView(void);  // render-only ps swap (camera/weapon feel)
+void Net_EndPredictedView(void);
 
 // Returns true if we're in a valid predictable state and context for the local player.
 // Used to prevent sounds and display events from triggering outside of prediction if they are predictable.

@@ -29,6 +29,10 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 #include <atomic>
 
+#ifdef NETDUKE32
+# include "net_predict.h"  // oldnet_predicting: suppress sounds from prediction passes
+#endif
+
 int32_t g_numEnvSoundsPlaying, g_highestSoundIdx;
 static bool g_dukeTalk;
 
@@ -823,6 +827,15 @@ boost:
 
 int S_PlaySound3D(int num, int spriteNum, const vec3_t& pos)
 {
+#ifdef NETDUKE32
+    // Prediction replays the pending local inputs EVERY frame (and again after
+    // each authoritative tic once Net_CorrectPrediction runs). Any sound fired
+    // from a predicted pass would repeat 30+ times and then fire once more for
+    // real; player.cpp carries no per-site guards in this port, so suppress
+    // centrally. The authoritative tic plays it once, a beat later.
+    if (oldnet_predicting)
+        return -1;
+#endif
     int const sndNum = VM_OnEventWithReturn(EVENT_SOUND, spriteNum, screenpeek, num);
 
     if ((sndNum == -1 && num != -1) || !ud.config.SoundToggle || (unsigned)spriteNum >= MAXSPRITES) // check that the user returned -1, but only if -1 wasn't playing already (in which case, warn)
@@ -946,6 +959,10 @@ error:
 
 int S_PlaySound(int num)
 {
+#ifdef NETDUKE32
+    if (oldnet_predicting)   // see S_PlaySound3D: no sounds from prediction passes
+        return -1;
+#endif
     int sndnum = VM_OnEventWithReturn(EVENT_SOUND, g_player[screenpeek].ps->i, screenpeek, num);
 
     if ((sndnum == -1 && num != -1) || !ud.config.SoundToggle) // check that the user returned -1, but only if -1 wasn't playing already (in which case, warn)
