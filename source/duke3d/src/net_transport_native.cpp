@@ -32,6 +32,7 @@
 #include "nn_grp.hpp"
 #include "nn_relay.hpp"
 #include "nn_signaling.hpp"
+#include "nn_upnp.hpp"
 
 #include <sjson.h>   // impl provided by eduke32's sjson.o (tests supply their own)
 
@@ -276,6 +277,13 @@ public:
     {
         if (pm_)
             pm_->closeAll();
+        if (upnpStarted_)
+        {
+            if (upnpThread_.joinable())
+                upnpThread_.join();
+            upnp_.unmapAll();
+            upnpStarted_ = false; // next match maps again
+        }
         std::lock_guard<std::mutex> lk(mtx_);
         tokenToDevice_.clear();
         deviceToToken_.clear();
@@ -305,6 +313,9 @@ public:
         running_ = false;
         if (presenceThread_.joinable())
             presenceThread_.join();
+        if (upnpThread_.joinable())
+            upnpThread_.join();
+        upnp_.unmapAll(); // leave the router the way we found it
         if (pm_)
             pm_->closeAll();
         if (nostr_)
@@ -745,6 +756,11 @@ private:
     void applyIcePolicy()
     {
         rtc::Configuration cfg;
+        // Pin the ICE agent to a known UDP range so UPnP can map exactly these
+        // ports. Per-pid offset: two instances on one machine get disjoint ranges.
+        icePortBase_ = (uint16_t)(20000 + (getpid() % 512) * 16);
+        cfg.portRangeBegin = icePortBase_;
+        cfg.portRangeEnd = icePortBase_ + 15;
         if (!localOnly_)
         {
             cfg.iceServers.emplace_back("stun:stun.l.google.com:19302");
@@ -752,8 +768,19 @@ private:
             cfg.iceServers.emplace_back("stun:stun.cloudflare.com:3478");
         }
         pm_->setConfig(std::move(cfg));
-        printf("[nnet] ice policy: %s\n", localOnly_ ? "LOCAL ONLY (no STUN, LAN pairs only)" : "internet (STUN)");
+        printf("[nnet] ice policy: %s, udp ports %u-%u\n",
+               localOnly_ ? "LOCAL ONLY (no STUN, LAN pairs only)" : "internet (STUN)",
+               icePortBase_, icePortBase_ + 15);
         fflush(stdout);
+        // Internet matches: map the range on the IGD in the background (seconds of
+        // SOAP; never on the game thread). Local Only punches no holes. Best-effort:
+        // no IGD (router UPnP off) is one log line. NN_NO_UPNP=1 disables.
+        if (!localOnly_ && !upnpStarted_ && !getenv("NN_NO_UPNP"))
+        {
+            upnpStarted_ = true;
+            uint16_t b = icePortBase_, e = icePortBase_ + 15;
+            upnpThread_ = std::thread([this, b, e] { upnp_.map(b, e); });
+        }
     }
 
     void setStatus(const std::string &s)
@@ -823,6 +850,11 @@ private:
     std::map<std::string, int> deviceToToken_;
     std::map<std::string, std::string> deviceName_; // peer deviceId -> display name
     std::thread presenceThread_;
+
+    UpnpMapper upnp_;          // best-effort IGD mapping of the pinned ICE range
+    std::thread upnpThread_;
+    bool upnpStarted_ = false;
+    uint16_t icePortBase_ = 0;
 
     // Menu update queue (produced on worker threads, applied by menuPump on the game thread).
     std::mutex menuMtx_;
