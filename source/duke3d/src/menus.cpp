@@ -1708,6 +1708,42 @@ static void netmenu_pull_grp_labels(void)
 }
 
 // Engine lifecycle -> JS advert/accept-gate (called from network.cpp / game.cpp too).
+#ifdef __EMSCRIPTEN__
+// The page's mute button (#mute in index.html) drives the ENGINE's own Sound and
+// Music toggles -- the same state the Sound Setup menu flips -- instead of
+// suspending the WebAudio context (which the engine's autoplay-unlock handlers
+// kept resuming; live-reported as "some actions still trigger sound"). Muting
+// stashes the user's real toggles so unmute restores them, not blanket ON.
+static int s_webMutePrevSound = -1, s_webMutePrevMusic = -1;
+extern "C" void Web_SetMute(int mute)
+{
+    if (mute)
+    {
+        if (s_webMutePrevSound < 0)
+        {
+            s_webMutePrevSound = ud.config.SoundToggle;
+            s_webMutePrevMusic = ud.config.MusicToggle;
+        }
+        ud.config.SoundToggle = 0;
+        FX_StopAllSounds();
+        S_ClearSoundLocks();
+        ud.config.MusicToggle = 0;
+        S_PauseMusic(true);
+    }
+    else
+    {
+        ud.config.SoundToggle = (s_webMutePrevSound < 0) ? 1 : s_webMutePrevSound;
+        ud.config.MusicToggle = (s_webMutePrevMusic < 0) ? 1 : s_webMutePrevMusic;
+        s_webMutePrevSound = s_webMutePrevMusic = -1;
+        if (ud.config.MusicToggle)
+        {
+            S_RestartMusic();
+            S_PauseMusic(false);
+        }
+    }
+}
+#endif
+
 extern "C" void NetMenu_SetInGame(int in_game)
 {
 #ifdef __EMSCRIPTEN__
@@ -2042,10 +2078,13 @@ static Menu_t Menus[] = {
     { &M_USERMAP, MENU_NETUSERMAP, MENU_NETOPTIONS, MA_Return, FileSelect },
 #ifdef NETMENU
     { &M_NET_HOSTCFG, MENU_NET_HOSTCFG, MENU_NETWORK, MA_Return, Menu },
-    { &M_NET_CHANGEMAP, MENU_NET_CHANGEMAP, MENU_NETWORK, MA_Return, Menu },
     { &M_NET_BROWSE, MENU_NET_BROWSE, MENU_NETWORK, MA_Return, Menu },
     { &M_NET_JOINCODE, MENU_NET_JOINCODE, MENU_NETWORK, MA_Return, Menu },
     { &M_NET_LOBBY, MENU_NET_LOBBY, MENU_NETWORK, MA_Return, Menu },
+    // 20017 AFTER 20016: Menus[] is BINARY-SEARCHED -- an out-of-order id makes
+    // every entry after the misplacement unfindable (live-reported as "Start says
+    // hosting but no lobby appears; Browse goes nowhere").
+    { &M_NET_CHANGEMAP, MENU_NET_CHANGEMAP, MENU_NETWORK, MA_Return, Menu },
 #endif
     { &M_NETJOIN, MENU_NETJOIN, MENU_NETWORK, MA_Return, Menu },
 };
@@ -2591,7 +2630,10 @@ void Menu_Init(void)
 #endif
     MEOS_NETOPTIONS_EPISODE.numOptions = k + 1;
 #ifdef NETMENU
-    MEOS_NET_CFG_EPISODE.numOptions = k; // episodes only -- no "User Map" row over the wire
+    // Episodes only -- no "User Map" row over the wire. SHAREWARE (VOLUMEONE) locks
+    // hosting to episode 0 exactly like the stock SP menu blues out episodes 1+:
+    // the CONs name every episode even when the GRP only ships L.A. Meltdown's maps.
+    MEOS_NET_CFG_EPISODE.numOptions = VOLUMEONE ? 1 : k;
 #endif
     NetEpisode = MEOSV_NetEpisodes[0];
     MMF_Top_Episode.pos.y = (58 + (3-k)*6)<<16;

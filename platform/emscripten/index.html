@@ -406,26 +406,31 @@
      A deferred, self-contained ES module built by platform/emscripten esbuild;
      independent of the wasm graph. Must be served beside eduke32.js. -->
 <script>
-// Mute toggle (persisted): suspends/resumes the SDL WebAudio context, killing music
-// AND sfx in one place. The context appears only after engine audio init, and the
-// autoplay-unlock handler resumes it on any input -- a watchdog re-asserts a
-// persisted mute so neither of those can un-mute the page.
+// Mute toggle (persisted): drives the ENGINE's own Sound/Music toggles via the
+// exported Web_SetMute -- the exact state the Sound Setup menu flips -- so every
+// FX and music path is silenced at the source. (The old audio-context suspend was
+// a workaround the engine's autoplay-unlock kept fighting: some actions still
+// made sound.) Unmute restores the user's real Sound/Music settings, not blanket ON.
 (function () {
   var btn = document.getElementById('mute');
   if (!btn) return;
   var muted = false;
   try { muted = localStorage.getItem('e32-muted') === '1'; } catch (e) {}
-  function ctx() { var s = window.Module && window.Module.SDL2; return s && s.audioContext; }
+  function ready() { return !!(window.Module && Module.ccall && window.__e32menu); }
   function paint() { btn.innerHTML = muted ? '&#128263;' : '&#128266;'; btn.classList.toggle('muted', muted); }
-  function apply() { var c = ctx(); if (c) { if (muted) c.suspend(); else c.resume(); } paint(); }
+  function apply() {
+    if (ready()) { try { Module.ccall('Web_SetMute', null, ['number'], [muted ? 1 : 0]); } catch (e) {} }
+    paint();
+  }
   btn.addEventListener('click', function () {
     muted = !muted;
     try { localStorage.setItem('e32-muted', muted ? '1' : '0'); } catch (e) {}
     apply();
   });
   paint();
-  var boot = setInterval(function () { if (ctx()) { clearInterval(boot); apply(); } }, 500);
-  setInterval(function () { var c = ctx(); if (c && muted && c.state === 'running') c.suspend(); }, 1500);
+  // __e32menu appears once the engine's menu loop runs (config loaded) -- the
+  // earliest point the toggles safely stick. Re-assert the persisted state then.
+  var boot = setInterval(function () { if (ready()) { clearInterval(boot); if (muted) apply(); } }, 500);
 })();
 </script>
 <script type="module" src="eduke32-net.js?v=__BUILD_ID__"></script>
