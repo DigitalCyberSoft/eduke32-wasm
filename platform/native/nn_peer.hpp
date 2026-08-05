@@ -51,6 +51,15 @@ public:
     std::function<void(const std::string &peer)> onChannelsReady;
     std::function<void(const std::string &peer, bool connected)> onConnectionChange;
 
+    // Swap the ICE configuration used for NEW connections (existing pcs keep theirs).
+    // Called at host/join time, before any peer connects: a Local Only match passes a
+    // STUN-less config so only same-network candidate pairs can ever complete.
+    void setConfig(rtc::Configuration config)
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        config_ = std::move(config);
+    }
+
     explicit PeerManager(std::string myDeviceId, rtc::Configuration config = {})
         : myId_(std::move(myDeviceId)), config_(std::move(config))
     {

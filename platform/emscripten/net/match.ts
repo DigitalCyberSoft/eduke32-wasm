@@ -117,6 +117,7 @@ export class Match {
     this.maxPlayers = init.maxPlayers;
     this.isPublic = init.isPublic;
     this.localOnly = init.localOnly;
+    this.peers.localOnly = init.localOnly; // ICE policy: LAN-only pairs when set
     this.relays = init.relays;
     this.myName = init.myName;
     this.grp = init.grp;

@@ -231,6 +231,16 @@ class DukeNet {
       : await Match.createPrivate(name, max, this.myName, this.localGrp, this.myRelayRtt, cfg.localOnly ?? false);
     this.myConnectIndex = 0;
     this.slots.clear();
+    // Mark our OWN slot 0 connected in the netcode. Without this the host's
+    // connecthead != myconnectindex and Net_SendNewGame silently DROPS the launch
+    // broadcast: the host enters the level alone while every guest keeps waiting in
+    // the lobby. (The native transport fixed the identical bug in hostMatch; guests
+    // get theirs via the join_ok handler.)
+    if (typeof window !== "undefined") {
+      const mod = (window as unknown as { Module?: { ccall?: (...args: unknown[]) => unknown } }).Module;
+      mod?.ccall?.("Net_SetLocalIndex", "void", ["number"], [0]);
+      console.log("[dnet] host: slot 0 attached (connect chain rooted)");
+    }
     this._wireMatch();
     this._startRttLoop();
     const info = this.match.info();

@@ -6,35 +6,21 @@
 // the host during the join handshake — see match.ts / duke-net.ts).
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DID_KEY = "eduke32-net-did";
-
 /** Short random token (for match ids / device ids). Non-deterministic on purpose. */
 export function uid(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
 function readDeviceId(): string {
-  // PER-TAB id via sessionStorage, NOT localStorage: two tabs in the same browser
-  // must get DIFFERENT ids, otherwise each discards the other's signaling as its own
-  // echo (signaling.ts `msg.from === DEVICE_ID`) and the WebRTC handshake never
-  // completes (stuck at "Connecting to host"). sessionStorage survives a same-tab
-  // reload (e.g. the GRP-download relaunch, which also uses sessionStorage) but is
-  // isolated per tab, so two clients on one machine can host+join each other.
-  let d: string | null = null;
-  try {
-    d = sessionStorage.getItem(DID_KEY);
-  } catch {
-    d = null;
-  }
-  if (!d) {
-    d = uid() + "-" + uid();
-    try {
-      sessionStorage.setItem(DID_KEY, d);
-    } catch {
-      /* private mode / no storage: ephemeral id for this session */
-    }
-  }
-  return d;
+  // Minted fresh on EVERY page load, stored nowhere. It must be unique per live
+  // JS context: each peer discards signaling where `msg.from === DEVICE_ID` as its
+  // own echo, so two contexts sharing an id can never connect to each other.
+  // sessionStorage looked per-tab but is NOT collision-safe: Chrome's "Duplicate
+  // Tab" and session restore copy it wholesale, and two same-profile windows then
+  // mutually self-filter (live-reported: "they seem to be trying to share
+  // something"). Nothing needs the id stable across a reload — the GRP-download
+  // relaunch rejoins by saved MATCH info (roomKey/hostId), not by own id.
+  return uid() + "-" + uid();
 }
 
 /** This tab's stable device id (per-tab so two tabs on one machine never collide;

@@ -99,7 +99,12 @@ function _turnOverride(): RTCIceServer[] {
 
 /** The live ICE config: public STUN + any compiled-in TURN + any ?turn= override.
  *  Read at each RTCPeerConnection so a runtime override applies. */
-export function rtcConfig(): RTCConfiguration {
+export function rtcConfig(localOnly = false): RTCConfiguration {
+  // Local Only IS an ICE policy, not infrastructure: with no STUN/TURN there are
+  // host candidates only, so a candidate pair can complete ONLY between machines on
+  // the same network (Chrome's mDNS host candidates resolve via multicast, i.e.
+  // on-LAN only). Signaling stays on the public Nostr relays either way.
+  if (localOnly) return { iceServers: [] };
   return { iceServers: [...STUN_SERVERS, ...TURN_SERVERS, ..._turnOverride()] };
 }
 

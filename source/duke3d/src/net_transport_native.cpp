@@ -134,8 +134,12 @@ public:
             // handshake on wss:// but WsTransport never receives the decrypted upgrade
             // response, so the wss fallbacks are currently dead on native — reproduced
             // with a 30-line rtc::WebSocket probe; see the relay up/error log lines.
-            relays_ = { "ws://127.0.0.1:7500",
-                        "wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net" };
+            // Public Nostr relays, same set as the browser transport. Signaling is
+            // ALWAYS a Nostr rendezvous (NN_RELAY overrides for tests); whether a
+            // match is LAN-only is enforced at the ICE layer instead -- a Local Only
+            // match offers no STUN, so only same-network candidate pairs can ever
+            // complete, no matter who can see the signaling.
+            relays_ = { "wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net" };
         }
 
         myDeviceId_ = "native-" + toHex(randomBytes(8));
@@ -172,6 +176,7 @@ public:
         if (roomKey_.empty())
             roomKey_ = base64Encode(randomBytes(32));
         matchId_ = "m-" + toHex(randomBytes(6));
+        applyIcePolicy();
         grpEnsure(); // fingerprint before the invite embeds it
         invite_ = makeInvite();
         // KEY stays printed: 44 chars, still typeable for native<->native joins.
@@ -199,6 +204,7 @@ public:
 
     void joinMatch(const std::string &code, const std::string &player)
     {
+        localOnly_ = false; // bare keys carry no flag; JSON invites overwrite below
         std::string key;
         for (char c : code)
             if (!isspace((unsigned char)c))
@@ -214,6 +220,7 @@ public:
         if (base64Decode(b64FromUrl(key), raw) && !raw.empty() && raw[0] == '{')
         {
             std::string roomKey, hid;
+            bool lo = false;
             {
                 std::lock_guard<std::mutex> lk(sigMtx_);
                 sjson_reset_context(sigCtx_);
@@ -225,8 +232,10 @@ public:
                     const char *hi = sjson_get_string(root, "hostId", nullptr);
                     if (rk) roomKey = rk;
                     if (hi) hid = hi;
+                    lo = sjson_get_bool(root, "localOnly", false);
                 }
             }
+            localOnly_ = lo; // a LAN-only match restricts ICE on BOTH ends (see joinWithKey)
             if (!roomKey.empty())
             {
                 grpEnsure();
@@ -249,6 +258,7 @@ public:
     void joinWithKey(const std::string &key, const std::string &hid, const std::string &player)
     {
         isHost_ = false;
+        applyIcePolicy(); // localOnly_ was set from the invite (bare keys: internet default)
         grpEnsure(); // before signaling starts: workers read the fingerprint after this
         roomKey_ = key;
         {
@@ -693,6 +703,7 @@ private:
                         ",\"hostId\":" + jsonStr(myDeviceId_) +
                         ",\"name\":" + jsonStr(matchName_) +
                         ",\"maxPlayers\":" + std::to_string(maxPlayers_) +
+                        ",\"localOnly\":" + (localOnly_ ? "true" : "false") +
                         ",\"grp\":" + grpJson() + "}";
         Bytes b(j.begin(), j.end());
         std::string out = b64ToUrl(base64Encode(b));
@@ -725,6 +736,24 @@ private:
         if (!grpFp_.valid)
             return "{\"crc\":0}"; // truthy for parseInvite; browser hosts deny on digest
         return grpFingerprintJson(grpFp_, [](const std::string &s) { return jsonStr(s); });
+    }
+
+    // ICE policy IS the local/internet boundary (signaling is always public Nostr):
+    //   Local Only -> no STUN: host candidates only, so a candidate pair can only
+    //                 complete between machines on the same network.
+    //   otherwise  -> STUN (same public set as netconfig.ts) for internet matches.
+    void applyIcePolicy()
+    {
+        rtc::Configuration cfg;
+        if (!localOnly_)
+        {
+            cfg.iceServers.emplace_back("stun:stun.l.google.com:19302");
+            cfg.iceServers.emplace_back("stun:stun1.l.google.com:19302");
+            cfg.iceServers.emplace_back("stun:stun.cloudflare.com:3478");
+        }
+        pm_->setConfig(std::move(cfg));
+        printf("[nnet] ice policy: %s\n", localOnly_ ? "LOCAL ONLY (no STUN, LAN pairs only)" : "internet (STUN)");
+        fflush(stdout);
     }
 
     void setStatus(const std::string &s)

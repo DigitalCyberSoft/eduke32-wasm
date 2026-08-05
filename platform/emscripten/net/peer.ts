@@ -48,6 +48,9 @@ export type ConnState = RTCPeerConnectionState;
 
 export class PeerManager {
   private _conns = new Map<string, Conn>();
+  /** Set by the owning Match: local-only matches build STUN-less peer connections
+   *  (host candidates only -> same-network pairs only). See netconfig.rtcConfig. */
+  localOnly = false;
 
   /** Inbound JSON control (pre-attach) from a peer's duke-rel channel. */
   onControl: ((peerId: string, msg: unknown) => void) | null = null;
@@ -66,7 +69,7 @@ export class PeerManager {
       if (s === "connected" || s === "connecting" || s === "new") return existing;
       this._cleanup(peerId, false);
     }
-    const pc = new RTCPeerConnection(rtcConfig());
+    const pc = new RTCPeerConnection(rtcConfig(this.localOnly));
     const conn: Conn = {
       pc,
       dcs: new Map(),
