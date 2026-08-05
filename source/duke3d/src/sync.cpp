@@ -34,6 +34,25 @@ static int crctable[256];
 
 int8_t syncData[MOVEFIFOSIZ][MAX_SYNC_TYPES];
 bool syncError[MAX_SYNC_TYPES];
+
+// Raw divergence detector, independent of the display path (Net_DisplaySyncMsg
+// sets g_foundSyncError but was never wired into this fork's render loop).
+int Net_SyncErrorDetected(void)
+{
+    for (int32_t i = 0; i < MAX_SYNC_TYPES; i++)
+        if (syncError[i])
+            return 1;
+    return 0;
+}
+
+// Clear the divergence verdict (auto-resync: the host just pushed an
+// authoritative snapshot and every peer reloaded identical state).
+void Net_ResetSyncCheck(void)
+{
+    g_foundSyncError = false;
+    Bmemset(syncError, 0, sizeof(syncError));
+    Bmemset(g_szfirstSyncMsg, 0, sizeof(g_szfirstSyncMsg));
+}
 bool g_foundSyncError = false;
 
 void initsynccrc(void)
@@ -280,6 +299,7 @@ void Net_GetSyncStat(void)
 ////////////////////////////////////////////////////////////////////////
 
 int desynched_players[MAXPLAYERS];
+int32_t g_netSyncCompares = 0;
 
 void Net_DisplaySyncMsg(void)
 {
@@ -365,6 +385,7 @@ void Net_AddSyncInfoToPacket(int *j)
     }
 }
 
+extern int32_t g_netSyncCompares;
 void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
 {
     // if ready2send is not set, or player is disconnected then don't try to get sync info
@@ -379,6 +400,7 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
     if (tickNum < 0 || tickNum == g_player[otherconnectindex].lastSyncTick || (tickNum > movefifoplc))
         return;
 
+    g_netSyncCompares++; // debug surface: proves the CRC comparison actually runs
     g_player[otherconnectindex].lastSyncTick = tickNum;
 
     // Grab sync info from packet buffer

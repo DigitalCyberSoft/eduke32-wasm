@@ -48,7 +48,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #if defined(NETDUKE32) && (defined(__EMSCRIPTEN__) || defined(NETNATIVE))
 # define NETMENU 1
 # include "sjson.h"
-# include "sdl_inc.h"   // clipboard (invite copy on host; Paste Code on join)
+# include "sdl_inc.h"
+# include "sync.h"   // clipboard (invite copy on host; Paste Code on join)
 # ifdef __EMSCRIPTEN__
 #  include <emscripten.h>
 # else
@@ -8961,7 +8962,7 @@ void M_DisplayMenus(void)
             // live counters (fifo, pump, positions) that must not go stale between
             // menu transitions -- change-only emission turned them into fossils.
             int64_t const cur = ((int64_t)(nngm & 0xff) << 48) | ((int64_t)menuOpen << 40) | ((int64_t)inGame << 41)
-                | ((int64_t)(g_foundSyncError ? 1 : 0) << 42)
+                | ((int64_t)((g_foundSyncError || Net_SyncErrorDetected()) ? 1 : 0) << 42)
                 | ((int64_t)(sel & 0xff) << 44)
                 | ((int64_t)numplayers << 32) | ((int64_t)myconnectindex << 24)
                 | (int64_t)(int32_t)m_currentMenu->menuID;
@@ -8984,9 +8985,9 @@ void M_DisplayMenus(void)
                 }
                 extern int32_t g_netPumpCalls, g_netGateC1, g_netGateC2, g_mainLoopIter, g_demoLoopIter;
                 Bsnprintf(scr, sizeof scr,
-                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d,%d,%d],o1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d,in:[%d,%d],ap1:[%d,%d,%d],gate1:[%d,%d,%d],snr:%d}",
+                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d,%d,%d],o1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d,in:[%d,%d],ap1:[%d,%d,%d],gate1:[%d,%d,%d],snr:%d,ep:%d,epd:%d,sc:%d}",
                           menuOpen, (int)m_currentMenu->menuID, inGame, (int)nngm,
-                          (int)numplayers, (int)myconnectindex, g_foundSyncError ? 1 : 0, (int)sel,
+                          (int)numplayers, (int)myconnectindex, (g_foundSyncError || Net_SyncErrorDetected()) ? 1 : 0, (int)sel,
                           p0x, p0y, p1x, p1y, p1z, p1a, o1x, o1y,
                           (int)(movefifoplc % 10000000), (int)(g_player[0].movefifoend % 10000000), (int)(g_player[1].movefifoend % 10000000),
                           (int)ready2send, (int)(g_netPumpCalls % 1000000), (int)(totalclock - ototalclock),
@@ -8999,7 +9000,9 @@ void M_DisplayMenus(void)
                           (g_player[1].ps != NULL) ? (int)g_player[1].ps->newowner : -99,
                           (g_player[1].ps != NULL) ? (int)g_player[1].ps->dead_flag : -99,
                           (int)g_player[1].playerquitflag,
-                          (int)g_netSnapshotReady);
+                          (int)g_netSnapshotReady,
+                          (int)g_netMoveEpoch, (int)g_netEpochDrops,
+                          (int)(({ extern int32_t g_netSyncCompares; g_netSyncCompares; }) % 1000000));
                 // NEVER eval a truncated script: Bsnprintf cuts mid-expression, the
                 // SyntaxError unwinds through callUserCallback -> doRewind and KILLS
                 // the ASYNCIFY resume -- the engine hard-freezes while the page stays
@@ -9069,6 +9072,10 @@ void M_DisplayMenus(void)
                 for (int k = 0; k < MAXPLAYERS && k < 16; k++)
                     if (g_player[k].connected)
                         seatMask |= (1 << k);
+                // bits 16..23: the NEW move generation. Bumped here (the only writer
+                // besides adoption); receivers adopt it from the snapshot.
+                g_netMoveEpoch = (uint8_t)(g_netMoveEpoch + 1);
+                seatMask |= ((int)g_netMoveEpoch) << 16;
                 initprintf("net: late join -> snapshot for %d players (mask 0x%x), holding the barrier\n",
                            numplayers, seatMask);
                 netmenu_send_snapshot(seatMask);
@@ -9104,6 +9111,38 @@ void M_DisplayMenus(void)
                 netmenu_leave();
             }
             return;
+        }
+        // HOST: the lockstep CRC flagged a DIVERGENCE. Q3-style self-heal: push a
+        // fresh authoritative snapshot through the late-join machinery -- every
+        // peer reloads identical state and play continues, instead of the match
+        // silently splitting into parallel realities (mirrored movement, kills
+        // that never propagate).
+        {
+            static int32_t s_lastResyncTic = -100000;
+            if ((int32_t)totalclock < s_lastResyncTic)
+                s_lastResyncTic = -100000; // timers were reset (level entry)
+            if ((g_foundSyncError || Net_SyncErrorDetected()) && myconnectindex == connecthead && numplayers > 1
+                && g_player[myconnectindex].ps != NULL
+                && (g_player[myconnectindex].ps->gm & MODE_GAME)
+                && (int32_t)totalclock - s_lastResyncTic > 600)
+            {
+                s_lastResyncTic = (int32_t)totalclock;
+                initprintf("net: DESYNC detected -> auto-resync snapshot\n");
+                if (Net_SaveLateJoinSnapshot() == 0)
+                {
+                    int seatMask = 0;
+                    for (int k = 0; k < MAXPLAYERS && k < 16; k++)
+                        if (g_player[k].connected)
+                            seatMask |= (1 << k);
+                    g_netMoveEpoch = (uint8_t)(g_netMoveEpoch + 1);
+                    seatMask |= ((int)g_netMoveEpoch) << 16;
+                    netmenu_send_snapshot(seatMask);
+                    Net_WaitForPlayers();
+                    ready2send = 1;
+                }
+                Net_ResetSyncCheck();
+                return;
+            }
         }
         // GUEST: the host vanished (peer-down on connecthead). Tear the match down
         // and land on the MAIN MENU -- the alternative was starving the tic loop

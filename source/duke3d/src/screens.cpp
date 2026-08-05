@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 #ifdef __ANDROID__
 #include "android.h"
+#include "sync.h"
 #endif
 
 #include "anim.h"
@@ -1388,7 +1389,8 @@ void G_DisplayRest(int32_t smoothratio)
         if (g_player[myconnectindex].ps->gm&MODE_TYPE)
             Net_SendMessage();
         else
-            M_DisplayMenus();
+            Net_DisplaySyncMsg(); // MP: paint "Out Of Sync" verdicts (also latches g_foundSyncError)
+    M_DisplayMenus();
     }
 
     {

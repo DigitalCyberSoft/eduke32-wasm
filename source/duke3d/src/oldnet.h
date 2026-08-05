@@ -152,6 +152,8 @@ extern int32_t g_netSnapshotReady; // receiver: late-join snapshot file landed; 
 void Net_InsertLatePlayer(int k);  // host: materialize a late joiner in the live world
 int  Net_SaveLateJoinSnapshot(void);
 int  Net_ApplyLateJoinSnapshot(void);
+extern uint8_t g_netMoveEpoch;    // lockstep generation stamp on move packets
+extern int32_t g_netEpochDrops;
 
 //OLDNET_EXTERN PredictBackup_t predictBackup[MOVEFIFOSIZ];
 

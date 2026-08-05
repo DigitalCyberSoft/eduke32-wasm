@@ -437,6 +437,9 @@ void Net_HandleInput(void)
 
         packbuf[0] = PACKET_TYPE_SLAVE_TO_MASTER;
         j = 1;
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        packbuf[j++] = g_netMoveEpoch;
+#endif
 
         osyn = (input_t *)&inputfifo[(g_player[myconnectindex].movefifoend-2)&(MOVEFIFOSIZ-1)][myconnectindex];
         nsyn = (input_t *)&inputfifo[(g_player[myconnectindex].movefifoend-1)&(MOVEFIFOSIZ-1)][myconnectindex];
@@ -462,7 +465,12 @@ void Net_HandleInput(void)
         //MASTER -> SLAVE packet
         packbuf[0] = PACKET_TYPE_MASTER_TO_SLAVE;
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        packbuf[1] = g_netMoveEpoch;
+        j = 3; // [2] = playerCount, filled below
+#else
         j = 2;
+#endif
         char playerCount = 0;
         TRAVERSE_CONNECT(i)
         {
@@ -476,7 +484,11 @@ void Net_HandleInput(void)
             Net_AddPlayerInputToPacket(&j, i, osyn, nsyn);
             playerCount++;
         }
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        packbuf[2] = playerCount;
+#else
         packbuf[1] = playerCount;
+#endif
 
         Net_AddSyncInfoToPacket(&j); // Must always be at the end of the packet.
 
@@ -546,8 +558,18 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 osyn = (input_t*)&inputfifo[(g_player[connecthead].movefifoend - 1) & (MOVEFIFOSIZ - 1)];
                 nsyn = (input_t*)&inputfifo[(g_player[connecthead].movefifoend) & (MOVEFIFOSIZ - 1)];
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                {
+                    int8_t const d = (int8_t)((uint8_t)packbuf[1] - g_netMoveEpoch);
+                    if (d < 0) { g_netEpochDrops++; break; } // stale generation: dead on arrival
+                    if (d > 0) g_netMoveEpoch = (uint8_t)packbuf[1];
+                }
+                char playerCount = packbuf[2];
+                j = 3;
+#else
                 char playerCount = packbuf[1];
                 j = 2;
+#endif
                 for(int32_t i = 0; i < playerCount; i++)
                 {
                     int32_t playerNum = packbuf[j++];
@@ -570,6 +592,14 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
             case PACKET_TYPE_SLAVE_TO_MASTER:  //[1] (receive slave sync buffer)
             {
                 j = 1;
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                {
+                    uint8_t const ep = (uint8_t)packbuf[j++];
+                    int8_t const d = (int8_t)(ep - g_netMoveEpoch);
+                    if (d < 0) { g_netEpochDrops++; break; } // stale generation: dead on arrival
+                    if (d > 0) g_netMoveEpoch = ep;          // peer is a generation ahead: converge
+                }
+#endif
 
                 osyn = (input_t *)&inputfifo[(g_player[other].movefifoend-1)&(MOVEFIFOSIZ-1)];
                 nsyn = (input_t *)&inputfifo[(g_player[other].movefifoend)&(MOVEFIFOSIZ-1)];
@@ -1074,7 +1104,17 @@ int32_t g_netHostGone = 0;
 #define LATEJOIN_SAVE "latejoin.esv"
 
 int32_t g_netSnapshotReady = 0;         // receiver: LATEJOIN_SAVE landed in the FS
-static uint32_t g_netSnapshotMask = 0;  // seat mask that came with it
+static uint32_t g_netSnapshotMask = 0;  // bits 0..15 seat mask, 16..23 move epoch
+
+// MOVE EPOCH: stamps every M2S/S2M packet. Bumped by Net_ClearFIFO (i.e., at every
+// barrier, symmetrically on all peers); receivers DISCARD mismatched packets. This
+// kills the whole "stale move packets in flight across a rendezvous contaminate
+// the fresh FIFOs" divergence class -- the reliable channel happily delivers
+// pre-barrier moves after the reset, and without the stamp they became the first
+// "inputs" of the new session, permanently shifting the stream pairing
+// (live-reported as mirrored movement + kills that never propagate).
+uint8_t g_netMoveEpoch = 0;
+int32_t g_netEpochDrops = 0; // discarded stale-generation move packets (debug surface)
 
 // Called by the transports (JS via ccall / native directly) when the snapshot
 // file is fully written. Consumed in menus.cpp at a safe frame point.
@@ -1137,8 +1177,13 @@ int Net_ApplyLateJoinSnapshot(void)
     int const myPeek = screenpeek;
 
     // Seat BEFORE loading: G_LoadPlayer rejects h.numplayers != ud.multimode.
+    uint32_t const seatBits = g_netSnapshotMask & 0xffffu;
+    // Adopt the sender's move epoch EXACTLY (the host bumped before sending; the
+    // barrier no longer touches it -- nested barrier calls made counting there
+    // hopeless). Adopt-if-newer on the receive path catches any stragglers.
+    g_netMoveEpoch = (uint8_t)((g_netSnapshotMask >> 16) & 0xff);
     for (int k = 0; k < MAXPLAYERS && k < 16; k++)
-        g_player[k].connected = (g_netSnapshotMask >> k) & 1;
+        g_player[k].connected = (seatBits >> k) & 1;
     g_player[myIdx].connected = 1;
     Net_SeatLateJoiners(); // mask already applied; sets quitflags + rebuilds the chain
     ud.multimode            = numplayers;
@@ -1161,6 +1206,8 @@ int Net_ApplyLateJoinSnapshot(void)
     // barrier entry and the master's echo (PLAYER_READY case) re-raises its flag.
     for (int k = 0; k < MAXPLAYERS; k++)
         g_player[k].playerreadyflag = 0;
+
+    Net_ResetSyncCheck(); // fresh authoritative state -> any recorded divergence is history
 
     if (r == 0)
         initprintf("net: late-join snapshot applied (%d players, I am %d)\n", numplayers, myconnectindex);

@@ -11,6 +11,9 @@ typedef struct
 } SyncType_t;
 
 extern char g_szfirstSyncMsg[MAX_SYNC_TYPES][60];
+void Net_ResetSyncCheck(void); // auto-resync: clear the divergence verdict
+int  Net_SyncErrorDetected(void); // any syncError[] set (display-independent)
+void Net_DisplaySyncMsg(void);
 
 extern int8_t syncData[MOVEFIFOSIZ][MAX_SYNC_TYPES];
 extern bool syncError[MAX_SYNC_TYPES];
