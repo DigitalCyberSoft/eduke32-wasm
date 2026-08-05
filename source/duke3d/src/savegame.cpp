@@ -841,6 +841,24 @@ uint16_t G_CountOldSaves(void)
     return bad;
 }
 
+// LATE-JOIN SNAPSHOT (oldnet transport track): write the running game to a fixed
+// file the transport then streams to every peer. Lives here for G_SaveTimers /
+// G_RestoreTimers (static). 0 on success.
+int Net_SaveLateJoinSnapshot(void)
+{
+    G_SaveTimers();
+    buildvfs_FILE fil = buildvfs_fopen_write("latejoin.esv");
+    if (fil == NULL)
+    {
+        G_RestoreTimers();
+        return -1;
+    }
+    int const r = sv_saveandmakesnapshot(fil, "latejoin", 0, 0, 0, 0, false);
+    buildvfs_fclose(fil);
+    G_RestoreTimers();
+    return r;
+}
+
 int32_t G_SavePlayer(savebrief_t & sv, bool isAutoSave)
 {
 #ifdef __ANDROID__

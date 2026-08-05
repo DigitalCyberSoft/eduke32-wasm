@@ -8955,7 +8955,7 @@ void M_DisplayMenus(void)
             {
                 lastExposed = cur;
                 lastEmitClock = (int32_t)totalclock;
-                char scr[256];
+                char scr[512];
                 // p0/p1: player positions (>>8) -- input-routing diagnosis: if both
                 // move in lockstep with one player's input, the input fanout is wrong.
                 int32_t p0x = 0, p0y = 0, p1x = 0, p1y = 0, p1z = 0, p1a = 0;
@@ -8973,9 +8973,10 @@ void M_DisplayMenus(void)
                           menuOpen, (int)m_currentMenu->menuID, inGame, (int)nngm,
                           (int)numplayers, (int)myconnectindex, g_foundSyncError ? 1 : 0, (int)sel,
                           p0x, p0y, p1x, p1y, p1z, p1a, o1x, o1y,
-                          (int)movefifoplc, (int)g_player[0].movefifoend, (int)g_player[1].movefifoend,
-                          (int)ready2send, (int)g_netPumpCalls, (int)(totalclock - ototalclock),
-                          (int)g_netGateC1, (int)g_netGateC2, (int)g_mainLoopIter, (int)g_demoLoopIter,
+                          (int)(movefifoplc % 10000000), (int)(g_player[0].movefifoend % 10000000), (int)(g_player[1].movefifoend % 10000000),
+                          (int)ready2send, (int)(g_netPumpCalls % 1000000), (int)(totalclock - ototalclock),
+                          (int)(g_netGateC1 % 1000000), (int)(g_netGateC2 % 1000000),
+                          (int)(g_mainLoopIter % 1000000), (int)(g_demoLoopIter % 1000000),
                           (int)netInput.fvel, (int)netInput.bits,
                           (int)g_player[1].input.fvel,
                           (g_player[1].ps != NULL) ? (int)g_player[1].ps->i : -1,
@@ -8983,7 +8984,13 @@ void M_DisplayMenus(void)
                           (g_player[1].ps != NULL) ? (int)g_player[1].ps->newowner : -99,
                           (g_player[1].ps != NULL) ? (int)g_player[1].ps->dead_flag : -99,
                           (int)g_player[1].playerquitflag);
-                emscripten_run_script(scr);
+                // NEVER eval a truncated script: Bsnprintf cuts mid-expression, the
+                // SyntaxError unwinds through callUserCallback -> doRewind and KILLS
+                // the ASYNCIFY resume -- the engine hard-freezes while the page stays
+                // alive (live-reported "hard lockup after a few minutes": the
+                // monotonically-growing counters eventually overflowed the buffer).
+                if (Bstrlen(scr) < sizeof(scr) - 1)
+                    emscripten_run_script(scr);
             }
         }
 #endif

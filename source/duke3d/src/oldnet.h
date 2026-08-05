@@ -148,6 +148,10 @@ OLDNET_EXTERN bool oldnet_gotinitialsettings; // True if we got PACKET_TYPE_INIT
 extern int32_t g_netLateJoinMask; // slots whose peer-up landed mid-game; host seats them via relaunch (menus.cpp)
 void Net_SeatLateJoiners(void);   // apply the mask to connected[] + rebuild the chain
 extern int32_t g_netHostGone;     // guest: the host peer went down; exit to the main menu
+extern int32_t g_netSnapshotReady; // receiver: late-join snapshot file landed; load + barrier
+void Net_InsertLatePlayer(int k);  // host: materialize a late joiner in the live world
+int  Net_SaveLateJoinSnapshot(void);
+int  Net_ApplyLateJoinSnapshot(void);
 
 //OLDNET_EXTERN PredictBackup_t predictBackup[MOVEFIFOSIZ];
 

@@ -10,6 +10,7 @@ static void Net_RebuildConnectChain(void);
 #include "net_transport.h"
 #include "chatpipe.h"
 #include "demo.h"  // G_CloseDemoWrite (Net_CheckPlayerQuit)
+#include "savegame.h"  // late-join snapshot: sv_saveandmakesnapshot / G_LoadPlayer
 
 // NetDuke32's player-iteration macros differ from our tree's (ours are bare
 // loop clauses used as `for (TRAVERSE_CONNECT(i))`; netduke32's bake in the
@@ -1046,6 +1047,100 @@ int32_t g_netLateJoinMask = 0;
 // NETMENU block: tear the match down and return to the MAIN MENU instead of
 // starving the tic loop (or silently soloing the map).
 int32_t g_netHostGone = 0;
+
+// ── Late-join SNAPSHOT (no round reset) ──────────────────────────────────────
+// The host seats a late joiner in the LIVE world, snapshots the whole game via
+// the savegame system, and the transport streams the file to every peer; each
+// receiver reloads the identical bytes and everyone rendezvouses at the
+// Net_WaitForPlayers barrier. Veterans keep positions/frags (they reload what
+// they already have, minus at most the transfer window); the host never leaves
+// the level at all.
+#define LATEJOIN_SAVE "latejoin.esv"
+
+int32_t g_netSnapshotReady = 0;         // receiver: LATEJOIN_SAVE landed in the FS
+static uint32_t g_netSnapshotMask = 0;  // seat mask that came with it
+
+// Called by the transports (JS via ccall / native directly) when the snapshot
+// file is fully written. Consumed in menus.cpp at a safe frame point.
+extern "C" void Net_SnapshotReady(int seatMask)
+{
+    g_netSnapshotMask  = (uint32_t)seatMask;
+    g_netSnapshotReady = 1;
+}
+
+// HOST: materialize a late joiner in the running level. Mirrors what level entry
+// does for players 1+ (G_ResetAllPlayers: players are memcpys of a reference ps
+// with identity/position fixups) plus the sprite insert. Only the HOST runs this
+// -- every other peer receives the RESULT inside the snapshot, so a divergence
+// here cannot desync anyone.
+void Net_InsertLatePlayer(int k)
+{
+    if ((unsigned)k >= MAXPLAYERS || g_playerSpawnCnt <= 0)
+        return;
+
+    G_MaybeAllocPlayer(k);
+
+    auto &plr = g_player[k];
+    Bmemcpy(plr.ps, g_player[myconnectindex].ps, sizeof(DukePlayer_t));
+    Bmemset(plr.frags, 0, sizeof(plr.frags));
+
+    auto &spawn = g_playerSpawnPoints[k % g_playerSpawnCnt];
+    int const i = A_InsertSprite(spawn.sect, spawn.x, spawn.y, spawn.z,
+                                 APLAYER, 0, 0, 0, spawn.ang, 0, 0, 0, 10);
+    sprite[i].yvel = k; // classic contract: a player sprite's yvel is its player index
+
+    auto &p = *plr.ps;
+    p.i          = i;
+    p.opos = p.pos = spawn.xyz;
+    p.bobpos     = p.pos.xy;
+    p.cursectnum = spawn.sect;
+    p.oq16ang = p.q16ang = fix16_from_int(spawn.ang);
+    p.dead_flag  = 0;
+    p.newowner   = -1;
+    p.frag = p.fraggedself = 0;
+    p.gm         = MODE_GAME;
+    sprite[i].cstat = CSTAT_SPRITE_BLOCK + CSTAT_SPRITE_BLOCK_HITSCAN;
+
+    P_ResetWeapons(k);
+    P_ResetInventory(k);
+
+    initprintf("net: inserted late player %d at spawn %d\n", k, k % g_playerSpawnCnt);
+}
+
+// RECEIVER (veteran or joiner): seat the mask, load LATEJOIN_SAVE, restore the
+// LOCAL identity (the snapshot was written by the host). 0 on success.
+int Net_ApplyLateJoinSnapshot(void)
+{
+    int const myIdx = myconnectindex;
+    int const myPeek = screenpeek;
+
+    // Seat BEFORE loading: G_LoadPlayer rejects h.numplayers != ud.multimode.
+    for (int k = 0; k < MAXPLAYERS && k < 16; k++)
+        g_player[k].connected = (g_netSnapshotMask >> k) & 1;
+    g_player[myIdx].connected = 1;
+    Net_SeatLateJoiners(); // mask already applied; sets quitflags + rebuilds the chain
+    ud.multimode            = numplayers;
+    g_mostConcurrentPlayers = ud.multimode;
+
+    savebrief_t sv;
+    Bstrcpy(sv.path, LATEJOIN_SAVE);
+    sv.isExt = 0;
+
+    int const r = G_LoadPlayer(sv);
+
+    // The snapshot carries the HOST's view of every per-player struct; OUR identity
+    // is local state and must survive the load.
+    myconnectindex = myIdx;
+    screenpeek     = myPeek;
+    Net_SeatLateJoiners(); // re-assert chain + quitflags over whatever the load restored
+
+    if (r == 0)
+        initprintf("net: late-join snapshot applied (%d players, I am %d)\n", numplayers, myconnectindex);
+    else
+        initprintf("net: late-join snapshot load FAILED (%d)\n", r);
+
+    return r;
+}
 
 // Seat every queued late joiner (menus.cpp consumer calls this at a safe frame
 // point, right before relaunching the current map).
