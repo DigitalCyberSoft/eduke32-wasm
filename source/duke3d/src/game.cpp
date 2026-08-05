@@ -7378,8 +7378,19 @@ int G_DoMoveThings(void)
     // Moved lower so it is restored correctly by diffs:
 //    everyothertime++;
 
+#ifndef NETDUKE32
     if (g_netClient) // [75] The server should not overwrite its own randomseed
         randomseed = ticrandomseed;
+#else
+    // Under LOCKSTEP this snapshot-netcode reset is poison: ticrandomseed is
+    // only ever written by the dormant client/server code (always 0 here), so
+    // the guest zeroed its RNG every tic while the host's evolved -- the two
+    // streams were STRUCTURALLY different from tic 1. Invisible for the whole
+    // life of the port because the sync-CRC table was never initialized (see
+    // sync.cpp); the moment the CRCs became real, Sync_Random flagged
+    // instantly. Both peers seed identically at level entry (premap: 1996)
+    // and snapshots carry randomseed, so symmetric evolution is correct.
+#endif
 
 #ifdef NETDUKE32
     // Lockstep: read the confirmed tic (movefifoplc) from the input ring, then
@@ -7469,7 +7480,8 @@ int G_DoMoveThings(void)
     // never absorbs remote effects on the local player (knockback, damage,
     // moving sectors). Sounds fired during the replay are centrally
     // suppressed (sounds.cpp oldnet_predicting guards).
-    Net_CorrectPrediction();
+    if (g_netPredictMode & 1)
+        Net_CorrectPrediction();
 #endif
 
     if (g_netServer)

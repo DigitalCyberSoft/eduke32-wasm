@@ -6989,7 +6989,12 @@ void A_Execute(int const spriteNum, int const playerNum, int const playerDist)
     //    Bsprintf(tempbuf, "unnamed (%d)", picnum);
 
 
-#ifndef NETCODE_DISABLE
+#if !defined(NETCODE_DISABLE) && !defined(NETDUKE32)
+    // [NETDUKE32: excluded] This per-actor guest-only RNG reset belongs to the
+    // snapshot netcode (server streams ticrandomseed). Under lockstep it
+    // zeroed the guest's randomseed before EVERY actor's CON run while the
+    // host's evolved -- guaranteed divergence, hidden until the sync-CRC
+    // table was initialized (sync.cpp).
     if (g_netClient)
     {
 #if 0

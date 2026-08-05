@@ -26,6 +26,10 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "input.h"
 #include "savegame.h"
 
+#ifdef NETDUKE32
+# include "net_predict.h"  // predicted-view swap for frame-rate angle smoothing (MP)
+#endif
+
 #ifdef __ANDROID__
 #include "android.h"
 #endif
@@ -3465,8 +3469,32 @@ void P_GetInput(int const playerNum)
     input.bits = localInput.bits;
     input.extbits = localInput.extbits;
 
+#ifdef NETDUKE32
+    if (!ud.recstat)
+    {
+        // MP: frame-rate angle smoothing applies to the PREDICTED view only --
+        // the authoritative angles advance in the tic path (P_ProcessInput),
+        // identically on every peer. The same avel deltas accumulate into
+        // localInput below and travel in the tic input, so the predicted view
+        // runs ahead by at most the current partial frame and reconciles.
+        // If the view swap declines (pause, EOL, not seated), SKIP the update
+        // entirely -- writing the authoritative player here is exactly the
+        // per-peer divergence this split exists to prevent.
+        // SP keeps mainline's direct application (byte-identical feel).
+        if (numplayers > 1)
+        {
+            Net_BeginPredictedView();
+            if (g_player[playerNum].ps == &predictedPlayer)
+                P_UpdateAngles(playerNum, input);
+            Net_EndPredictedView();
+        }
+        else
+            P_UpdateAngles(playerNum, input);
+    }
+#else
     if (!ud.recstat)
         P_UpdateAngles(playerNum, input);
+#endif
 
     // in case bits were altered
     localInput.bits = input.bits;
@@ -5589,6 +5617,29 @@ void P_ProcessInput(int playerNum)
             pPlayer->vel.z = 128;
         }
     }
+
+#ifdef NETDUKE32
+    // LOCKSTEP: view angles are SIMULATION state and must advance identically
+    // on every peer, from the transmitted per-tic input -- classic Duke's
+    // `ps->ang += syn->avel`. Mainline moved angle application to the
+    // frame-rate path (P_UpdateAngles, wall-clock-scaled float math) and let
+    // its snapshot netcode ship the resulting angles around; that netcode is
+    // dormant here, so remote copies of a player NEVER TURNED -- movement
+    // still worked (velocities are pre-rotated into the input at sample time)
+    // but every remote machine computed that player's hitscans with a STALE
+    // angle: shots hit on the shooter's screen and missed on the victim's
+    // (live-reported: "only registering a kill on the client that makes the
+    // kill"). Invisible to the sync CRC until its table was initialized.
+    if (numplayers > 1)
+    {
+        int const angleLocks = P_CheckLockedMovement(playerNum);
+        if (!(angleLocks & IL_NOANGLE))
+            pPlayer->q16ang = fix16_sadd(pPlayer->q16ang, pInput.q16avel) & 0x7FFFFFF;
+        if (!(angleLocks & IL_NOHORIZ))
+            pPlayer->q16horiz = fix16_clamp(fix16_sadd(pPlayer->q16horiz, pInput.q16horz),
+                                            F16(HORIZ_MIN), F16(HORIZ_MAX));
+    }
+#endif
 
     if (P_CheckLockedMovement(playerNum) & IL_NOMOVE)
     {

@@ -207,6 +207,9 @@ static DukePlayer_t *s_viewSwapSaved;
 
 void Net_BeginPredictedView(void)
 {
+    extern int32_t g_netPredictMode;  // DEBUG bisect (oldnet.cpp)
+    if (!(g_netPredictMode & 2))
+        return;
     if (s_viewSwapSaved != NULL || numplayers < 2 || screenpeek != myconnectindex
         || originalPlayer == NULL || ud.pause_on)
         return;

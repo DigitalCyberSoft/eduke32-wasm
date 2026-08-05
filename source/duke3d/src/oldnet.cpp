@@ -1707,6 +1707,48 @@ static uint32_t g_netSnapshotMask = 0;  // bits 0..15 seat mask, 16..23 move epo
 uint8_t g_netMoveEpoch = 0;
 int32_t g_netEpochDrops = 0; // discarded stale-generation move packets (debug surface)
 
+// DEBUG bisection switch (desync validation): bit0 = Net_CorrectPrediction
+// runs, bit1 = predicted-view render swap active. Defaults to both ON.
+int32_t g_netPredictMode = 3;
+#ifdef __EMSCRIPTEN__
+extern "C" void Web_SetPredictMode(int mode)
+{
+    g_netPredictMode = mode;
+    EM_ASM({ console.log('[eng] predictMode=' + $0); }, mode);
+}
+#endif
+
+#ifdef __EMSCRIPTEN__
+// TEST HOOK (harness only): deliberately fork THIS peer's world state, so the
+// CRC watchdog -> host auto-resync healing path can be exercised in anger. A
+// real desync (should any bug ever cause one) takes exactly this route: CRCs
+// mismatch, the host pushes a snapshot, everyone reloads. NOTE: randomseed is
+// NOT forkable here -- both peers deterministically reset it from
+// ticrandomseed (always 0 on this track) inside the tic, which also means an
+// RNG-stream desync is impossible by construction. Position is the real thing:
+// it feeds physics and every later CRC.
+extern "C" void Web_ForceDesync(void)
+{
+    auto const ps = g_player[myconnectindex].ps;
+    if (ps == NULL || !(ps->gm & MODE_GAME))
+        return;
+    // Multi-target on purpose: the ccall can land while the engine is
+    // suspended inside a predicted-view swap (ps would be the predicted COPY,
+    // wiped at the next reconcile) and the player sprite is rewritten from ps
+    // every tic -- but walls and sectors have no predicted copies and nothing
+    // rewrites them, so Sync_Map flags them for as long as the fork lives.
+    ps->pos.x += 256;
+    if ((unsigned)ps->i < MAXSPRITES)
+        sprite[ps->i].x += 256;
+    if (numwalls > 0)
+        wall[0].x += 16;
+    if (numsectors > 0)
+        sector[0].floorz += 256;
+    EM_ASM({ console.log('[eng] Web_ForceDesync: forked (psIsPredicted=' + $0 + ')'); },
+           (ps == &predictedPlayer) ? 1 : 0);
+}
+#endif
+
 // Called by the transports (JS via ccall / native directly) when the snapshot
 // file is fully written. Consumed in menus.cpp at a safe frame point.
 extern "C" void Net_SnapshotReady(int seatMask)

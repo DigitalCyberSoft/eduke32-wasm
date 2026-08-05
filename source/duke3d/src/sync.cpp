@@ -26,6 +26,9 @@ Prepared for public release: 03/28/2005 - Charlie Wiederhold, 3D Realms
 
 #include "duke3d.h"
 #include "soundefs.h"  // DUKE_KILLED2 (desync alert sound)
+#ifdef __EMSCRIPTEN__
+# include <emscripten.h>
+#endif
 
 char g_szfirstSyncMsg[MAX_SYNC_TYPES][60];
 
@@ -265,6 +268,60 @@ static char Sync_Bots(void)
 }
 #endif
 
+// DEBUG bisection of Sync_PlayerPos (desync validation): one category per
+// field group, so a mismatch names the diverging FIELD. Temporary; remove
+// with the rest of the validation instrumentation.
+static char Sync_DbgPos(void)
+{
+    unsigned short crc = 0;
+    for (int32_t ALL_PLAYERS(i))
+    {
+        auto pp = g_player[i].ps;
+        updatecrc(crc, pp->pos.x); updatecrc(crc, pp->pos.y); updatecrc(crc, pp->pos.z);
+    }
+    return ((char)crc & 255);
+}
+static char Sync_DbgAng(void)
+{
+    unsigned short crc = 0;
+    for (int32_t ALL_PLAYERS(i))
+        updatecrc(crc, g_player[i].ps->q16ang);
+    return ((char)crc & 255);
+}
+static char Sync_DbgHoriz(void)
+{
+    unsigned short crc = 0;
+    for (int32_t ALL_PLAYERS(i))
+        updatecrc(crc, g_player[i].ps->q16horiz);
+    return ((char)crc & 255);
+}
+static char Sync_DbgSprite(void)
+{
+    unsigned short crc = 0;
+    for (int32_t ALL_PLAYERS(i))
+    {
+        auto pp = g_player[i].ps;
+        updatecrc(crc, sprite[pp->i].x); updatecrc(crc, sprite[pp->i].y);
+        updatecrc(crc, sprite[pp->i].z); updatecrc(crc, sprite[pp->i].ang);
+    }
+    return ((char)crc & 255);
+}
+// The INPUT each sim consumed for the tic that Net_GetSyncStat is stamping
+// (movefifoplc was already incremented: the consumed tic is plc-1). If these
+// categories flag, the peers consumed DIFFERENT INPUT BYTES for the same tic
+// (a wire/fifo bug); if they stay clean while world categories fork, the sim
+// itself is nondeterministic somewhere.
+static char Sync_DbgInputHash(int plr)
+{
+    unsigned short crc = 0;
+    uint8_t const *b = (uint8_t const *)&inputfifo[(movefifoplc - 1) & (MOVEFIFOSIZ - 1)][plr];
+    for (unsigned k = 0; k < sizeof(input_t); k++)
+        updatecrc(crc, b[k]);
+    return ((char)crc & 255);
+}
+static char Sync_DbgInp0(void) { return Sync_DbgInputHash(0); }
+static char Sync_DbgInp1(void) { return Sync_DbgInputHash(1); }
+
 // This must not exceed MAX_SYNC_TYPES
 static SyncType_t syncType[] = {
     DEFINE_SYNCFUNC(Sync_Engine),
@@ -274,6 +331,12 @@ static SyncType_t syncType[] = {
     DEFINE_SYNCFUNC(Sync_Projectiles),
     DEFINE_SYNCFUNC(Sync_Actors),
     DEFINE_SYNCFUNC(Sync_Map),
+    DEFINE_SYNCFUNC(Sync_DbgPos),     // 7
+    DEFINE_SYNCFUNC(Sync_DbgAng),     // 8
+    DEFINE_SYNCFUNC(Sync_DbgHoriz),   // 9
+    DEFINE_SYNCFUNC(Sync_DbgSprite),  // 10
+    DEFINE_SYNCFUNC(Sync_DbgInp0),    // 11  consumed input, player 0
+    DEFINE_SYNCFUNC(Sync_DbgInp1),    // 12  consumed input, player 1
 #if 0
     DEFINE_SYNCFUNC(Sync_GameSettings),
 #endif
@@ -288,8 +351,32 @@ void Net_GetSyncStat(void)
     if (numplayers < 2)
         return;
 
+    // The CRC table was NEVER initialized in this port -- classic called
+    // initsynccrc() from game init, and the call was lost. With a zero table,
+    // updatecrc() computes 0^(0<<8)=0 forever: every category CRC was a
+    // CONSTANT ZERO on every peer, so the watchdog compared zeros against
+    // zeros and could not flag anything (forced-desync soak caught it: a
+    // deliberately forked world produced 1100+ "clean" comparisons). Lazy
+    // init here is order-proof.
+    static bool s_crcInited;
+    if (!s_crcInited)
+    {
+        s_crcInited = true;
+        initsynccrc();
+    }
+
     for (int32_t i = 0; i < NUM_SYNC_TYPES; i++)
         syncData[INPUTFIFO_CURTICK][i] = syncType[i].func();
+
+#if defined(__EMSCRIPTEN__)
+    // DEBUG (desync validation): prove the ring is being FILLED, with what, at
+    // which slot. Throttled to one line per 64 tics.
+    if ((movefifoplc & 63) == 0)
+        EM_ASM({ console.log('[eng] syncstat plc=' + $0 + ' slot=' + $1 + ' pp=' + $2 + ' map=' + $3); },
+               movefifoplc, INPUTFIFO_CURTICK,
+               (int)(uint8_t)syncData[INPUTFIFO_CURTICK][2],
+               (int)(uint8_t)syncData[INPUTFIFO_CURTICK][6]);
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -402,7 +489,13 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
     // against a syncData slot that has been REUSED by a newer generation
     // (tickNum & (MOVEFIFOSIZ-1) aliases every MOVEFIFOSIZ tics) and latch a
     // false "Out Of Sync" that triggers a needless resync.
-    if (tickNum < 0 || tickNum == g_player[otherconnectindex].lastSyncTick || (tickNum > movefifoplc)
+    // tickNum < 30: comparison grace for the first second of every session.
+    // The moments right after a barrier/snapshot reload are racy on purpose
+    // (rings refill, cursors reset, stale stamps drain) and comparing there
+    // produced false flags that re-triggered the auto-resync in a loop
+    // (soak-caught: post-heal sessions re-flagged at tic 1-2 with zero-hash
+    // artifacts). Real divergence persists past the grace and still flags.
+    if (tickNum < 30 || tickNum == g_player[otherconnectindex].lastSyncTick || (tickNum > movefifoplc)
         || tickNum <= movefifoplc - (MOVEFIFOSIZ - 8))
         return;
 
@@ -423,6 +516,33 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
                 syncError[sb] = true;
             }
 
+#if defined(__EMSCRIPTEN__)
+            // DEBUG (desync validation): the first few RAW mismatches, typed.
+            // One category flaking = real divergence in that subsystem; ALL
+            // categories at once = comparison misalignment.
+            {
+                static int s_worldLogs, s_inputLogs;
+                bool const isInputCat = (sb >= 11);
+                if (isInputCat ? (s_inputLogs < 24) : (s_worldLogs < 8))
+                {
+                    (isInputCat ? s_inputLogs : s_worldLogs)++;
+                    EM_ASM({ console.log('[eng] MISMATCH cat=' + $0 + ' tic=' + $1 + ' local=' + $2 + ' remote=' + $3 + ' plc=' + $4 + ' ep=' + $5); },
+                           sb, tickNum, (int)(uint8_t)head_sync, (int)(uint8_t)player_sync, movefifoplc,
+                           (int)g_netMoveEpoch);
+                    // Input-hash mismatch: dump the LOCAL ring's raw fields for
+                    // that tic, both players, so the two sides' logs can be
+                    // diffed field-by-field.
+                    if (isInputCat)
+                        for (int plr = 0; plr < 2; plr++)
+                        {
+                            input_t const *in = &inputfifo[(tickNum - 1) & (MOVEFIFOSIZ - 1)][plr];
+                            EM_ASM({ console.log('[eng] INPDUMP tic=' + $0 + ' p=' + $1 + ' fvel=' + $2 + ' svel=' + $3 + ' avel=' + $4 + ' horz=' + $5 + ' bits=0x' + ($6 >>> 0).toString(16) + ' ext=0x' + ($7 >>> 0).toString(16)); },
+                                   tickNum - 1, plr, in->fvel, in->svel, (int)in->q16avel, (int)in->q16horz,
+                                   (int)in->bits, (int)in->extbits);
+                        }
+                }
+            }
+#endif
             desynched_players[otherconnectindex] = 1;
         }
     }
