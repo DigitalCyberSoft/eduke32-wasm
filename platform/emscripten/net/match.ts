@@ -58,7 +58,14 @@ export interface RoomPlayer {
   name: string;
   connected: boolean;
   lastSeen: number;
+  /** When this peer first appeared in the roster. A peer still not connected
+   *  CONNECT_TIMEOUT_MS after this is dropped (host side) so a failed WebRTC pair
+   *  can't squat a lobby row as "(CONNECTING)" forever. */
+  firstSeen: number;
 }
+
+/** How long the host tolerates a roster member whose WebRTC pair never completes. */
+export const CONNECT_TIMEOUT_MS = 60_000;
 
 export interface MatchHandlers {
   onRoster?: (players: RoomPlayer[]) => void;
@@ -122,7 +129,7 @@ export class Match {
     this.myName = init.myName;
     this.grp = init.grp;
     this.pingHint = init.pingHint;
-    this.roster.set(DEVICE_ID, { deviceId: DEVICE_ID, name: this.myName, connected: true, lastSeen: Date.now() });
+    this.roster.set(DEVICE_ID, { deviceId: DEVICE_ID, name: this.myName, connected: true, lastSeen: Date.now(), firstSeen: Date.now() });
   }
 
   // ── Factories ────────────────────────────────────────────────────────────
@@ -245,7 +252,12 @@ export class Match {
       this.roomKey,
       {
         onOffer: (from, sdp) => {
-          if (this._acceptsPeer(from)) void this.peers.handleOffer(from, sdp, this.roomKey, this.relays);
+          // The HOST answers every room-keyed offer, even once playing: the guest
+          // needs open channels to RECEIVE the authoritative join_deny ("started"/
+          // "full") from _hostHandleJoin. Refusing at the signal layer left late
+          // joiners stuck on "CONNECTING TO HOST" with no feedback (live-reported).
+          // Guests still answer only the host (STAR).
+          if (this.role === "host" || this._acceptsPeer(from)) void this.peers.handleOffer(from, sdp, this.roomKey, this.relays);
         },
         onAnswer: (from, sdp) => void this.peers.handleAnswer(from, sdp),
         onIce: (from, c) => void this.peers.addIceCandidate(from, c),
@@ -283,8 +295,15 @@ export class Match {
       // Host capacity/started gate: admit a NEW joiner only while open with a free
       // slot. Guests keep tracking every room member for the roster display; they
       // only ever *connect* to the host (see _acceptsPeer).
-      if (this.role === "host" && !matchHasOpenSlot(this.roster.size, this.maxPlayers, this._status)) return;
-      this.roster.set(from, { deviceId: from, name: nm, connected: this.peers.isConnected(from), lastSeen: Date.now() });
+      if (this.role === "host" && !matchHasOpenSlot(this.roster.size, this.maxPlayers, this._status)) {
+        // No seat -- but still DIAL (don't add to the roster): open channels are the
+        // only path for the authoritative join_deny ("started"/"full"), and glare
+        // avoidance may put the offer on OUR side. Without this a late knocker sat
+        // on "CONNECTING TO HOST" forever (live-reported). The deny closes the pair.
+        this.peers.connect(from, this.roomKey, this.relays);
+        return;
+      }
+      this.roster.set(from, { deviceId: from, name: nm, connected: this.peers.isConnected(from), lastSeen: Date.now(), firstSeen: Date.now() });
       if (this.isPublic) this._announceSoon(); // player count changed -> refresh the advert now
     }
     // STAR: host dials every guest; a guest dials only the host. PeerManager.connect
@@ -295,10 +314,22 @@ export class Match {
 
   private _prune(): void {
     const cutoff = Date.now() - PRESENCE_INTERVAL_MS * 3;
+    const connectCutoff = Date.now() - CONNECT_TIMEOUT_MS;
     let changed = false;
     for (const [id, p] of this.roster) {
       if (id === DEVICE_ID) continue;
       if (p.lastSeen < cutoff && !this.peers.isConnected(id)) {
+        this.roster.delete(id);
+        changed = true;
+      }
+      // Presence keeps refreshing lastSeen, so a peer whose WebRTC pair never
+      // completes would otherwise sit in the lobby as "(CONNECTING)" forever
+      // (live-reported "1. DUKE (CONNECTING)"). The host evicts it after
+      // CONNECT_TIMEOUT_MS; if the peer is really there its presence re-adds it
+      // and the connect gets a fresh start.
+      else if (this.role === "host" && !this.peers.isConnected(id) && p.firstSeen < connectCutoff) {
+        console.log(`[dnet] dropping ${id.slice(0, 8)}: no WebRTC connection after ${Math.round(CONNECT_TIMEOUT_MS / 1000)}s`);
+        this.peers.close(id);
         this.roster.delete(id);
         changed = true;
       }
@@ -338,6 +369,10 @@ export class Match {
 
   guestIds(): string[] {
     return this.players().map((p) => p.deviceId).filter((id) => id !== DEVICE_ID);
+  }
+
+  status(): MatchStatus {
+    return this._status;
   }
 
   setStatus(status: MatchStatus): void {

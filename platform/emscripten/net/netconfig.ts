@@ -29,29 +29,31 @@ const LOCAL_RELAY = "ws://127.0.0.1:7500";
 function localRelayWanted(): boolean {
   try {
     if (typeof location === "undefined") return true; // Node harness: always
-    const h = location.hostname;
-    if (h === "localhost" || h === "127.0.0.1" || h === "[::1]") return true;
+    // EXPLICIT opt-in only (?localrelay=1). Local pages no longer auto-include the
+    // loopback relay: a dev bench must signal exactly like production (public Nostr)
+    // unless the tester deliberately points it at a local relay.
     return new URLSearchParams(location.search).has("localrelay");
   } catch {
     return false;
   }
 }
 
+// Public relays: signaling rendezvous only (ICE policy decides who can CONNECT).
+// Keep this list pruned to relays that actually answer NIP-01 — a dead relay costs
+// a console error + a retry loop on every publish. Every entry below returned EOSE
+// to a live probe on 2026-08-05. Dropped that day: soloco.nl + nostr.wine (403),
+// relay.damus.io (503), relay.snort.social / relay.nostr.band / relayable.org
+// (handshake timeout), and the old unvetted tail (mom/einundzwanzig/yabu/oxtr/
+// mostr/data.haus/nostr.net/noswhere) — breadth adds noise, not reliability;
+// 5 healthy relays already survive any single outage. Re-probe before editing:
+// /tmp/relayprobe.mjs <urls...> (sends a REQ, expects EOSE).
 export const NOSTR_RELAYS: readonly string[] = [
   ...(localRelayWanted() ? [LOCAL_RELAY] : []),
-  "wss://relay.damus.io",
   "wss://nos.lol",
-  "wss://relay.snort.social",
   "wss://relay.primal.net",
-  "wss://nostr.mom",
-  "wss://nostr.einundzwanzig.space",
-  "wss://yabu.me",
-  "wss://nostr.oxtr.dev",
-  "wss://relay.mostr.pub",
-  "wss://soloco.nl",
-  "wss://nostr.data.haus",
-  "wss://relay.nostr.net",
-  "wss://relay.noswhere.com",
+  "wss://offchain.pub",
+  "wss://nostr.bitcoiner.social",
+  "wss://nostr-pub.wellorder.net",
 ];
 
 /** Public STUN (zero-config). Multiple servers + Cloudflare's so a single outage

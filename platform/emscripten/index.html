@@ -246,7 +246,7 @@
     monitorRunDependencies: function (left) {
       if (left === 0) { setPct(100); statusEl.textContent = 'Starting…'; }
     },
-    onRuntimeInitialized: function () { started = true; fitCanvas(); document.getElementById('gear').style.display = 'flex'; setTimeout(hideLoader, 400); },
+    onRuntimeInitialized: function () { started = true; fitCanvas(); document.getElementById('gear').style.display = 'flex'; document.getElementById('mute').style.display = 'flex'; setTimeout(hideLoader, 400); },
     printErr: function (t) {
       console.error(t);
       if (!window.__e32ver) { var m = /EDuke32\s+\S+/.exec(t); if (m) { window.__e32ver = m[0]; var v = document.getElementById('ver'); if (v) v.textContent = m[0]; } }

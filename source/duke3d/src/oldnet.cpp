@@ -1004,6 +1004,19 @@ void Net_PeerEvent(int peerToken, int eventType)
     if ((unsigned)peerToken >= MAXPLAYERS)
         return;
 
+    // Engine-side backstop for the transport's "started" join gate: a peer-up for a
+    // NEW peer while we are IN GAME must be dropped. Lockstep cannot seat a player
+    // mid-session -- growing numplayers here made the tic loop wait forever on move
+    // packets from a peer that never entered the level (live-reported host freeze
+    // the moment a late join landed). Down events and already-seated peers pass.
+    if (eventType == NET_PEER_UP && !g_player[peerToken].connected
+        && g_player[myconnectindex].ps != NULL
+        && (g_player[myconnectindex].ps->gm & MODE_GAME))
+    {
+        initprintf("net: dropped mid-game peer-up for slot %d (no late join in lockstep)\n", peerToken);
+        return;
+    }
+
     g_player[peerToken].connected = (eventType == NET_PEER_UP) ? 1 : 0;
     Net_RebuildConnectChain();
 }

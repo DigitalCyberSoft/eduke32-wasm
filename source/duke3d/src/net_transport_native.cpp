@@ -290,6 +290,7 @@ public:
         inbound_.clear();
         attached_ = false;
         launched_ = false;
+        inGame_ = false; // fresh match, open join gate
     }
 
     void menuPump() // game thread: apply queued menu updates via the NetMenu_* setters
@@ -389,6 +390,7 @@ public:
         return (int)(tokenToDevice_.size() + 1) >= minPlayers_;
     }
     void markLaunched() { launched_ = true; }
+    void setInGame(bool on) { inGame_.store(on); }
     bool isHost() const { return isHost_; }
 
     // Menu pulls (game thread only; the strings are not mutated concurrently).
@@ -599,6 +601,17 @@ private:
 
     void hostHandleJoin(const std::string &peer, const std::string &name, const std::string &grpDigest)
     {
+        // STARTED GATE first, mirroring duke-net.ts: lockstep cannot seat a player
+        // mid-session. Accepting here would push a NET_PEER_UP into a running game
+        // and stall the tic loop on input that never comes (browser host froze this
+        // way; same physics on native).
+        if (inGame_.load() || launched_.load())
+        {
+            pm_->sendControl(peer, "{\"t\":\"join_deny\",\"reason\":\"started\"}");
+            printf("[nnet] host: denied %s (match already started)\n", peer.c_str());
+            fflush(stdout);
+            return;
+        }
         // GRP gate, mirroring duke-net.ts _hostHandleJoin: identical GRP sets only.
         // Gate only when our own fingerprint exists; a fingerprint-less host stays
         // permissive (logged) rather than denying everyone.
@@ -825,6 +838,7 @@ private:
     bool isHost_ = false;
     std::atomic<bool> running_{ false };
     std::atomic<bool> launched_{ false };
+    std::atomic<bool> inGame_{ false };  // set via NetMenu_SetInGame: closes the join gate
     bool attached_ = false;
     bool signalingStarted_ = false;
     bool isPublic_ = false;
@@ -955,7 +969,11 @@ void net_native_leave(void)
 const char *net_native_invite(void) { return g_t ? g_t->inviteCstr() : ""; }
 const char *net_native_grp_label(void) { return g_t ? g_t->grpLabelCstr() : ""; }
 void net_native_browse(int /*start*/) { /* native public-match browse not wired yet */ }
-void net_native_set_ingame(int /*in_game*/) { /* native advert / accept-gate not wired yet */ }
+void net_native_set_ingame(int in_game)
+{
+    if (g_t)
+        g_t->setInGame(in_game != 0);
+}
 void net_native_menu_pump(void)
 {
     if (g_t)

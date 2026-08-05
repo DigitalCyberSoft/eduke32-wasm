@@ -51,7 +51,7 @@ import { putGrp, getGrp } from "./idb";
 type Ctl =
   | { t: "join"; name: string; grp: GrpFingerprint }
   | { t: "join_ok"; yourSlot: number; hostSlot: number; name: string }
-  | { t: "join_deny"; reason: "grpmismatch" | "full" | "closed"; hostGrp?: GrpFingerprint }
+  | { t: "join_deny"; reason: "grpmismatch" | "full" | "closed" | "started"; hostGrp?: GrpFingerprint }
   | { t: "grp_req" }
   | { t: "grp_begin"; offer: GrpOffer }
   | { t: "grp_end" }
@@ -207,6 +207,15 @@ class DukeNet {
   }
   getMyConnectIndex(): number {
     return this.myConnectIndex;
+  }
+
+  /** One compact state line for the periodic console heartbeat (null = no match).
+   *  Reading it never touches the engine, so it stays truthful while wasm is wedged. */
+  debugLine(): string | null {
+    const m = this.match;
+    if (!m) return null;
+    const up = m.players().filter((p) => p.connected).length;
+    return `role=${m.role} status=${m.status()} idx=${this.myConnectIndex} roster=${m.players().length} connected=${up} attached=${this.slots.size}`;
   }
 
   /** The engine calls this when the local match actually starts (true) or ends
@@ -426,26 +435,44 @@ class DukeNet {
   private _hostHandleJoin(peerId: string, msg: { grp: GrpFingerprint; name: string }): void {
     const m = this.match;
     if (!m || m.role !== "host") return;
-    console.log(`[dnet] <- join request from ${peerId.slice(0, 8)} name=${msg.name}`);
+    const st = m.status();
+    console.log(`[dnet] <- join request from ${peerId.slice(0, 8)} name=${msg.name} (match=${st} guests=${this.slots.size}/${m.maxPlayers - 1})`);
+    // STARTED GATE (must be FIRST): lockstep cannot seat a player mid-session. Before
+    // this gate an in-game host ACCEPTED the join -> Net_PeerEvent grew numplayers
+    // mid-game -> the tic loop waited forever on input from a peer that never entered
+    // the level: host hard-froze right after "<- join request" (live-reported), and the
+    // joiner entered a spectator-camera limbo. Deny + let the joiner return to Browse.
+    if (st !== "open") {
+      console.log(`[dnet] join denied: match already ${st}`);
+      m.peers.sendControl(peerId, { t: "join_deny", reason: "started" } as Ctl);
+      setTimeout(() => m.peers.close(peerId), 300); // deny flushed -> drop the pair
+      return;
+    }
     const hostFp = m.grpFingerprint();
     if (!msg.grp || msg.grp.setDigest !== hostFp.setDigest) {
       // GRP GATING: only identical-GRP-set players may join. Offer the fingerprint so
       // the joiner can decide whether to download (if the host's main GRP is shareable).
+      console.log(`[dnet] join denied: grp mismatch (theirs=${msg.grp?.setDigest?.slice(0, 12) ?? "none"} ours=${hostFp.setDigest.slice(0, 12)})`);
       m.peers.sendControl(peerId, { t: "join_deny", reason: "grpmismatch", hostGrp: hostFp } as Ctl);
       return;
     }
     if (this.slots.size + 1 >= m.maxPlayers) {
+      console.log(`[dnet] join denied: full (${this.slots.size + 1}/${m.maxPlayers})`);
       m.peers.sendControl(peerId, { t: "join_deny", reason: "full" } as Ctl);
       return;
     }
     const slot = this._allocSlot();
     this.slots.set(peerId, slot);
     // Attach: from now on this peer's channels carry raw netcode frames, and the
-    // netcode sees a NET_PEER_UP at connectindex==slot.
+    // netcode sees a NET_PEER_UP at connectindex==slot. Log each step so a freeze
+    // in this path pinpoints itself (the last line printed = the step that hung).
+    console.log(`[dnet] join accept: slot=${slot} registering peer`);
     this.seam.registerPeer(peerId, slot);
     m.peers.setAttached(peerId, true);
     this.seam.enqueuePeerEventByDevice(peerId, true);
+    console.log(`[dnet] join accept: peer-up queued, sending join_ok slot=${slot}`);
     m.peers.sendControl(peerId, { t: "join_ok", yourSlot: slot, hostSlot: 0, name: this.myName } as Ctl);
+    console.log(`[dnet] -> join_ok sent to ${peerId.slice(0, 8)} (slot ${slot})`);
     this.events.onStatus?.(`Player joined (slot ${slot})`);
   }
 
@@ -487,6 +514,12 @@ class DukeNet {
         return;
       }
       this.events.onError?.("This match needs a paid GRP you do not have.");
+    } else if (msg.reason === "started") {
+      // The match launched before our join completed. There is no mid-game join in
+      // lockstep, so land back in Browse with an honest message instead of the old
+      // forever-"CONNECTING TO HOST [JOINING]" / lobby limbo.
+      this.events.onError?.("Match already in progress - pick another game");
+      this.leave();
     } else {
       this.events.onError?.("Join refused: " + msg.reason);
     }
@@ -847,6 +880,15 @@ function wireInEngineMenu(): void {
     leave(): void { try { dukeNet.leave(); } catch { /* already gone */ } },
   };
   (window as unknown as { NetMenu: typeof NetMenu }).NetMenu = NetMenu;
+
+  // Freeze-visible heartbeat: one line every 15s WHILE IN A MATCH. Reading it:
+  //   lines keep coming + canvas frozen  -> the engine wedged (JS event loop alive);
+  //   lines stop while the tab is open   -> a wasm spin is blocking the event loop.
+  // Either way the LAST [dnet] line before silence names the step that hung.
+  setInterval(() => {
+    const l = dukeNet.debugLine();
+    if (l) console.log("[dnet] hb " + l);
+  }, 15_000);
 }
 
 if (typeof window !== "undefined") {
