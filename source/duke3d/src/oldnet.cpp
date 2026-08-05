@@ -333,8 +333,14 @@ void Net_GetPlayerInputFromPacket(int* j, int playerNum, input_t* osyn, input_t*
 
 void faketimerhandler(void) { };
 
+int32_t g_netPumpCalls = 0; // debug surface: proves the input pump runs
+int32_t g_netGateC1 = 0, g_netGateC2 = 0; // main-loop gate probes (game.cpp)
+int32_t g_mainLoopIter = 0;  // app_main do-loop residency (game.cpp)
+int32_t g_demoLoopIter = 0;  // G_PlaybackDemo per-frame residency (demo.cpp)
+
 void Net_HandleInput(void)
 {
+    g_netPumpCalls++;
     int i, j;
     //    short who;
     input_t *osyn, *nsyn;

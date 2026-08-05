@@ -497,6 +497,23 @@ RECHECK:
 
     in_menu = g_player[myconnectindex].ps->gm&MODE_MENU;
 
+    // Deferred netgame entry (NEW_GAME consumed inside this loop's menu pump, see
+    // menus.cpp M_DisplayMenus NETMENU block): the game is LIVE now -- exit the
+    // attract loop instead of cycling it against the running netgame. Without this
+    // the multimode>1 RECHECK left `foundemo` stale, re-opened the menu over the
+    // game (552) and kept the demo machinery fighting the live session
+    // (live-reported: guest menu stuck over black, screen shaking, "player 2 not
+    // acting as a separate player").
+    if ((g_player[myconnectindex].ps->gm & MODE_GAME) && ud.multimode > 1)
+    {
+        if (foundemo)
+        {
+            kclose(g_demo_recFilePtr);
+            g_demo_recFilePtr = buildvfs_kfd_invalid;
+        }
+        return 0;
+    }
+
     pub = NUMPAGES;
     pus = NUMPAGES;
 
@@ -549,14 +566,22 @@ RECHECK:
         }
     }
 
-    if (foundemo == 0 || in_menu || I_CheckAllInput() || numplayers > 1)
+    if ((foundemo == 0 || in_menu || I_CheckAllInput() || numplayers > 1)
+        && !(g_player[myconnectindex].ps->gm & MODE_GAME))
     {
         FX_StopAllSounds();
         S_ClearSoundLocks();
         Menu_Open(myconnectindex);
     }
 
-    ready2send = 0;
+    // A LIVE netgame may have been entered by the deferred NEW_GAME consumer inside
+    // the M_DisplayMenus call above (between-demos idle path): zeroing ready2send
+    // then would switch the input pump off permanently -- the guest never samples,
+    // never sends SLAVE_TO_MASTER, and the whole lockstep session freezes at tic 0
+    // (live-reported "screen shaking / player 2 not a separate player": a frozen
+    // sim under a flapping camera). Only reset it when no game is running.
+    if (!(g_player[myconnectindex].ps->gm & MODE_GAME))
+        ready2send = 0;
     bigi = 0;
 
     I_ClearAllInput();
@@ -891,6 +916,7 @@ nextdemo_nomenu:
                 goto RECHECK;
             }
 
+            { extern int32_t g_demoLoopIter; g_demoLoopIter++; }
             if ((I_EscapeTrigger()||(MOUSE_GetButtons()&M_RIGHTBUTTON)) && (g_player[myconnectindex].ps->gm&MODE_MENU) == 0 && (g_player[myconnectindex].ps->gm&MODE_TYPE) == 0)
             {
                 I_EscapeTriggerClear();

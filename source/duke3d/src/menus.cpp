@@ -1780,6 +1780,7 @@ static void netmenu_relaunch(int vol, int lev)
     // 2+ players the tic-0 Net_WaitForPlayers barrier runs as a nested modal loop
     // (pumping net_poll); it no-ops solo.
     G_NewGame_EnterLevel();
+    ready2send = 1; // input pump ON (see the guest consumer note)
 }
 
 // --- screen layout (framework-native: same fonts/macros/formats as neighbours) ---
@@ -8932,14 +8933,43 @@ void M_DisplayMenus(void)
         // headless rig wait for real menu states instead of guessing at timings, and
         // gives live sessions one more breadcrumb when someone reports a stuck screen.
         {
-            static int32_t lastExposed = INT32_MIN;
+            extern bool g_foundSyncError; // sync.cpp lockstep CRC verdict
+            static int64_t lastExposed = INT64_MIN;
             int32_t const menuOpen = (nngm & MODE_MENU) ? 1 : 0;
-            int32_t const cur = menuOpen * 1000000 + (int32_t)m_currentMenu->menuID;
-            if (cur != lastExposed)
+            int32_t const inGame = (nngm & MODE_GAME) ? 1 : 0;
+            // Selected row (Menu-type screens only): lets a harness verify each
+            // keypress landed instead of trusting key timing blindly.
+            int32_t sel = -1;
+            if (m_currentMenu->type == Menu)
+                sel = ((MenuMenu_t *)m_currentMenu->object)->currentEntry;
+            // Emit on any state change OR at least every ~500ms: the payload carries
+            // live counters (fifo, pump, positions) that must not go stale between
+            // menu transitions -- change-only emission turned them into fossils.
+            int64_t const cur = ((int64_t)(nngm & 0xff) << 48) | ((int64_t)menuOpen << 40) | ((int64_t)inGame << 41)
+                | ((int64_t)(g_foundSyncError ? 1 : 0) << 42)
+                | ((int64_t)(sel & 0xff) << 44)
+                | ((int64_t)numplayers << 32) | ((int64_t)myconnectindex << 24)
+                | (int64_t)(int32_t)m_currentMenu->menuID;
+            static int32_t lastEmitClock = -10000;
+            if (cur != lastExposed || (int32_t)totalclock - lastEmitClock >= 60)
             {
                 lastExposed = cur;
-                char scr[96];
-                Bsnprintf(scr, sizeof scr, "window.__e32menu={open:%d,id:%d}", menuOpen, (int)m_currentMenu->menuID);
+                lastEmitClock = (int32_t)totalclock;
+                char scr[256];
+                // p0/p1: player positions (>>8) -- input-routing diagnosis: if both
+                // move in lockstep with one player's input, the input fanout is wrong.
+                int32_t p0x = 0, p0y = 0, p1x = 0, p1y = 0;
+                if (g_player[0].ps != NULL) { p0x = g_player[0].ps->pos.x >> 8; p0y = g_player[0].ps->pos.y >> 8; }
+                if (g_player[1].ps != NULL) { p1x = g_player[1].ps->pos.x >> 8; p1y = g_player[1].ps->pos.y >> 8; }
+                extern int32_t g_netPumpCalls, g_netGateC1, g_netGateC2, g_mainLoopIter, g_demoLoopIter;
+                Bsnprintf(scr, sizeof scr,
+                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d}",
+                          menuOpen, (int)m_currentMenu->menuID, inGame, (int)nngm,
+                          (int)numplayers, (int)myconnectindex, g_foundSyncError ? 1 : 0, (int)sel,
+                          p0x, p0y, p1x, p1y,
+                          (int)movefifoplc, (int)g_player[0].movefifoend, (int)g_player[1].movefifoend,
+                          (int)ready2send, (int)g_netPumpCalls, (int)(totalclock - ototalclock),
+                          (int)g_netGateC1, (int)g_netGateC2, (int)g_mainLoopIter, (int)g_demoLoopIter);
                 emscripten_run_script(scr);
             }
         }
@@ -8977,6 +9007,7 @@ void M_DisplayMenus(void)
             g_mostConcurrentPlayers = ud.multimode;
             NetMenu_SetInGame(1);
             G_NewGame_EnterLevel(); // sets gm = MODE_GAME (clears NEWGAME), premap.cpp:2046
+            ready2send = 1;         // input pump ON, whatever attract-loop path we returned through
             return;
         }
         // HOST: late joiners. Their peer-up landed while we were IN GAME, so oldnet

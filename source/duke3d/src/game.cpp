@@ -7147,18 +7147,22 @@ MAIN_LOOP_RESTART:
         double gameUpdateStartTime = timerGetFractionalTicks();
         auto framecnt = g_frameCounter;
 
+        extern int32_t g_netGateC1, g_netGateC2, g_mainLoopIter;
+        g_mainLoopIter++;
         if (((g_netClient || g_netServer) || (myplayer.gm & (MODE_MENU|MODE_DEMO)) == 0) && (int32_t)(totalclock - ototalclock) >= TICSPERFRAME)
         {
             do
             {
                 do
                 {
+                    g_netGateC1++;
                     if (g_frameJustDrawn && g_networkMode != NET_DEDICATED_SERVER && (myplayer.gm & (MODE_MENU | MODE_DEMO)) == 0)
                         dukeFillInputForTic();
 
                     if (ready2send == 0)
                         break;
 
+                    g_netGateC2++;
                     ototalclock += TICSPERFRAME;
 
                     if (((ud.show_help == 0 && (myplayer.gm & MODE_MENU) != MODE_MENU) || ud.recstat == 2 || (g_netServer || ud.multimode > 1))
