@@ -601,17 +601,11 @@ private:
 
     void hostHandleJoin(const std::string &peer, const std::string &name, const std::string &grpDigest)
     {
-        // STARTED GATE first, mirroring duke-net.ts: lockstep cannot seat a player
-        // mid-session. Accepting here would push a NET_PEER_UP into a running game
-        // and stall the tic loop on input that never comes (browser host froze this
-        // way; same physics on native).
-        if (inGame_.load() || launched_.load())
-        {
-            pm_->sendControl(peer, "{\"t\":\"join_deny\",\"reason\":\"started\"}");
-            printf("[nnet] host: denied %s (match already started)\n", peer.c_str());
-            fflush(stdout);
-            return;
-        }
+        // LATE JOIN is allowed, mirroring duke-net.ts: the joiner attaches normally
+        // and its NET_PEER_UP is QUEUED by oldnet while the host is in-game; the
+        // host then seats it at a safe frame point by relaunching the current map
+        // (menus.cpp late-join consumer). Attaching straight into the running tic
+        // loop is what used to freeze the host.
         // GRP gate, mirroring duke-net.ts _hostHandleJoin: identical GRP sets only.
         // Gate only when our own fingerprint exists; a fingerprint-less host stays
         // permissive (logged) rather than denying everyone.

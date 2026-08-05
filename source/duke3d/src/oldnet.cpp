@@ -2,6 +2,10 @@
 
 #include "duke3d.h"
 #include "oldnet.h"
+
+// Forward decl: file-static, defined mid-file; the seat-mask receive path in the
+// packet dispatch runs before it textually.
+static void Net_RebuildConnectChain(void);
 #include "net_predict.h"
 #include "net_transport.h"
 #include "chatpipe.h"
@@ -616,7 +620,8 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 uint32_t flags      = (uint32_t)B_UNBUF32(&packbuf[j]); j += sizeof(int32_t);
                 // [NetDuke32 port] Upstream: G_NewGame(flags | NEWGAME_FROMSERVER).
                 // TODO(netcode): upstream NEWGAME_* flag nuances (NOSEND/RESETALL) are
-                // not modeled by this tree's G_NewGame.
+                // not modeled by this tree's G_NewGame. Low 16 bits stay reserved for
+                // them; high 16 bits are the transport seat mask (see below).
                 (void)flags;
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
                 // WebRTC/seam build (browser OR native NETNATIVE) -- stock native NetDuke32
@@ -630,6 +635,20 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 // (premap.cpp:788), monsters spawn, and APLAYER starts are misclassified as
                 // STAT_MISC (game.cpp:2797). numplayers is already >1 here (we only receive
                 // NEW_GAME once connected).
+                // SEAT MASK (flags high 16 bits): the host's authoritative session
+                // roster. Apply it FIRST -- a guest only ever hears peer-ups for the
+                // host itself, so on 3+ player launches and every late join its local
+                // connected[] (hence numplayers) is stale until this packet.
+                if (flags >> 16)
+                {
+                    uint32_t seatMask = flags >> 16;
+                    for (int32_t k = 0; k < MAXPLAYERS && k < 16; k++)
+                        if (k != myconnectindex)  // our own seat is implied
+                            g_player[k].connected = (seatMask >> k) & 1;
+                    g_player[myconnectindex].connected = 1;
+                    Net_RebuildConnectChain();
+                    LOG_F(INFO, "[nnative] seat mask 0x%x -> numplayers=%d", seatMask, numplayers);
+                }
                 ud.multimode            = numplayers;
                 g_mostConcurrentPlayers = ud.multimode;
                 ud.m_monsters_off       = 1;   // match the host's deathmatch setup
@@ -999,21 +1018,38 @@ static void Net_RebuildConnectChain(void)
         ud.multimode = numplayers;
 }
 
+// Bitmask of slots whose peer-up arrived while the host was in-game. Consumed by
+// Net_SeatLateJoiners() from the host's late-join relaunch (menus.cpp).
+int32_t g_netLateJoinMask = 0;
+
+// Seat every queued late joiner (menus.cpp consumer calls this at a safe frame
+// point, right before relaunching the current map).
+void Net_SeatLateJoiners(void)
+{
+    for (int k = 0; k < MAXPLAYERS; k++)
+        if (g_netLateJoinMask & (1 << k))
+            g_player[k].connected = 1;
+    g_netLateJoinMask = 0;
+    Net_RebuildConnectChain();
+}
+
 void Net_PeerEvent(int peerToken, int eventType)
 {
     if ((unsigned)peerToken >= MAXPLAYERS)
         return;
 
-    // Engine-side backstop for the transport's "started" join gate: a peer-up for a
-    // NEW peer while we are IN GAME must be dropped. Lockstep cannot seat a player
-    // mid-session -- growing numplayers here made the tic loop wait forever on move
-    // packets from a peer that never entered the level (live-reported host freeze
-    // the moment a late join landed). Down events and already-seated peers pass.
+    // LATE JOIN: a peer-up for a NEW peer while we are IN GAME must not touch the
+    // connect chain here -- this runs inside net_poll, possibly mid-simulation, and
+    // growing numplayers under the tic loop starved it on input from a peer not yet
+    // in the level (live-reported host freeze). Instead RECORD the joiner; the host
+    // seats it at a safe frame point (M_DisplayMenus NETMENU block) by relaunching
+    // the current map for everyone, so all peers re-enter tic 0 together.
     if (eventType == NET_PEER_UP && !g_player[peerToken].connected
         && g_player[myconnectindex].ps != NULL
         && (g_player[myconnectindex].ps->gm & MODE_GAME))
     {
-        initprintf("net: dropped mid-game peer-up for slot %d (no late join in lockstep)\n", peerToken);
+        g_netLateJoinMask |= (1 << peerToken);
+        initprintf("net: late join queued for slot %d (relaunch pending)\n", peerToken);
         return;
     }
 
@@ -1267,6 +1303,20 @@ void Net_SendNewGame(uint32_t flags)
     packbuf[j++] = ud.m_player_skill;
     packbuf[j++] = ud.m_coop;
     B_BUF32(&packbuf[j], ud.m_dmflags); j += sizeof(int32_t);
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // Transport track: the high 16 bits of `flags` carry the SEAT MASK -- which
+    // slots are in the session. Guests need it because their only direct peer is
+    // the host (STAR): without it a guest's numplayers stays 2 and a 3-player
+    // launch (or any late join) desyncs. Stock NetDuke32 senders leave these bits
+    // 0 and the stock receiver ignores them, so the wire stays compatible.
+    {
+        uint32_t seatMask = 0;
+        for (int32_t k = 0; k < MAXPLAYERS && k < 16; k++)
+            if (g_player[k].connected)
+                seatMask |= (1u << k);
+        flags |= seatMask << 16;
+    }
+#endif
     B_BUF32(&packbuf[j], flags);        j += sizeof(int32_t);
 
     int i;

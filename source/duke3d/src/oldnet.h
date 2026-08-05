@@ -145,6 +145,8 @@ void Net_SendClientInfo(void);
 OLDNET_EXTERN input_t netInput;
 
 OLDNET_EXTERN bool oldnet_gotinitialsettings; // True if we got PACKET_TYPE_INIT_SETTINGS from the host.
+extern int32_t g_netLateJoinMask; // slots whose peer-up landed mid-game; host seats them via relaunch (menus.cpp)
+void Net_SeatLateJoiners(void);   // apply the mask to connected[] + rebuild the chain
 
 //OLDNET_EXTERN PredictBackup_t predictBackup[MOVEFIFOSIZ];
 

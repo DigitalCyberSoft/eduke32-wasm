@@ -15,8 +15,12 @@ describe("matchHasOpenSlot — host capacity + started gate", () => {
     expect(matchHasOpenSlot(5, 4, "open")).toBe(false); // never over-fill
   });
 
-  it("a started match takes nobody new regardless of free slots", () => {
-    expect(matchHasOpenSlot(1, 8, "playing")).toBe(false);
+  it("a PLAYING match with room still takes joiners (late join seats via relaunch)", () => {
+    expect(matchHasOpenSlot(1, 8, "playing")).toBe(true); // in-game, seats free
+    expect(matchHasOpenSlot(8, 8, "playing")).toBe(false); // in-game, full
+  });
+
+  it("mid-launch handoff refuses joiners", () => {
     expect(matchHasOpenSlot(2, 8, "starting")).toBe(false);
   });
 

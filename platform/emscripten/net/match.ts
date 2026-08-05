@@ -29,13 +29,14 @@ import type { GrpFingerprint } from "./grp";
 import { sanitizeText, sanitizeName } from "./sanitize";
 
 export type Role = "host" | "guest";
-export type MatchStatus = "open" | "starting" | "playing";
+export type MatchStatus = "open" | "starting" | "playing" | "closed";
 
-/** Capacity predicate (pure, unit-tested): does an OPEN match with `rosterSize`
- *  members (self included) have room for one more under `maxPlayers`? A match that
- *  has started (status !== "open") has room for nobody new. */
+/** Capacity predicate (pure, unit-tested): does a match with `rosterSize` members
+ *  (self included) have room for one more under `maxPlayers`? Both "open" and
+ *  "playing" matches take joiners -- the engine seats late joiners by relaunching
+ *  the current map. Only "starting" (mid-launch handoff) refuses. */
 export function matchHasOpenSlot(rosterSize: number, maxPlayers: number, status: MatchStatus): boolean {
-  return status === "open" && rosterSize < maxPlayers;
+  return status !== "starting" && rosterSize < maxPlayers;
 }
 
 export interface MatchInfo {
@@ -401,8 +402,8 @@ export class Match {
     this._unsubSignaling?.();
     this.peers.closeAll();
     if (this.isPublic) {
-      this._status = "playing"; // not "open" -> filtered out of the public list
-      void this._announce();    // publish the final non-open record NOW so consumers drop it immediately instead of waiting the 60s TTL
+      this._status = "closed"; // dead room -> dropped from the public list NOW
+      void this._announce();    // publish the final closed record instead of waiting the 60s TTL
     }
   }
 }
@@ -415,7 +416,12 @@ export async function listPublicMatches(onUpdate: (matches: MatchInfo[]) => void
   const emit = () => {
     const now = Date.now();
     for (const [id, m] of seen) if (now - m.ts >= ANNOUNCE_TTL_MS) seen.delete(id);
-    const live = [...seen.values()].filter((m) => m.status === "open");
+    // "open" lobbies AND "playing" matches with a free seat are joinable (late
+    // joiners get seated via the host's relaunch). "starting" hides during the
+    // launch handoff; "closed" is a dead room's final announce.
+    const live = [...seen.values()].filter(
+      (m) => m.status === "open" || (m.status === "playing" && (m.players | 0) < (m.maxPlayers | 0)),
+    );
     live.sort((a, b) => b.ts - a.ts);
     onUpdate(live);
   };

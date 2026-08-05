@@ -1565,6 +1565,7 @@ static int32_t s_netLocalOnly = 0;      // On => host boots guests whose real pi
 static int32_t s_netPingIdx  = 0;       // index into the ping presets
 static int s_netHostPublic = 1;         // set by the root HOST PUBLIC/PRIVATE choice
 static int s_netMyConnectIndex = 0;     // 0 = host; guest learns its slot via NetMenu_OnJoined
+static int s_netHosting = 0;            // 1 while WE host an active transport match (Change Map gate)
 
 // --- untrusted-string hardening -------------------------------------------
 // Clamp a peer string to printable ASCII, length-capped. The legacy menu font path
@@ -1688,6 +1689,7 @@ static void netmenu_browse(int start)
 }
 static void netmenu_leave(void)
 {
+    s_netHosting = 0;
 #ifdef __EMSCRIPTEN__
     emscripten_run_script("window.NetMenu&&window.NetMenu.leave()");
 #else
@@ -1716,6 +1718,34 @@ extern "C" void NetMenu_SetInGame(int in_game)
 #endif
 }
 
+// The ONE way a WebRTC match (re)enters a level: lobby launch, in-game Change Map,
+// and the late-join relaunch all come through here so the staging can never diverge.
+// Multiplayer session setup the stock Net_StartNewGame path implies but this launch
+// omits: g_netServer is a MACRO (numplayers>1 && host, oldnet.h:71), true only for
+// the host -- ud.multimode MUST be set for guests (g_netServer false there), and
+// ud.m_monsters_off MUST be set or monsters spawn in deathmatch (spawn gates only on
+// ud.monsters_off, game.cpp:3538). No gametype picker yet -> hardcode DM (coop 0,
+// global.cpp:44). Net_SendNewGame also broadcasts the SEAT MASK (oldnet.cpp) so
+// guests learn the authoritative session roster.
+static void netmenu_relaunch(int vol, int lev)
+{
+    ud.m_volume_number      = (vol >= 0 && vol < MAXVOLUMES) ? vol : 0;
+    ud.m_level_number       = lev;
+    ud.multimode            = numplayers;
+    g_mostConcurrentPlayers = ud.multimode;
+    ud.m_coop               = 0;   // gametype 0 = Deathmatch (spawn)
+    ud.m_monsters_off       = 1;   // no monsters in deathmatch
+    ud.m_player_skill       = 0;
+    if (numplayers > 1)
+        Net_SendNewGame(0);   // guests (re)enter the same map at tic 0 (reads ud.m_* above)
+    NetMenu_SetInGame(1);     // stop advertising open-state; joins now go the late-join route
+    // Enter DIRECTLY, exactly like the single-player New Game path: the deferred-gm
+    // approach ran after the frame's MODE_NEWGAME check and blanked the screen. For
+    // 2+ players the tic-0 Net_WaitForPlayers barrier runs as a nested modal loop
+    // (pumping net_poll); it no-ops solo.
+    G_NewGame_EnterLevel();
+}
+
 // --- screen layout (framework-native: same fonts/macros/formats as neighbours) ---
 static MenuMenuFormat_t MMF_NetBrowse = { { MENU_MARGIN_REGULAR<<16, 52<<16, }, 176<<16 }; // positive cutoff -> windowed+scrollbar like LOAD/SAVE
 static MenuEntryFormat_t MEF_NetBrowseRow = { 2<<16, 0, 250<<16 };
@@ -1732,8 +1762,10 @@ static MenuLink_t MEO_NET_ROOT_JOIN     = { MENU_NET_JOINCODE, MA_Advance, };
 static MenuEntry_t ME_NET_ROOT_JOIN     = MAKE_MENUENTRY( "Join by Code",       &MF_Redfont, &MEF_CenterMenu, &MEO_NET_ROOT_JOIN,     Link );
 static MenuLink_t MEO_NET_ROOT_BACK     = { MENU_PREVIOUS,     MA_Return, };
 static MenuEntry_t ME_NET_ROOT_BACK     = MAKE_MENUENTRY( "Back",               &MF_Redfont, &MEF_CenterMenu, &MEO_NET_ROOT_BACK,     Link );
+static MenuLink_t MEO_NET_ROOT_CHANGEMAP = { MENU_NET_CHANGEMAP, MA_Advance, };
+static MenuEntry_t ME_NET_ROOT_CHANGEMAP = MAKE_MENUENTRY( "Change Map", &MF_Redfont, &MEF_CenterMenu, &MEO_NET_ROOT_CHANGEMAP, Link );
 static MenuEntry_t *MEL_NETWORK_ND[] = {
-    &ME_NET_ROOT_HOSTPUB, &ME_NET_ROOT_HOSTPRIV, &ME_NET_ROOT_BROWSE, &ME_NET_ROOT_JOIN, &ME_NET_ROOT_BACK,
+    &ME_NET_ROOT_CHANGEMAP, &ME_NET_ROOT_HOSTPUB, &ME_NET_ROOT_HOSTPRIV, &ME_NET_ROOT_BROWSE, &ME_NET_ROOT_JOIN, &ME_NET_ROOT_BACK,
 };
 
 // HOST CONFIG
@@ -1745,14 +1777,29 @@ static MenuOption_t MEO_NET_CFG_SHARE = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_Off
 static MenuEntry_t ME_NET_CFG_SHARE = MAKE_MENUENTRY( "GRP Sharing", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_SHARE, Option );
 static MenuOption_t MEO_NET_CFG_LOCALONLY = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_OffOn, &s_netLocalOnly );
 static MenuEntry_t ME_NET_CFG_LOCALONLY = MAKE_MENUENTRY( "Local Only", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_LOCALONLY, Option );
+// Episode selector: shares the init-populated episode name/value arrays but NOT the
+// stock optionset -- MEOS_NET_CFG_EPISODE.numOptions is set at init WITHOUT the
+// trailing "User Map" row (no map-file transfer between peers). Bound to NetEpisode,
+// which the launch/relaunch paths already read as the volume.
+static MenuOptionSet_t MEOS_NET_CFG_EPISODE = MAKE_MENUOPTIONSET( MEOSN_NetEpisodes, MEOSV_NetEpisodes, 0x0 );
+static MenuOption_t MEO_NET_CFG_EPISODE = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_NET_CFG_EPISODE, &NetEpisode );
+static MenuEntry_t ME_NET_CFG_EPISODE = MAKE_MENUENTRY( "Episode", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_EPISODE, Option );
 // Map selector: reuses the init-populated level option set (MEOS_NETOPTIONS_LEVEL). The
-// options pointer is assigned per-episode in this menu's ChangingTo; bound to ud.m_level_number.
+// options pointer follows the Episode selection per-frame in Menu_Pre (stock
+// MENU_NETOPTIONS pattern); bound to ud.m_level_number.
 static MenuOption_t MEO_NET_CFG_LEVEL = MAKE_MENUOPTION( &MF_Bluefont, NULL, &ud.m_level_number );
 static MenuEntry_t ME_NET_CFG_LEVEL = MAKE_MENUENTRY( "Level", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_LEVEL, Option );
 static MenuLink_t MEO_NET_CFG_START = { MENU_NET_LOBBY, MA_Advance, };
 static MenuEntry_t ME_NET_CFG_START = MAKE_MENUENTRY( "Start", &MF_Redfont, &MEF_VideoSetup_Apply, &MEO_NET_CFG_START, Link );
 static MenuEntry_t *MEL_NET_HOSTCFG[] = {
-    &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_LEVEL, &ME_NET_CFG_SHARE, &ME_NET_CFG_LOCALONLY, &ME_NET_CFG_START,
+    &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_EPISODE, &ME_NET_CFG_LEVEL, &ME_NET_CFG_SHARE, &ME_NET_CFG_LOCALONLY, &ME_NET_CFG_START,
+};
+
+// CHANGE MAP (host, in-game): same Episode/Level pickers; Warp relaunches every
+// peer on the chosen map via the NEW_GAME broadcast + tic-0 barrier.
+static MenuEntry_t ME_NET_CHANGEMAP_GO = MAKE_MENUENTRY( "Warp to Map", &MF_Redfont, &MEF_VideoSetup_Apply, &MEO_NULL, Link );
+static MenuEntry_t *MEL_NET_CHANGEMAP[] = {
+    &ME_NET_CFG_EPISODE, &ME_NET_CFG_LEVEL, &ME_NET_CHANGEMAP_GO,
 };
 
 // BROWSE PUBLIC GAMES — Max Ping control + a dynamic, scrollable match list
@@ -1846,6 +1893,7 @@ static MenuMenu_t M_NET_HOSTCFG  = MAKE_MENUMENU( "Host Game", &MMF_SmallOptions
 static MenuMenu_t M_NET_BROWSE   = MAKE_MENUMENU_CUSTOMSIZE( "Browse Public Games", &MMF_NetBrowse, MEL_NET_BROWSE );
 static MenuMenu_t M_NET_JOINCODE = MAKE_MENUMENU( "Join by Code", &MMF_SmallOptions, MEL_NET_JOINCODE );
 static MenuMenu_t M_NET_LOBBY    = MAKE_MENUMENU( "Multiplayer Lobby", &MMF_SmallOptions, MEL_NET_LOBBY );
+static MenuMenu_t M_NET_CHANGEMAP = MAKE_MENUMENU( "Change Map", &MMF_SmallOptions, MEL_NET_CHANGEMAP );
 #endif
 
 #ifdef EDUKE32_RETAIL_MENU
@@ -1994,6 +2042,7 @@ static Menu_t Menus[] = {
     { &M_USERMAP, MENU_NETUSERMAP, MENU_NETOPTIONS, MA_Return, FileSelect },
 #ifdef NETMENU
     { &M_NET_HOSTCFG, MENU_NET_HOSTCFG, MENU_NETWORK, MA_Return, Menu },
+    { &M_NET_CHANGEMAP, MENU_NET_CHANGEMAP, MENU_NETWORK, MA_Return, Menu },
     { &M_NET_BROWSE, MENU_NET_BROWSE, MENU_NETWORK, MA_Return, Menu },
     { &M_NET_JOINCODE, MENU_NET_JOINCODE, MENU_NETWORK, MA_Return, Menu },
     { &M_NET_LOBBY, MENU_NET_LOBBY, MENU_NETWORK, MA_Return, Menu },
@@ -2541,6 +2590,9 @@ void Menu_Init(void)
     k--;
 #endif
     MEOS_NETOPTIONS_EPISODE.numOptions = k + 1;
+#ifdef NETMENU
+    MEOS_NET_CFG_EPISODE.numOptions = k; // episodes only -- no "User Map" row over the wire
+#endif
     NetEpisode = MEOSV_NetEpisodes[0];
     MMF_Top_Episode.pos.y = (58 + (3-k)*6)<<16;
     if (g_maxDefinedSkill == 0)
@@ -3217,6 +3269,22 @@ static void Menu_Pre(MenuID_t cm)
         // Only the host (connectindex 0) may launch the game; guests just wait.
         MenuEntry_HideOnCondition(&ME_NETHOST_LAUNCH, s_netMyConnectIndex != 0);
         break;
+    case MENU_NETWORK:
+        // Change Map exists only for the HOST of a RUNNING match (ESC -> Multiplayer).
+        MenuEntry_HideOnCondition(&ME_NET_ROOT_CHANGEMAP,
+            !s_netHosting || s_netMyConnectIndex != 0
+            || g_player[myconnectindex].ps == NULL
+            || !(g_player[myconnectindex].ps->gm & MODE_GAME));
+        break;
+    case MENU_NET_HOSTCFG:
+    case MENU_NET_CHANGEMAP:
+    {   // level list follows the Episode selection live (stock MENU_NETOPTIONS pattern)
+        int const vol = (NetEpisode >= 0 && NetEpisode < MAXVOLUMES) ? NetEpisode : 0;
+        MEO_NET_CFG_LEVEL.options = &MEOS_NETOPTIONS_LEVEL[vol];
+        if (ud.m_level_number < 0 || ud.m_level_number >= MEOS_NETOPTIONS_LEVEL[vol].numOptions)
+            ud.m_level_number = 0;
+        break;
+    }
 #endif
 
     case MENU_OPTIONS:
@@ -4668,39 +4736,21 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
     else if (entry == &ME_SAVESETUP_RESETSTATS)
         Menu_Change(MENU_RESETSTATSVERIFY);
 #endif
+#ifdef NETMENU
+    else if (entry == &ME_NET_CHANGEMAP_GO)
+    {
+        // In-game map change (host only; the root entry is hidden otherwise): same
+        // broadcast+barrier as the lobby launch, so every peer re-enters together.
+        netmenu_relaunch(NetEpisode, ud.m_level_number);
+    }
+#endif
     else if (entry == &ME_NETHOST_LAUNCH)
     {
 #ifdef NETMENU
         // WebRTC host launch. Only the host reaches this entry (hidden for guests via
         // HideOnCondition on s_netMyConnectIndex != 0). Works at any player count.
-        //
-        // No in-menu map picker yet, so launch the shareware start map (E1L1) -- a map
-        // guaranteed to exist, so G_EnterLevel cannot blank on a missing level.
-        // TODO(netcode): drive volume/level from a HOST CONFIG map selector.
-        ud.m_volume_number = (NetEpisode >= 0 && NetEpisode < MAXVOLUMES) ? NetEpisode : 0;
-        // ud.m_level_number is chosen by the HOST CONFIG "Level" selector (ME_NET_CFG_LEVEL).
-        // Multiplayer session setup the stock Net_StartNewGame path implies but this
-        // launch omits. g_netServer is a MACRO (numplayers>1 && host, oldnet.h:71), true
-        // only for the host -- so the host mostly works, but ud.multimode MUST be set for
-        // the guest side (g_netServer is false there), and ud.m_monsters_off MUST be set
-        // or monsters spawn in deathmatch (monster spawn is gated only by ud.monsters_off,
-        // game.cpp:3538). Refs: cmdline.cpp:685 (multimode), game.cpp:6881 (monsters_off),
-        // global.cpp:44 (coop 0 = Deathmatch). No gametype picker yet -> hardcode DM.
-        ud.multimode            = numplayers;
-        g_mostConcurrentPlayers = ud.multimode;
-        ud.m_coop               = 0;   // gametype 0 = Deathmatch (spawn)
-        ud.m_monsters_off       = 1;   // no monsters in deathmatch
-        ud.m_player_skill       = 0;
-        if (numplayers > 1)
-            Net_SendNewGame(0);   // guests enter the same map at tic 0 (reads ud.m_* above)
-        NetMenu_SetInGame(1);     // stop advertising + close the accept gate
-        // Enter the level DIRECTLY, exactly like the single-player New Game path
-        // (G_NewGame_EnterLevel at menus.cpp:4229/4386). The deferred-gm approach set the
-        // flag from this menu-stack handler AFTER the main loop's MODE_NEWGAME check
-        // (game.cpp:7186) had already run for the frame, so the menu closed but the level
-        // never entered -> blank screen. For 2+ players the tic-0 Net_WaitForPlayers
-        // barrier runs as a nested modal loop (pumping net_poll); it no-ops solo.
-        G_NewGame_EnterLevel();
+        // Episode/Level come from the HOST CONFIG selectors (ME_NET_CFG_EPISODE/LEVEL).
+        netmenu_relaunch(NetEpisode, ud.m_level_number);
 #else
         // master does whatever it wants
         if (g_netServer)
@@ -4725,6 +4775,7 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
     {
         s_netMyConnectIndex = 0;           // hosting -> connectindex 0
         netmenu_host();                    // create the advertised match; link advances to the lobby
+        s_netHosting = 1;                  // Change Map (in-game) is host-only while this match lives
     }
     else if (entry == &ME_NET_JOINCODE_CONNECT)
     {
@@ -5968,6 +6019,7 @@ static void Menu_ChangingTo(Menu_t * m)
     case MENU_NET_LOBBY:
         netmenu_browse(0);            // leaving the browser / joined -> release the subscription
         break;
+    case MENU_NET_CHANGEMAP:
     case MENU_NET_HOSTCFG:
         netmenu_pull_grp_labels();    // read DukeNet.getLocalGrp().labels for the read-only display
         {   // point the Level selector at the current episode's map list + clamp the choice
@@ -8832,6 +8884,24 @@ void M_DisplayMenus(void)
     // live-reported "guest sits on the wallpaper while the host waits for players".
     {
         auto &nngm = g_player[myconnectindex].ps->gm;
+#ifdef __EMSCRIPTEN__
+        // Debug/harness surface: expose {open, id} of the menu to the page whenever it
+        // changes. Costs one string eval per menu TRANSITION (not per frame); lets the
+        // headless rig wait for real menu states instead of guessing at timings, and
+        // gives live sessions one more breadcrumb when someone reports a stuck screen.
+        {
+            static int32_t lastExposed = INT32_MIN;
+            int32_t const menuOpen = (nngm & MODE_MENU) ? 1 : 0;
+            int32_t const cur = menuOpen * 1000000 + (int32_t)m_currentMenu->menuID;
+            if (cur != lastExposed)
+            {
+                lastExposed = cur;
+                char scr[96];
+                Bsnprintf(scr, sizeof scr, "window.__e32menu={open:%d,id:%d}", menuOpen, (int)m_currentMenu->menuID);
+                emscripten_run_script(scr);
+            }
+        }
+#endif
 #ifdef NETNATIVE
         net_native_menu_pump(); // apply queued transport -> NetMenu_* updates on the game thread
         // HOST: headless auto-launch (NN_AUTOLAUNCH) or, interactively, ME_NETHOST_LAUNCH does this.
@@ -8865,6 +8935,22 @@ void M_DisplayMenus(void)
             g_mostConcurrentPlayers = ud.multimode;
             NetMenu_SetInGame(1);
             G_NewGame_EnterLevel(); // sets gm = MODE_GAME (clears NEWGAME), premap.cpp:2046
+            return;
+        }
+        // HOST: late joiners. Their peer-up landed while we were IN GAME, so oldnet
+        // only QUEUED them (touching the connect chain under the tic loop starved it
+        // -- the live-reported host freeze). Seat them here, at a safe frame point,
+        // then relaunch the CURRENT map: veterans, joiner and host all re-enter tic 0
+        // together through the same barrier. (Round resets -- state-preserving
+        // snapshot join is the recorded follow-up.)
+        if (g_netLateJoinMask && myconnectindex == connecthead
+            && g_player[myconnectindex].ps != NULL
+            && (g_player[myconnectindex].ps->gm & MODE_GAME))
+        {
+            Net_SeatLateJoiners();
+            initprintf("net: late join -> relaunching E%dL%d for %d players\n",
+                       ud.volume_number + 1, ud.level_number + 1, numplayers);
+            netmenu_relaunch(ud.volume_number, ud.level_number);
             return;
         }
     }

@@ -437,13 +437,14 @@ class DukeNet {
     if (!m || m.role !== "host") return;
     const st = m.status();
     console.log(`[dnet] <- join request from ${peerId.slice(0, 8)} name=${msg.name} (match=${st} guests=${this.slots.size}/${m.maxPlayers - 1})`);
-    // STARTED GATE (must be FIRST): lockstep cannot seat a player mid-session. Before
-    // this gate an in-game host ACCEPTED the join -> Net_PeerEvent grew numplayers
-    // mid-game -> the tic loop waited forever on input from a peer that never entered
-    // the level: host hard-froze right after "<- join request" (live-reported), and the
-    // joiner entered a spectator-camera limbo. Deny + let the joiner return to Browse.
-    if (st !== "open") {
-      console.log(`[dnet] join denied: match already ${st}`);
+    // LATE JOIN is allowed: an in-game host accepts the joiner like any other; the
+    // ENGINE defers the seat to a safe frame point (oldnet queues the peer-up, the
+    // host relaunches the current map so everyone re-enters tic 0 together). The
+    // old behavior -- attaching straight into the running tic loop -- hard-froze
+    // the host right after "<- join request" (live-reported). "starting" is the
+    // only refused window (mid-handoff).
+    if (st === "starting") {
+      console.log(`[dnet] join denied: match is mid-launch`);
       m.peers.sendControl(peerId, { t: "join_deny", reason: "started" } as Ctl);
       setTimeout(() => m.peers.close(peerId), 300); // deny flushed -> drop the pair
       return;
