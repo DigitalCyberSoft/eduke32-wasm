@@ -1042,6 +1042,11 @@ static void Net_RebuildConnectChain(void)
 // Net_SeatLateJoiners() from the host's late-join relaunch (menus.cpp).
 int32_t g_netLateJoinMask = 0;
 
+// Set when the HOST's peer goes down on a guest. Consumed by the menus.cpp
+// NETMENU block: tear the match down and return to the MAIN MENU instead of
+// starving the tic loop (or silently soloing the map).
+int32_t g_netHostGone = 0;
+
 // Seat every queued late joiner (menus.cpp consumer calls this at a safe frame
 // point, right before relaunching the current map).
 void Net_SeatLateJoiners(void)
@@ -1072,6 +1077,9 @@ void Net_PeerEvent(int peerToken, int eventType)
         initprintf("net: late join queued for slot %d (relaunch pending)\n", peerToken);
         return;
     }
+
+    if (eventType == NET_PEER_DOWN && peerToken == connecthead && myconnectindex != connecthead)
+        g_netHostGone = 1; // guest lost its host -> menus.cpp consumer exits to the main menu
 
     g_player[peerToken].connected = (eventType == NET_PEER_UP) ? 1 : 0;
     Net_RebuildConnectChain();

@@ -9039,6 +9039,30 @@ void M_DisplayMenus(void)
             netmenu_relaunch(ud.volume_number, ud.level_number);
             return;
         }
+        // GUEST: the host vanished (peer-down on connecthead). Tear the match down
+        // and land on the MAIN MENU -- the alternative was starving the tic loop
+        // until the disconnect timeout and then silently continuing SOLO in the map.
+        if (g_netHostGone)
+        {
+            // NOTE: no "am I a guest" re-check here -- the peer-down's chain rebuild
+            // already promoted the surviving guest to connecthead by this point. The
+            // flag is only ever set on guests at event time; trust it.
+            g_netHostGone = 0;
+            {
+                initprintf("net: host left -> returning to the main menu\n");
+                netmenu_leave();          // transport teardown (JS/native)
+                NetMenu_SetInGame(0);
+                Net_ClearFIFO();          // lockstep state gone with the session
+                for (int k = 0; k < MAXPLAYERS; k++)
+                    g_player[k].connected = 0;
+                g_player[0].connected = 1; // back to a clean solo identity
+                myconnectindex = screenpeek = 0;
+                Net_SeatLateJoiners();     // mask is 0: just rebuilds the chain cleanly
+                NetMenu_SetStatus("!Host left the game");
+                G_BackToMenu();
+                return;
+            }
+        }
     }
 #endif
 
