@@ -38,4 +38,9 @@ void net_transport_shutdown(void)
     // no-op
 }
 
+void net_kick(int /*peerToken*/)
+{
+    // no-op: no wire attached
+}
+
 }  // extern "C"

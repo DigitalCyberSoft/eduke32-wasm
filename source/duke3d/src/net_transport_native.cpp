@@ -360,6 +360,22 @@ public:
             pm_->sendNet(d, channel, reinterpret_cast<const uint8_t *>(data), (size_t)len);
     }
 
+    // Host: tear down one peer's pair after the netcode excised them (timeout /
+    // kick). Their side sees a normal disconnect and returns to its menu.
+    void kick(int token)
+    {
+        std::string dev;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = tokenToDevice_.find(token);
+            if (it == tokenToDevice_.end())
+                return;
+            dev = it->second;
+        }
+        nnlog("kick: closing peer token=" + std::to_string(token));
+        pm_->close(dev);
+    }
+
     // ── seam: net_poll drains to the netcode (game thread) ───────────────────
     void poll()
     {
@@ -1034,6 +1050,12 @@ void net_poll(void)
 {
     if (g_t)
         g_t->poll();
+}
+
+void net_kick(int peerToken)
+{
+    if (g_t)
+        g_t->kick(peerToken);
 }
 
 // ── Engine helpers (used by the native launch trigger; see game.cpp) ─────────

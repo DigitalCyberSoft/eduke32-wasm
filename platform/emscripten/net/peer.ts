@@ -29,6 +29,20 @@ const MAX_BACKOFF_MS = 60_000;
 const RESEND_INTERVAL_MS = 1200;
 const RESEND_MAX = 12; // ~14 s of resends before deferring to _scheduleReconnect
 
+// Test-harness fault injection for the duke-move channel (see sendNet). Parsed
+// once; 0/absent = disabled (the production default).
+function _numParam(name: string): number {
+  try {
+    if (typeof location === "undefined") return 0;
+    const v = Number(new URLSearchParams(location.search).get(name));
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  } catch {
+    return 0;
+  }
+}
+const TEST_MOVE_LOSS = _numParam("lossmove"); // percent of move frames to drop
+const TEST_MOVE_JITTER = _numParam("jitmove"); // max ms of random delay (reorders)
+
 interface Conn {
   pc: RTCPeerConnection;
   dcs: Map<DcLabel, RTCDataChannel>;
@@ -277,7 +291,25 @@ export class PeerManager {
     const dc = this._dc(peerId, label);
     if (!dc) return false;
     try {
-      dc.send(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+      const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+      // TEST HARNESS ONLY (?lossmove=<pct>&jitmove=<ms>): synthetic loss/reorder
+      // on the duke-move channel, so the tic-indexed protocol's repair paths can
+      // be soaked on a loopback bench where the real wire never drops anything.
+      // Loopback DCs are lossless, so without this the loss tolerance the
+      // protocol exists for would ship untested.
+      if (channel === 0 && (TEST_MOVE_LOSS > 0 || TEST_MOVE_JITTER > 0)) {
+        if (TEST_MOVE_LOSS > 0 && Math.random() * 100 < TEST_MOVE_LOSS) return true; // "sent" (dropped)
+        if (TEST_MOVE_JITTER > 0 && Math.random() < 0.5) {
+          const delay = Math.random() * TEST_MOVE_JITTER;
+          setTimeout(() => {
+            try {
+              if (dc.readyState === "open") dc.send(buf);
+            } catch { /* channel died while delayed: same as a drop */ }
+          }, delay);
+          return true;
+        }
+      }
+      dc.send(buf);
       return true;
     } catch {
       return false;

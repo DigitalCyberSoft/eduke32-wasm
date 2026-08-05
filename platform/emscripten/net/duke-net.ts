@@ -132,6 +132,23 @@ class DukeNet {
   readonly _seamDrain = () => this.seam.drain();
   readonly _seamInit = () => this.seam.init();
   readonly _seamShutdown = () => this.seam.shutdown();
+  readonly _seamKick = (peerToken: number) => this.kickPeer(peerToken);
+
+  /** HOST: tear down one seated peer's pair. Called by the engine (net_kick)
+   *  after it has deterministically excised that player (timeout/disconnect
+   *  drop). A courtesy {t:'kick'} rides ahead so a live-but-lagging client shows
+   *  a reason instead of a bare connection loss. */
+  kickPeer(peerToken: number): void {
+    const m = this.match;
+    if (!m || m.role !== "host") return;
+    const dev = this.seam.deviceOf(peerToken);
+    if (!dev) return;
+    console.log(`[dnet] kick: dropping peer token=${peerToken} (${dev.slice(0, 8)})`);
+    m.peers.sendControl(dev, { t: "kick", reason: "dropped from the match (connection)" } as Ctl);
+    this.seam.unregisterPeer(dev);
+    this.slots.delete(dev);
+    setTimeout(() => this.match?.peers.close(dev), 300); // let the notice flush, then drop
+  }
 
   constructor() {
     // The seam's actual wire send: resolve deviceId -> the peer's data channel.
@@ -140,6 +157,37 @@ class DukeNet {
     if (nm) this.myName = sanitizeName(nm);
     const ad = safeLocalGet("eduke32-net-allow-dl");
     if (ad === "0") this.allowDownload = false;
+
+    // Backgrounded GUEST tab: the wasm main loop throttles to a crawl, which
+    // would drag the whole lockstep down (or zombie at ~1 tic/s under the
+    // host's rate monitor). After a short grace, leave the match cleanly: close
+    // the host pair (host drops the seat within a tic) and queue the host-down
+    // event locally so the engine exits to the menu the moment the tab resumes.
+    // The HOST is exempt: hiding the host ends the match for everyone anyway,
+    // and each guest's own host-silence watchdog already covers that.
+    if (typeof document !== "undefined") {
+      let hiddenTimer: ReturnType<typeof setTimeout> | null = null;
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) {
+          if (hiddenTimer) { clearTimeout(hiddenTimer); hiddenTimer = null; }
+          return;
+        }
+        if (hiddenTimer || !this.match || this.match.role !== "guest") return;
+        const inGame = () => ((window as any).__e32menu?.game | 0) === 1;
+        if (!inGame()) return;
+        hiddenTimer = setTimeout(() => {
+          hiddenTimer = null;
+          const m = this.match;
+          if (!document.hidden || !m || m.role !== "guest" || !inGame()) return;
+          console.log("[dnet] tab hidden >5s in-game: leaving the match");
+          const hostId = m.hostId;
+          if (hostId) {
+            this.seam.enqueuePeerEventByDevice(hostId, false); // engine sees host-down on resume
+            m.peers.close(hostId);
+          }
+        }, 5000);
+      });
+    }
   }
 
   // ── Config ─────────────────────────────────────────────────────────────────

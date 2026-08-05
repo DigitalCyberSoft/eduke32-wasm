@@ -32,7 +32,7 @@ extern "C" {
 
 extern int32_t g_mostConcurrentPlayers;
 
-#define MOVEFIFOSIZ                 2
+#define MOVEFIFOSIZ                 256  // lockstep input ring depth; keep equal to duke3d.h's copy
 
 #define NAM_GRENADE_LIFETIME        120
 #define NAM_GRENADE_LIFETIME_VAR    30

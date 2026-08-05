@@ -62,6 +62,13 @@ mergeInto(LibraryManager.library, {
     }
   },
 
+  // C: void net_kick(int peerToken) — host tears down one peer's pair after the
+  // netcode excised that player (timeout / drop). No-op when no wire attached.
+  net_kick: function (peerToken) {
+    var DN = typeof window !== "undefined" ? window.DukeNet : undefined;
+    if (DN && DN._seamKick) DN._seamKick(peerToken | 0);
+  },
+
   // C: void net_transport_init(void)
   net_transport_init: function () {
     var DN = typeof window !== "undefined" ? window.DukeNet : undefined;

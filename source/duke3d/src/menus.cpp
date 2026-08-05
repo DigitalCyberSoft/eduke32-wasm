@@ -8971,7 +8971,7 @@ void M_DisplayMenus(void)
             {
                 lastExposed = cur;
                 lastEmitClock = (int32_t)totalclock;
-                char scr[512];
+                char scr[576];
                 // p0/p1: player positions (>>8) -- input-routing diagnosis: if both
                 // move in lockstep with one player's input, the input fanout is wrong.
                 int32_t p0x = 0, p0y = 0, p1x = 0, p1y = 0, p1z = 0, p1a = 0;
@@ -8985,7 +8985,7 @@ void M_DisplayMenus(void)
                 }
                 extern int32_t g_netPumpCalls, g_netGateC1, g_netGateC2, g_mainLoopIter, g_demoLoopIter;
                 Bsnprintf(scr, sizeof scr,
-                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d,%d,%d],o1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d,in:[%d,%d],ap1:[%d,%d,%d],gate1:[%d,%d,%d],snr:%d,ep:%d,epd:%d,sc:%d}",
+                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d,%d,%d],o1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d,in:[%d,%d],ap1:[%d,%d,%d],gate1:[%d,%d,%d],snr:%d,ep:%d,epd:%d,sc:%d,du:%d,gp:%d,st:%d}",
                           menuOpen, (int)m_currentMenu->menuID, inGame, (int)nngm,
                           (int)numplayers, (int)myconnectindex, (g_foundSyncError || Net_SyncErrorDetected()) ? 1 : 0, (int)sel,
                           p0x, p0y, p1x, p1y, p1z, p1a, o1x, o1y,
@@ -9002,7 +9002,9 @@ void M_DisplayMenus(void)
                           (int)g_player[1].playerquitflag,
                           (int)g_netSnapshotReady,
                           (int)g_netMoveEpoch, (int)g_netEpochDrops,
-                          (int)(({ extern int32_t g_netSyncCompares; g_netSyncCompares; }) % 1000000));
+                          (int)(({ extern int32_t g_netSyncCompares; g_netSyncCompares; }) % 1000000),
+                          (int)(g_netDupTics % 1000000), (int)(g_netGapDrops % 1000000),
+                          g_netStallSince ? 1 : 0);
                 // NEVER eval a truncated script: Bsnprintf cuts mid-expression, the
                 // SyntaxError unwinds through callUserCallback -> doRewind and KILLS
                 // the ASYNCIFY resume -- the engine hard-freezes while the page stays
@@ -9060,6 +9062,12 @@ void M_DisplayMenus(void)
             && g_player[myconnectindex].ps != NULL
             && (g_player[myconnectindex].ps->gm & MODE_GAME))
         {
+            // Fold any pending disconnect drops into the roster FIRST: the seat
+            // mask and the snapshot both embed the roster, and a dead peer must
+            // not be seated into (or ghost-statue inside) the new session.
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+            Net_FlushPendingDrops();
+#endif
             for (int k = 0; k < MAXPLAYERS; k++)
                 if (g_netLateJoinMask & (1 << k))
                     Net_InsertLatePlayer(k);

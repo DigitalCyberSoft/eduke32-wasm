@@ -337,6 +337,319 @@ void Net_GetPlayerInputFromPacket(int* j, int playerNum, input_t* osyn, input_t*
 
 void faketimerhandler(void) { };
 
+// ===========================================================================
+// TIC-INDEXED LOSS-TOLERANT MOVE PROTOCOL (transport track)
+//
+// The stock NetDuke32 M2S/S2M packets are one-tic delta codes with NO sequence
+// numbers: they assume a lossless in-order link (COMMIT), so one dropped or
+// reordered datagram shifts the delta stream and corrupts every later input.
+// The transport-track replacement makes every move packet SELF-CONTAINED:
+//
+//   S2M: [type][epoch][startTic i32][count u8][ackTic i32]
+//        count x input records for the sending slave (record 0 deltas against
+//        ZERO-INPUT, each next against the previous record -> absolute content,
+//        delta-compact encoding)
+//        [sync CRC block, unchanged format]
+//
+//   M2S: [type][epoch][startTic i32][count u8][playerCount u8][destAck i32]
+//        playerCount x directory entries [slot | 0x80 if dropped][minlag i8]
+//                                        [goneTic i32 when flagged]
+//        count x tics, each = records for every listed player still present at
+//        that tic (per-player delta chains, zero-based like S2M)
+//        [sync CRC block]
+//
+// Each packet re-sends EVERYTHING from the receiver's last acknowledged tic
+// (acks ride every packet in the opposite direction), capped by NET_TICWIN_CAP
+// and NET_BYTE_BUDGET. So the move channel runs UNRELIABLE/UNORDERED:
+//   * loss inside the window costs nothing (the next packet re-carries it),
+//   * reorder is dedup'd by absolute tic index (g_netDupTics counts it),
+//   * a burst that outruns the window stalls the ack, which widens the next
+//     window back to the ack -- an automatic repair resend from the input ring
+//     (MOVEFIFOSIZ=256 tics of history; the local sampler stops at +100).
+// The M2S directory doubles as the AUTHORITATIVE roster: a dropped player is
+// flagged with the first tic they are absent from (goneTic), and every peer
+// excises them at exactly that tic (Net_ApplyPendingDrops). Voluntary quits
+// keep the classic in-band SK_GAMEQUIT path (Net_ConsumeQuitInputs), which is
+// deterministic for free because every peer consumes the same input stream.
+// ===========================================================================
+
+input_t g_netStagedInput;   // MP local input staging (see dukeFillInputForTic)
+
+int32_t g_netDupTics    = 0;  // redundant tic records ignored (proof repair ran)
+int32_t g_netGapDrops   = 0;  // packets whose window started past our high-water
+int32_t g_netStallSince = 0;  // consume-gate stall start (G_MoveLoop), 0 = flowing
+int32_t g_netStallMask  = 0;  // players the consume gate is waiting on
+
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+
+enum
+{
+    NET_BYTE_BUDGET = 1360,  // soft size ceiling before the sync block
+    NET_KEEPALIVE   = 12,    // master resend/keepalive cadence, totalclock (~100ms)
+    NET_STALL_DROP  = 1200,  // master: continuous stall on one WARMED peer ->
+                             // drop (10s). Not tighter: alt-tab throttling and
+                             // GC pauses produce multi-second silences from
+                             // perfectly alive peers, deliberate backgrounding
+                             // is reaped faster by the visibility auto-leave
+                             // (5s), and true deaths by transport peer-down.
+    NET_JOIN_GRACE  = 7200,  // 60s limit while a peer is WARMING UP: fewer than
+                             // NET_WARM_TICS delivered inside the session's
+                             // first 60s. A joiner loads for many seconds after
+                             // its interior-barrier READY already released the
+                             // master (Net_WaitForServer maps onto the barrier),
+                             // then hitches for seconds more on first render --
+                             // soak-caught twice: the short axe kicked every
+                             // rejoiner either mid-load or mid-warm-up.
+    NET_WARM_TICS   = 120,   // delivered tics that end a peer's warm-up early
+    NET_RATE_WIN    = 960,   // master: zombie-rate sample window (8s)
+    NET_RATE_MIN    = 60,    // master: fewer tics than this per window -> drop
+    NET_HOST_SILENT = 1200,  // guest: nothing from the host at all -> host gone (10s)
+};
+
+static input_t const s_zeroInput = {};
+
+// Per-peer protocol state (indexed by connectindex). Reset in Net_ClearFIFO.
+static int32_t s_ackOfMyInput;                  // slave: master's high-water of MY input
+static int32_t s_slaveAck[MAXPLAYERS];          // master: each slave's ack of the aggregate stream
+static int32_t s_lastSendClock[MAXPLAYERS];     // master: last M2S clock per slave (keepalive)
+static int32_t s_goneTic[MAXPLAYERS];           // >= 0: first tic WITHOUT this player; -1 = active
+static int32_t s_goneAnnounceUntil[MAXPLAYERS]; // master keeps flagging the drop until this clock
+// s_goneTic's "no drop" sentinel is -1, but static storage zero-initializes --
+// and 0 is a VALID drop boundary. Net_ResetProtocolState fixes the array, but it
+// first runs inside Net_ClearFIFO, which is AFTER Net_FlushPendingDrops consults
+// the array at the first barrier: the zero-init read as "drop everyone at tic 0"
+// and the host silently unseated every guest at first launch (soak-caught).
+static struct GoneTicInit { GoneTicInit() { for (auto &t : s_goneTic) t = -1; } } s_goneTicInit;
+static int32_t s_stallSince[MAXPLAYERS];        // master: when aggregation first blocked on peer
+static int32_t s_rateClock[MAXPLAYERS], s_rateEnd[MAXPLAYERS]; // master: zombie-rate monitor
+static int32_t s_peerDownMask;                  // mid-game transport peer-downs, folded into drops
+
+static int32_t s_sessionStartClock;  // stamped at every barrier (warm-up window)
+
+static void Net_ResetProtocolState(void)
+{
+    g_netStagedInput = {};
+    s_ackOfMyInput   = 0;
+    s_peerDownMask   = 0;
+    g_netStallSince = g_netStallMask = 0;
+    s_sessionStartClock = (int32_t)totalclock;
+    for (int i = 0; i < MAXPLAYERS; i++)
+    {
+        s_slaveAck[i] = s_lastSendClock[i] = 0;
+        s_goneTic[i]  = -1;
+        s_goneAnnounceUntil[i] = 0;
+        s_stallSince[i] = 0;
+        s_rateClock[i] = s_rateEnd[i] = 0;
+    }
+}
+
+// Absolute-position input codec: same per-field flag layout as
+// Net_AddPlayerInputToPacket, but against an EXPLICIT base and with no side
+// effects, so records chain inside one self-contained packet.
+static int Net_WriteInputDelta(char *pbuf, int j, input_t const *base, input_t const *cur)
+{
+    int const inputFlagsPos = j++;
+    int const extFlagsPos   = j++;
+    pbuf[inputFlagsPos] = 0;
+    pbuf[extFlagsPos]   = 0;
+
+    if (cur->fvel != base->fvel)       { B_BUF16(&pbuf[j], cur->fvel);    j += 2; pbuf[inputFlagsPos] |= 1; }
+    if (cur->svel != base->svel)       { B_BUF16(&pbuf[j], cur->svel);    j += 2; pbuf[inputFlagsPos] |= 2; }
+    if (cur->q16avel != base->q16avel) { B_BUF32(&pbuf[j], cur->q16avel); j += 4; pbuf[inputFlagsPos] |= 4; }
+    if (cur->q16horz != base->q16horz) { B_BUF32(&pbuf[j], cur->q16horz); j += 4; pbuf[inputFlagsPos] |= 8; }
+
+    uint32_t const bx = cur->bits ^ base->bits;
+    if (bx & 0x000000ffu) pbuf[j++] = (char)(cur->bits & 255),         pbuf[inputFlagsPos] |= 16;
+    if (bx & 0x0000ff00u) pbuf[j++] = (char)((cur->bits >> 8) & 255),  pbuf[inputFlagsPos] |= 32;
+    if (bx & 0x00ff0000u) pbuf[j++] = (char)((cur->bits >> 16) & 255), pbuf[inputFlagsPos] |= 64;
+    if (bx & 0xff000000u) pbuf[j++] = (char)((cur->bits >> 24) & 255), pbuf[inputFlagsPos] |= 128;
+
+    uint32_t const ex = cur->extbits ^ base->extbits;
+    if (ex & 0x000000ffu) pbuf[j++] = (char)(cur->extbits & 255),         pbuf[extFlagsPos] |= 1;
+    if (ex & 0x0000ff00u) pbuf[j++] = (char)((cur->extbits >> 8) & 255),  pbuf[extFlagsPos] |= 2;
+    if (ex & 0x00ff0000u) pbuf[j++] = (char)((cur->extbits >> 16) & 255), pbuf[extFlagsPos] |= 4;
+    if (ex & 0xff000000u) pbuf[j++] = (char)((cur->extbits >> 24) & 255), pbuf[extFlagsPos] |= 8;
+
+    return j;
+}
+
+static int Net_ReadInputDelta(char const *pbuf, int j, input_t const *base, input_t *out)
+{
+    char const inputFlags = pbuf[j++];
+    char const extFlags   = pbuf[j++];
+
+    *out = *base;
+
+    if (inputFlags & 1) { out->fvel    = (int16_t)B_UNBUF16(&pbuf[j]); j += 2; }
+    if (inputFlags & 2) { out->svel    = (int16_t)B_UNBUF16(&pbuf[j]); j += 2; }
+    if (inputFlags & 4) { out->q16avel = (fix16_t)B_UNBUF32(&pbuf[j]); j += 4; }
+    if (inputFlags & 8) { out->q16horz = (fix16_t)B_UNBUF32(&pbuf[j]); j += 4; }
+
+    if (inputFlags & 16)  out->bits = (out->bits & 0xffffff00u) | (uint8_t)pbuf[j++];
+    if (inputFlags & 32)  out->bits = (out->bits & 0xffff00ffu) | ((uint32_t)(uint8_t)pbuf[j++] << 8);
+    if (inputFlags & 64)  out->bits = (out->bits & 0xff00ffffu) | ((uint32_t)(uint8_t)pbuf[j++] << 16);
+    if (inputFlags & 128) out->bits = (out->bits & 0x00ffffffu) | ((uint32_t)(uint8_t)pbuf[j++] << 24);
+
+    if (extFlags & 1) out->extbits = (out->extbits & 0xffffff00u) | (uint8_t)pbuf[j++];
+    if (extFlags & 2) out->extbits = (out->extbits & 0xffff00ffu) | ((uint32_t)(uint8_t)pbuf[j++] << 8);
+    if (extFlags & 4) out->extbits = (out->extbits & 0xff00ffffu) | ((uint32_t)(uint8_t)pbuf[j++] << 16);
+    if (extFlags & 8) out->extbits = (out->extbits & 0x00ffffffu) | ((uint32_t)(uint8_t)pbuf[j++] << 24);
+
+    return j;
+}
+
+// Master: schedule an involuntary drop. The boundary is the first un-aggregated
+// tic; every already-broadcast tic before it includes the player, so every peer
+// can excise at exactly this tic.
+static void Net_ScheduleDrop(int i, const char *why)
+{
+    if (s_goneTic[i] >= 0)
+        return;
+    s_goneTic[i] = movefifosendplc;
+    s_goneAnnounceUntil[i] = (int32_t)totalclock + 600;
+    initprintf("net: dropping player %d (%s) at tic %d\n", i, why, movefifosendplc);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('[eng] scheduleDrop p=' + $0 + ' tic=' + $1 + ' why=' + UTF8ToString($2)); },
+           i, movefifosendplc, why);
+#endif
+}
+
+// Receiver: the master flagged this player gone from `tic` on. Rides every M2S
+// until the master stops announcing; idempotent.
+static void Net_ScheduleDropFromWire(int slot, int32_t tic)
+{
+    if ((unsigned)slot >= MAXPLAYERS || s_goneTic[slot] >= 0)
+        return;
+    s_goneTic[slot] = tic;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('[eng] dropFromWire p=' + $0 + ' tic=' + $1); }, slot, tic);
+#endif
+}
+
+// Master health monitor: fold transport peer-downs, continuous stalls, and
+// zombie delivery rates (background-throttled tabs) into deterministic drops.
+static void Net_CheckPeerHealth(void)
+{
+    if (myconnectindex != connecthead || g_player[myconnectindex].ps == NULL
+        || !(g_player[myconnectindex].ps->gm & MODE_GAME))
+        return;
+
+    int32_t const now = (int32_t)totalclock;
+    int i;
+    TRAVERSE_CONNECT(i)
+    {
+        if (i == myconnectindex || s_goneTic[i] >= 0)
+            continue;
+
+        if (s_peerDownMask & (1 << i)) { Net_ScheduleDrop(i, "connection lost"); continue; }
+
+        // totalclock resets (level transitions) restart the monitors
+        if (s_stallSince[i] > now) s_stallSince[i] = 0;
+        if (s_rateClock[i] > now)  s_rateClock[i] = 0;
+
+        // A peer still WARMING UP -- loading or in its first hitchy seconds of
+        // play right after a barrier -- is not dead: it gets the long limit,
+        // and the zombie-rate monitor stays off until it has proven itself.
+        if (s_sessionStartClock > now)   // totalclock reset
+            s_sessionStartClock = now;
+        bool const warming = (g_player[i].movefifoend < NET_WARM_TICS)
+                             && (now - s_sessionStartClock < NET_JOIN_GRACE);
+        int32_t const stallLimit = warming ? NET_JOIN_GRACE : NET_STALL_DROP;
+
+        if (s_stallSince[i] && now - s_stallSince[i] > stallLimit)
+        {
+#ifdef __EMSCRIPTEN__
+            EM_ASM({ console.log('[eng] stalldrop p=' + $0 + ' now=' + $1 + ' since=' + $2 + ' lim=' + $3 + ' end=' + $4); },
+                   i, now, s_stallSince[i], stallLimit, g_player[i].movefifoend);
+#endif
+            Net_ScheduleDrop(i, "timed out"); continue;
+        }
+
+        if (warming)
+        { s_rateClock[i] = 0; continue; }
+
+        if (s_rateClock[i] == 0)
+        { s_rateClock[i] = now; s_rateEnd[i] = g_player[i].movefifoend; }
+        else if (now - s_rateClock[i] >= NET_RATE_WIN)
+        {
+            if (g_player[i].movefifoend - s_rateEnd[i] < NET_RATE_MIN)
+            { Net_ScheduleDrop(i, "connection too slow"); continue; }
+            s_rateClock[i] = now;
+            s_rateEnd[i]   = g_player[i].movefifoend;
+        }
+    }
+    s_peerDownMask = 0;  // folded
+}
+
+// Build one tailored MASTER_TO_SLAVE packet for `dest`: everything from that
+// slave's ack (capped) up to the aggregation cursor, plus the roster directory
+// with drop boundaries and the pre-captured sync block. Length returned.
+static int Net_BuildMasterPacket(int dest, int32_t start, char const *syncBlk, int syncLen)
+{
+    int32_t const end = movefifosendplc;
+    packbuf[0] = PACKET_TYPE_MASTER_TO_SLAVE;
+    packbuf[1] = (char)g_netMoveEpoch;
+    int j = 2;
+    B_BUF32(&packbuf[j], start); j += 4;
+    int const countPos  = j++;
+    int const pcountPos = j++;
+    B_BUF32(&packbuf[j], g_player[dest].movefifoend); j += 4;  // ack of dest's own inputs
+
+    // Roster directory: the live chain plus recently-dropped players, so their
+    // pre-drop records still decode in repair windows and the drop boundary
+    // itself is redundant across packets.
+    int listed[MAXPLAYERS], nlisted = 0;
+    int i;
+    TRAVERSE_CONNECT(i)
+        listed[nlisted++] = i;
+    for (i = 0; i < MAXPLAYERS; i++)
+        if (s_goneTic[i] >= 0 && !g_player[i].connected && (int32_t)totalclock < s_goneAnnounceUntil[i])
+            listed[nlisted++] = i;
+
+    input_t const *bases[MAXPLAYERS];
+    for (int k = 0; k < nlisted; k++)
+    {
+        int const p = listed[k];
+        packbuf[j++] = (char)(p | (s_goneTic[p] >= 0 ? 0x80 : 0));
+        packbuf[j++] = (char)min(max(g_player[p].myminlag, -128), 127);
+        if (s_goneTic[p] >= 0) { B_BUF32(&packbuf[j], s_goneTic[p]); j += 4; }
+        bases[p] = &s_zeroInput;
+    }
+
+    int32_t built = 0;
+    for (int32_t t = start; t < end && built < 255; t++)
+    {
+        int const savej = j;
+        input_t const *savedBases[MAXPLAYERS];
+        for (int k = 0; k < nlisted; k++) savedBases[listed[k]] = bases[listed[k]];
+
+        for (int k = 0; k < nlisted; k++)
+        {
+            int const p = listed[k];
+            if (s_goneTic[p] >= 0 && t >= s_goneTic[p])
+                continue;   // gone from this tic on: no record
+            input_t const *cur = &inputfifo[t & (MOVEFIFOSIZ - 1)][p];
+            j = Net_WriteInputDelta(packbuf, j, bases[p], cur);
+            bases[p] = cur;
+        }
+        if (j > NET_BYTE_BUDGET)
+        {   // revert the partial tic; the remainder rides the next packet
+            j = savej;
+            for (int k = 0; k < nlisted; k++) bases[listed[k]] = savedBases[listed[k]];
+            break;
+        }
+        built++;
+    }
+    packbuf[countPos]  = (char)built;
+    packbuf[pcountPos] = (char)nlisted;
+
+    Bmemcpy(&packbuf[j], syncBlk, syncLen);
+    j += syncLen;
+    return j;
+}
+
+#endif  // transport track
+
 int32_t g_netPumpCalls = 0; // debug surface: proves the input pump runs
 int32_t g_netGateC1 = 0, g_netGateC2 = 0; // main-loop gate probes (game.cpp)
 int32_t g_mainLoopIter = 0;  // app_main do-loop residency (game.cpp)
@@ -357,6 +670,197 @@ void Net_HandleInput(void)
 
     Net_GetPackets();
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    (void)osyn;  // used only by the stock one-tic protocol in the #else branch
+    // ── Tic-indexed protocol (see the wire-format comment above) ─────────────
+    // A capped sampler must STILL send/aggregate: acks and repair windows ride
+    // every packet, and stopping them deadlocks a peer that is waiting on a
+    // resend (the stock early-return here starved exactly that).
+    bool const capped = (g_player[myconnectindex].movefifoend - movefifoplc >= 100);
+
+    if (!capped)
+    {
+        // Put our local input into the FIFO to be processed by P_ProcessInput and such.
+        nsyn  = &inputfifo[g_player[myconnectindex].movefifoend & (MOVEFIFOSIZ - 1)][myconnectindex];
+        *nsyn = netInput;
+        g_player[myconnectindex].movefifoend++;
+    }
+
+    if (numplayers < 2)
+        return;
+
+    TRAVERSE_CONNECT(i)
+    if (i != myconnectindex)
+    {
+        int32_t const lag = (g_player[myconnectindex].movefifoend - 1) - g_player[i].movefifoend;
+        g_player[i].myminlag = min(g_player[i].myminlag, lag);
+        mymaxlag = max(mymaxlag, lag);
+    }
+
+    if (!capped && ((g_player[myconnectindex].movefifoend - 1) & (TIMERUPDATESIZ - 1)) == 0)
+    {
+        i = mymaxlag - bufferjitter;
+        mymaxlag = 0;
+        if (i > 0)
+            bufferjitter += ((2 + i) >> 2);
+        else if (i < 0)
+            bufferjitter -= ((2 - i) >> 2);
+    }
+
+    if (myconnectindex != connecthead)   // ── SLAVE ──
+    {
+        // Host silence watchdog: a host that stops sending entirely (crash,
+        // pulled cable AND dead transport events) ends the match gracefully.
+        {
+            int32_t const now = (int32_t)totalclock;
+            if (lastpackettime > now)   // totalclock reset (level transition)
+                lastpackettime = now;
+            if (g_player[myconnectindex].ps != NULL
+                && (g_player[myconnectindex].ps->gm & MODE_GAME)
+                && now - lastpackettime > NET_HOST_SILENT)
+                g_netHostGone = 1;
+        }
+
+        //Fix timers and buffer/jitter value
+        if (!capped && ((g_player[myconnectindex].movefifoend-1)&(TIMERUPDATESIZ-1)) == 0)
+        {
+            // [JM] I wish this wasn't so fucking cryptic.
+            i = g_player[connecthead].myminlag - otherminlag;
+            if (klabs(i) > 2)
+            {
+                if (klabs(i) > 8)
+                {
+                    if (i < 0)
+                        i++;
+                    i >>= 1;
+                }
+                else
+                {
+                    if (i < 0)
+                        i = -1;
+                    if (i > 0)
+                        i = 1;
+                }
+                totalclock -= TICSPERFRAME * i;
+                otherminlag += i;
+            }
+
+            TRAVERSE_CONNECT(i)
+            {
+                g_player[i].myminlag = 0x7fffffff;
+            }
+        }
+
+        // Window: everything the master has not acked, newest tic always
+        // included. NEVER clamp the start past the ack: a receiver behind by
+        // more than any fixed cap could then never repair (soak-caught as an
+        // endless g_netGapDrops wedge). The byte budget below bounds each
+        // packet; successive packets converge any backlog, and the sampler's
+        // +100 runahead cap keeps every reachable tic inside the 256-tic ring.
+        int32_t const myEnd = g_player[myconnectindex].movefifoend;
+        int32_t start = s_ackOfMyInput;
+        if (start < 0) start = 0;
+        if (start >= myEnd) start = myEnd - 1;
+
+        packbuf[0] = PACKET_TYPE_SLAVE_TO_MASTER;
+        packbuf[1] = (char)g_netMoveEpoch;
+        j = 2;
+        B_BUF32(&packbuf[j], start); j += 4;
+        int const countPos = j++;
+        B_BUF32(&packbuf[j], movefifosendplc); j += 4;  // ack: contiguous master tics applied
+
+        input_t const *base = &s_zeroInput;
+        int32_t built = 0;
+        for (int32_t t = start; t < myEnd && built < 255; t++)
+        {
+            input_t const *cur = &inputfifo[t & (MOVEFIFOSIZ - 1)][myconnectindex];
+            int const nj = Net_WriteInputDelta(packbuf, j, base, cur);
+            if (nj > NET_BYTE_BUDGET)
+                break;
+            j = nj;
+            base = cur;
+            built++;
+        }
+        packbuf[countPos] = (char)built;
+
+        Net_AddSyncInfoToPacket(&j);
+        oldnet_sendpacket(connecthead, (unsigned char *)packbuf, j);
+        return;
+    }
+
+    // ── MASTER ──
+    Net_CheckPeerHealth();
+
+    // Aggregate: advance over tics every still-required peer has provided.
+    for (;;)
+    {
+        int32_t blockMask = 0;
+        TRAVERSE_CONNECT(i)
+            if ((s_goneTic[i] < 0 || movefifosendplc < s_goneTic[i])
+                && g_player[i].movefifoend <= movefifosendplc)
+                blockMask |= (1 << i);
+
+        if (blockMask)
+        {
+            int32_t const now = (int32_t)totalclock;
+            TRAVERSE_CONNECT(i)
+            {
+                if (blockMask & (1 << i))
+                {
+                    if (!s_stallSince[i] || s_stallSince[i] > now)
+                        s_stallSince[i] = now;
+                }
+                else
+                    s_stallSince[i] = 0;
+            }
+            break;
+        }
+        TRAVERSE_CONNECT(i)
+            s_stallSince[i] = 0;
+
+        if ((movefifosendplc & (TIMERUPDATESIZ - 1)) == 0)
+            TRAVERSE_CONNECT(i)
+                g_player[i].myminlag = 0x7fffffff;
+
+        movefifosendplc++;
+    }
+
+    // Capture this tic's sync block ONCE; every tailored packet carries the
+    // same bytes (Net_AddSyncInfoToPacket dedups by lastSyncTick, so calling it
+    // per-packet would starve all slaves but the first).
+    char syncBlk[8 + MAX_SYNC_TYPES];
+    int  syncLen = 0;
+    Net_AddSyncInfoToPacket(&syncLen);
+    Bmemcpy(syncBlk, packbuf, syncLen);
+
+    TRAVERSE_CONNECT(i)
+    {
+        if (i == myconnectindex)
+            continue;
+        // Window starts at the slave's ack, NEVER clamped forward (see the
+        // slave-side comment: a fixed cap wedges any receiver behind by more).
+        int32_t start = s_slaveAck[i];
+        if (start < 0) start = 0;
+
+        int32_t const now = (int32_t)totalclock;
+        if (s_lastSendClock[i] > now)
+            s_lastSendClock[i] = 0;
+        if (start >= movefifosendplc && now - s_lastSendClock[i] < NET_KEEPALIVE)
+            continue;   // nothing new and no keepalive due
+        s_lastSendClock[i] = now;
+
+        j = Net_BuildMasterPacket(i, start, syncBlk, syncLen);
+        oldnet_sendpacket(i, (unsigned char *)packbuf, j);
+    }
+
+    // Classic master self-quit: exit once our own quit-bit tic has been
+    // aggregated (its broadcast + the drop machinery inform every peer).
+    if (g_gameQuit && movefifosendplc > 0
+        && TEST_SYNC_KEY(inputfifo[(movefifosendplc - 1) & (MOVEFIFOSIZ - 1)][myconnectindex].bits, SK_GAMEQUIT))
+        G_GameExit(" ");
+
+#else  // stock NetDuke32 one-tic protocol (native builds without the seam)
+
     if (g_player[myconnectindex].movefifoend - movefifoplc >= 100)
         return;
 
@@ -365,21 +869,6 @@ void Net_HandleInput(void)
     *nsyn = netInput;
 
     g_player[myconnectindex].movefifoend++;
-
-#if 0
-    if (ud.multimode > 1 && (myconnectindex == connecthead))
-    {
-        for (ALL_PLAYERS(i))
-        {
-            if (g_player[i].isBot)
-            {
-                nsyn = &inputfifo[g_player[i].movefifoend & (MOVEFIFOSIZ - 1)][i];
-                DukeBot_GetInput(i, nsyn);
-                g_player[i].movefifoend++;
-            }
-        }
-    }
-#endif
 
     if (numplayers < 2)
         return;
@@ -437,9 +926,6 @@ void Net_HandleInput(void)
 
         packbuf[0] = PACKET_TYPE_SLAVE_TO_MASTER;
         j = 1;
-#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
-        packbuf[j++] = g_netMoveEpoch;
-#endif
 
         osyn = (input_t *)&inputfifo[(g_player[myconnectindex].movefifoend-2)&(MOVEFIFOSIZ-1)][myconnectindex];
         nsyn = (input_t *)&inputfifo[(g_player[myconnectindex].movefifoend-1)&(MOVEFIFOSIZ-1)][myconnectindex];
@@ -465,18 +951,13 @@ void Net_HandleInput(void)
         //MASTER -> SLAVE packet
         packbuf[0] = PACKET_TYPE_MASTER_TO_SLAVE;
 
-#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
-        packbuf[1] = g_netMoveEpoch;
-        j = 3; // [2] = playerCount, filled below
-#else
         j = 2;
-#endif
         char playerCount = 0;
         TRAVERSE_CONNECT(i)
         {
             packbuf[j++] = i; // Player Index
 
-            //Fix timers and buffer/jitter value 
+            //Fix timers and buffer/jitter value
             packbuf[j++] = min(max(g_player[i].myminlag, -128), 127);
             if ((movefifosendplc & (TIMERUPDATESIZ - 1)) == 0)
                 g_player[i].myminlag = 0x7fffffff;
@@ -484,11 +965,7 @@ void Net_HandleInput(void)
             Net_AddPlayerInputToPacket(&j, i, osyn, nsyn);
             playerCount++;
         }
-#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
-        packbuf[2] = playerCount;
-#else
         packbuf[1] = playerCount;
-#endif
 
         Net_AddSyncInfoToPacket(&j); // Must always be at the end of the packet.
 
@@ -504,6 +981,7 @@ void Net_HandleInput(void)
             G_GameExit(" ");
         }
     }
+#endif
 }
 
 void Net_ParsePackets(void)
@@ -524,6 +1002,9 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
     int i, j;
 
     input_t *osyn, *nsyn;
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    (void)osyn; (void)nsyn;  // used only by the stock one-tic protocol branches
+#endif
 
     if (packbufleng <= 0 || packbufleng > (int)sizeof(packbuf))
         return;
@@ -555,26 +1036,93 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     continue;
                 }
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                // Tic-indexed window: self-contained, loss/reorder tolerant.
+                {
+                    int8_t const d = (int8_t)((uint8_t)packbuf[1] - g_netMoveEpoch);
+                    if (d != 0) { g_netEpochDrops++; break; }   // wrong generation either way
+                }
+                j = 2;
+                int32_t const start  = (int32_t)B_UNBUF32(&packbuf[j]); j += 4;
+                int32_t const count  = (uint8_t)packbuf[j++];
+                int32_t const pcount = (uint8_t)packbuf[j++];
+                {
+                    int32_t const myAck = (int32_t)B_UNBUF32(&packbuf[j]); j += 4;
+                    if (myAck > s_ackOfMyInput)   // monotonic: reorder-safe
+                        s_ackOfMyInput = myAck;
+                }
+                if (pcount > MAXPLAYERS)
+                    break;   // malformed
+
+                int     slots[MAXPLAYERS];
+                int32_t gone[MAXPLAYERS];
+                bool bad = false;
+                for (int32_t k = 0; k < pcount; k++)
+                {
+                    uint8_t const sb = (uint8_t)packbuf[j++];
+                    int const slot = sb & 0x7f;
+                    int8_t const minlag = (int8_t)packbuf[j++];
+                    int32_t gtic = -1;
+                    if (sb & 0x80) { gtic = (int32_t)B_UNBUF32(&packbuf[j]); j += 4; }
+                    if (slot >= MAXPLAYERS) { bad = true; break; }
+                    slots[k] = slot;
+                    gone[k]  = gtic;
+                    if (slot == myconnectindex)
+                        otherminlag = (int32_t)minlag;
+                    if (gtic >= 0)
+                        Net_ScheduleDropFromWire(slot, gtic);
+                }
+                if (bad)
+                    break;
+
+                int32_t const have = movefifosendplc;   // contiguous master-stream high-water
+                if (start > have)
+                {
+                    g_netGapDrops++;   // hole: our stale ack forces a wider resend next packet
+                    break;
+                }
+
+                input_t recs[MAXPLAYERS];
+                for (int32_t k = 0; k < pcount; k++)
+                    recs[k] = s_zeroInput;
+
+                for (int32_t t = start; t < start + count; t++)
+                {
+                    for (int32_t k = 0; k < pcount; k++)
+                    {
+                        if (gone[k] >= 0 && t >= gone[k])
+                            continue;   // dropped players carry no records past their boundary
+                        input_t tmp;
+                        j = Net_ReadInputDelta(packbuf, j, &recs[k], &tmp);
+                        recs[k] = tmp;
+                        // Our own echo is never applied: local sampling owns our column.
+                        if (t >= have && slots[k] != myconnectindex)
+                            inputfifo[t & (MOVEFIFOSIZ - 1)][slots[k]] = tmp;
+                    }
+                    if (t < have)
+                    {
+                        g_netDupTics++;
+                        continue;
+                    }
+                    for (int32_t k = 0; k < pcount; k++)
+                        if (slots[k] != myconnectindex && (gone[k] < 0 || t < gone[k])
+                            && g_player[slots[k]].movefifoend <= t)
+                            g_player[slots[k]].movefifoend = t + 1;
+                    movefifosendplc = t + 1;
+                }
+
+                Net_GetSyncInfoFromPacket(packbuf, &j, other);
+#else
                 osyn = (input_t*)&inputfifo[(g_player[connecthead].movefifoend - 1) & (MOVEFIFOSIZ - 1)];
                 nsyn = (input_t*)&inputfifo[(g_player[connecthead].movefifoend) & (MOVEFIFOSIZ - 1)];
 
-#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
-                {
-                    int8_t const d = (int8_t)((uint8_t)packbuf[1] - g_netMoveEpoch);
-                    if (d < 0) { g_netEpochDrops++; break; } // stale generation: dead on arrival
-                    if (d > 0) g_netMoveEpoch = (uint8_t)packbuf[1];
-                }
-                char playerCount = packbuf[2];
-                j = 3;
-#else
                 char playerCount = packbuf[1];
                 j = 2;
-#endif
                 for(int32_t i = 0; i < playerCount; i++)
                 {
                     int32_t playerNum = packbuf[j++];
 
-                    //Fix timers and buffer/jitter value 
+                    //Fix timers and buffer/jitter value
                     int32_t minlag = (int32_t)((signed char)packbuf[j++]);
 
                     if (((g_player[other].movefifoend & (TIMERUPDATESIZ - 1)) == 0) && (playerNum == myconnectindex))
@@ -586,26 +1134,59 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 Net_GetSyncInfoFromPacket(packbuf, &j, other);
 
                 movefifosendplc++;
-
+#endif
                 break;
             }
             case PACKET_TYPE_SLAVE_TO_MASTER:  //[1] (receive slave sync buffer)
             {
-                j = 1;
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                // Tic-indexed window for the sending slave's own input stream.
                 {
-                    uint8_t const ep = (uint8_t)packbuf[j++];
-                    int8_t const d = (int8_t)(ep - g_netMoveEpoch);
-                    if (d < 0) { g_netEpochDrops++; break; } // stale generation: dead on arrival
-                    if (d > 0) g_netMoveEpoch = ep;          // peer is a generation ahead: converge
+                    int8_t const d = (int8_t)((uint8_t)packbuf[1] - g_netMoveEpoch);
+                    if (d != 0) { g_netEpochDrops++; break; }   // wrong generation either way
                 }
-#endif
+                if ((unsigned)other >= MAXPLAYERS)
+                    break;
+                j = 2;
+                int32_t const start = (int32_t)B_UNBUF32(&packbuf[j]); j += 4;
+                int32_t const count = (uint8_t)packbuf[j++];
+                {
+                    int32_t const ack = (int32_t)B_UNBUF32(&packbuf[j]); j += 4;
+                    if (ack > s_slaveAck[other])   // monotonic: reorder-safe
+                        s_slaveAck[other] = ack;
+                }
+
+                int32_t const have = g_player[other].movefifoend;
+                if (start > have)
+                {
+                    g_netGapDrops++;   // hole: our ack in the next M2S forces a wider resend
+                    break;
+                }
+
+                input_t prev = s_zeroInput, tmp;
+                for (int32_t t = start; t < start + count; t++)
+                {
+                    j = Net_ReadInputDelta(packbuf, j, &prev, &tmp);
+                    prev = tmp;
+                    if (t < have)
+                    {
+                        g_netDupTics++;
+                        continue;
+                    }
+                    inputfifo[t & (MOVEFIFOSIZ - 1)][other] = tmp;
+                    g_player[other].movefifoend = t + 1;
+                }
+
+                Net_GetSyncInfoFromPacket(packbuf, &j, other);
+#else
+                j = 1;
 
                 osyn = (input_t *)&inputfifo[(g_player[other].movefifoend-1)&(MOVEFIFOSIZ-1)];
                 nsyn = (input_t *)&inputfifo[(g_player[other].movefifoend)&(MOVEFIFOSIZ-1)];
 
                 Net_GetPlayerInputFromPacket(&j, other, osyn, nsyn);
                 Net_GetSyncInfoFromPacket(packbuf, &j, other);
+#endif
                 break;
             }
 
@@ -891,7 +1472,17 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     }
                     case PACKET_TYPE_MENU_LEVEL_QUIT:
                     {
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                        // packbuf[1] = the aborting player. Classic killed EVERY
+                        // peer's app here; on the transport track only the HOST
+                        // aborting ends the match (gracefully, via the host-gone
+                        // consumer). A guest's abort is just that guest leaving:
+                        // its transport peer-down handles the seat.
+                        if ((int32_t)(uint8_t)packbuf[1] == connecthead && myconnectindex != connecthead)
+                            g_netHostGone = 1;
+#else
                         G_GameExit("Game aborted from menu; disconnected.");
+#endif
                         break;
                     }
                     case PACKET_TYPE_USER_MAP:
@@ -1250,6 +1841,22 @@ void Net_PeerEvent(int peerToken, int eventType)
 
     if (eventType == NET_PEER_DOWN && peerToken == connecthead && myconnectindex != connecthead)
         g_netHostGone = 1; // guest lost its host -> menus.cpp consumer exits to the main menu
+
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // Mid-game SLAVE loss on the MASTER: never resize the session here -- this
+    // runs inside net_poll, possibly mid-simulation, and each peer would apply
+    // it at a different tic. Record it; Net_CheckPeerHealth folds it into a
+    // goneTic drop that every peer excises at the SAME tic.
+    if (eventType == NET_PEER_DOWN && myconnectindex == connecthead
+        && peerToken != myconnectindex && g_player[peerToken].connected
+        && g_player[myconnectindex].ps != NULL
+        && (g_player[myconnectindex].ps->gm & MODE_GAME))
+    {
+        s_peerDownMask |= (1 << peerToken);
+        initprintf("net: peer %d down mid-game; deterministic drop queued\n", peerToken);
+        return;
+    }
+#endif
 
     g_player[peerToken].connected = (eventType == NET_PEER_UP) ? 1 : 0;
     Net_RebuildConnectChain();
@@ -1709,6 +2316,12 @@ void Net_ClearFIFO(void)
 {
     netInput = {}; // Clear all networked input.
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // New lockstep session: acks, drop boundaries, keepalive clocks, and the
+    // health monitors all restart from zero alongside the FIFO cursors.
+    Net_ResetProtocolState();
+#endif
+
     memset(&syncData, 0, sizeof(syncData));
     memset(&syncError, 0, sizeof(syncError));
     memset(&g_szfirstSyncMsg, 0, sizeof(g_szfirstSyncMsg));
@@ -1797,12 +2410,197 @@ void Net_CheckPlayerQuit(int i)
     g_player[myconnectindex].ps->ftq = QUOTE_RESERVED2, g_player[myconnectindex].ps->fta = 180;
 }
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+// ── Deterministic mid-game player removal ───────────────────────────────────
+// Classic Net_CheckPlayerQuit's body, callable without the in-band quit bit.
+// EVERY peer must call this at the SAME tic (either from the consumed input
+// stream carrying SK_GAMEQUIT, or at the master-stamped goneTic boundary), so
+// the world edit below is part of the deterministic simulation.
+void Net_ExcisePlayer(int i)
+{
+    if ((unsigned)i >= MAXPLAYERS || !g_player[i].connected || i == myconnectindex || numplayers < 2)
+        return;
+
+    initprintf("net: excising player %d at tic %d\n", i, movefifoplc);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('[eng] excise p=' + $0 + ' plc=' + $1 + ' gone=' + $2 + ' quitbit=' + $3); },
+           i, movefifoplc, s_goneTic[i],
+           TEST_SYNC_KEY(g_player[i].input.bits, SK_GAMEQUIT) ? 1 : 0);
+#endif
+
+    g_player[i].connected      = 0;
+    g_player[i].playerquitflag = 0;
+
+    G_CloseDemoWrite();
+
+    if (screenpeek == i)
+    {
+        screenpeek = G_GetNextPlayer(i);
+        if (screenpeek < 0)
+            screenpeek = connecthead;
+    }
+
+    if (i == connecthead)
+        connecthead = connectpoint2[connecthead];
+    else
+    {
+        int jj;
+        TRAVERSE_CONNECT(jj)
+        {
+            if (connectpoint2[jj] == i)
+                connectpoint2[jj] = connectpoint2[i];
+        }
+    }
+
+    numplayers--;
+    ud.multimode--;
+
+    if (numplayers < 2)
+        S_PlaySound(GENERIC_AMBIENCE17);
+
+    pub = NUMPAGES;
+    pus = NUMPAGES;
+    G_UpdateScreenArea();
+
+    if (g_player[i].ps != NULL)
+    {
+        P_QuickKill(g_player[i].ps);
+        if ((unsigned)g_player[i].ps->i < MAXSPRITES)
+            A_DeleteSprite(g_player[i].ps->i);
+
+        Bsprintf(buf, "%s^00 is history!", g_player[i].user_name);
+        G_AddUserQuote(buf);
+        Bstrcpy(apStrings[QUOTE_RESERVED2], buf);
+        g_player[myconnectindex].ps->ftq = QUOTE_RESERVED2;
+        g_player[myconnectindex].ps->fta = 180;
+    }
+
+    if (vote.starter == i)
+    {
+        for (int32_t ALL_PLAYERS(k))
+            g_player[k].gotvote = 0;
+        vote = votedata_t();
+    }
+
+    // The master also tears down the wire pair; the kicked peer experiences a
+    // normal host-side disconnect (its own UI path handles it). Guests have no
+    // link to a fellow guest (star topology), so this is master-only.
+    if (myconnectindex == connecthead)
+        net_kick(i);
+}
+
+// Voluntary leaves, consumed at the deterministic point: every peer reads the
+// same input stream, so the first tic carrying SK_GAMEQUIT excises the quitter
+// identically everywhere. Called from G_DoMoveThings right after input latch.
+void Net_ConsumeQuitInputs(void)
+{
+    if (numplayers < 2)
+        return;
+
+    int i, drops[MAXPLAYERS], n = 0;
+    TRAVERSE_CONNECT(i)
+        if (i != myconnectindex && TEST_SYNC_KEY(g_player[i].input.bits, SK_GAMEQUIT))
+            drops[n++] = i;
+
+    for (int k = 0; k < n; k++)
+    {
+        i = drops[k];
+        if (i == connecthead && myconnectindex != connecthead)
+        {
+            // The HOST quit from its menu: graceful match teardown (menus.cpp
+            // host-gone consumer), never a client-side G_GameExit.
+            g_netHostGone = 1;
+            continue;
+        }
+        if (myconnectindex == connecthead && s_goneTic[i] < 0)
+        {
+            // Stop REQUIRING their input immediately (they exit after this
+            // tic); announcing keeps their final records decodable in repair
+            // windows for any slave that still needs them.
+            s_goneTic[i] = movefifosendplc;
+            s_goneAnnounceUntil[i] = (int32_t)totalclock + 600;
+        }
+        Net_ExcisePlayer(i);
+    }
+}
+
+// Involuntary drops: excise exactly at the master-stamped boundary. Called from
+// G_MoveLoop before the consume gate, so the gate never waits on the departed.
+void Net_ApplyPendingDrops(void)
+{
+    if (numplayers < 2)
+        return;
+
+    for (int i = 0; i < MAXPLAYERS; i++)
+        if (s_goneTic[i] >= 0 && g_player[i].connected && s_goneTic[i] <= movefifoplc)
+            Net_ExcisePlayer(i);
+}
+
+// Barrier entry (level launch, snapshot join, resync): pending drops can no
+// longer excise in-band -- fold them into the roster before the cursors reset.
+// The master's view is authoritative; it propagates via seat masks/snapshots.
+void Net_FlushPendingDrops(void)
+{
+    if (myconnectindex != connecthead)
+    {
+        // Receivers take the roster from the mask; just forget local markers.
+        for (int i = 0; i < MAXPLAYERS; i++)
+            s_goneTic[i] = -1;
+        s_peerDownMask = 0;
+        return;
+    }
+
+    int changed = 0;
+    for (int i = 0; i < MAXPLAYERS; i++)
+    {
+        if (i == myconnectindex)
+        {
+            s_goneTic[i] = -1;
+            continue;
+        }
+        if ((s_goneTic[i] >= 0 || (s_peerDownMask & (1 << i))) && g_player[i].connected)
+        {
+            g_player[i].connected = 0;
+            changed = 1;
+            initprintf("net: flushed pending drop of player %d at barrier\n", i);
+
+            // If we are live in a level (snapshot boundary, not a fresh
+            // launch), also clean their avatar out of the world so the
+            // snapshot doesn't embed a ghost statue.
+            auto const ps = g_player[i].ps;
+            if (g_player[myconnectindex].ps != NULL
+                && (g_player[myconnectindex].ps->gm & MODE_GAME)
+                && ps != NULL && (unsigned)ps->i < MAXSPRITES
+                && sprite[ps->i].picnum == APLAYER && sprite[ps->i].yvel == i)
+            {
+                P_QuickKill(ps);
+                A_DeleteSprite(ps->i);
+            }
+        }
+        s_goneTic[i] = -1;
+    }
+    s_peerDownMask = 0;
+
+    if (changed)
+        Net_RebuildConnectChain();
+}
+#endif  // transport track
+
 void Net_WaitForPlayers()
 {
     int i;
 
     if (numplayers < 2)
         return;
+
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // A drop pending at a barrier crossing can no longer excise in-band (the
+    // FIFO cursors reset below). Fold it into the roster NOW, before the reset
+    // and before the readiness loop would wait on a dead peer forever.
+    Net_FlushPendingDrops();
+    if (numplayers < 2)
+        return;   // the flush may have shrunk the session to just us
+#endif
 
     // Tic-0 lockstep state reset. The classic connect path ran Net_ClearFIFO when
     // the netgame formed; on the transport track NOTHING called it, so

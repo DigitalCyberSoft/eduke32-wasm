@@ -397,7 +397,13 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
     int32_t const tickNum = (int32_t)B_UNBUF32(&packbuf[(*j)]);
     (*j) += sizeof(int32_t);
 
-    if (tickNum < 0 || tickNum == g_player[otherconnectindex].lastSyncTick || (tickNum > movefifoplc))
+    // Reject tics outside the live ring window: the move channel is unreliable/
+    // unordered, so a badly delayed packet could otherwise compare a REMOTE tic
+    // against a syncData slot that has been REUSED by a newer generation
+    // (tickNum & (MOVEFIFOSIZ-1) aliases every MOVEFIFOSIZ tics) and latch a
+    // false "Out Of Sync" that triggers a needless resync.
+    if (tickNum < 0 || tickNum == g_player[otherconnectindex].lastSyncTick || (tickNum > movefifoplc)
+        || tickNum <= movefifoplc - (MOVEFIFOSIZ - 8))
         return;
 
     g_netSyncCompares++; // debug surface: proves the CRC comparison actually runs

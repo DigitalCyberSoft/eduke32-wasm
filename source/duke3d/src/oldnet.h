@@ -155,6 +155,21 @@ int  Net_ApplyLateJoinSnapshot(void);
 extern uint8_t g_netMoveEpoch;    // lockstep generation stamp on move packets
 extern int32_t g_netEpochDrops;
 
+// ── Tic-indexed loss-tolerant move protocol (transport track) ────────────────
+// Every M2S/S2M packet is SELF-CONTAINED: it names the absolute tic range it
+// carries and re-sends everything the receiver has not yet acknowledged, so the
+// move channel runs UNRELIABLE/UNORDERED and any loss/reorder pattern repairs
+// itself from the next packet. See oldnet.cpp "wire format" comment.
+extern input_t g_netStagedInput;  // MP-sampled local input (never inputfifo[0]: that IS ring slot 0)
+extern int32_t g_netDupTics;      // redundant tic records deduplicated (loss-repair proof)
+extern int32_t g_netGapDrops;     // packets ignored because their window started past our high-water
+extern int32_t g_netStallSince;   // totalclock when the consume gate first blocked (0 = flowing)
+extern int32_t g_netStallMask;    // players the consume gate is waiting on
+void Net_ConsumeQuitInputs(void); // deterministic voluntary-leave excision (consumption time)
+void Net_ApplyPendingDrops(void); // deterministic involuntary excision at the master-stamped tic
+void Net_ExcisePlayer(int i);     // remove a player from the running match (classic quit body)
+void Net_FlushPendingDrops(void); // barrier entry: fold pending drops into the roster, no world edits
+
 //OLDNET_EXTERN PredictBackup_t predictBackup[MOVEFIFOSIZ];
 
 enum DukePacket_t

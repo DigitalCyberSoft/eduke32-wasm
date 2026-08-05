@@ -70,6 +70,12 @@ void net_poll(void);
 void net_transport_init(void);
 void net_transport_shutdown(void);
 
+// [additive] Close the connection to one peer (host-side: after the netcode has
+// deterministically excised that player, e.g. timeout/kick). The transport tears
+// the pair down; the kicked peer experiences a normal peer-down (host-gone on a
+// guest), which its UI already handles. No-op for the stub.
+void net_kick(int peerToken);
+
 //========================================================================
 // Inbound: transport -> netcode   (implemented by the netcode, in oldnet.cpp)
 //========================================================================

@@ -69,7 +69,13 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #define NUMPAGES            1
 
 #define RECSYNCBUFSIZ       2520   //2520 is the (LCM of 1-8)*3
-#define MOVEFIFOSIZ         2
+// Lockstep input ring depth, in tics (classic DOS Duke: 256; mainline shrank it
+// to 2 when the snapshot netcode stopped using the ring). The tic-indexed move
+// protocol needs real history: the local runahead cap is 100 tics and repair
+// windows resend up to NET_TICWIN_CAP tics behind a peer's ack, so 256 gives
+// every reachable tic a live slot. Must stay a power of two (& (MOVEFIFOSIZ-1)
+// indexing) and match the copy of this define in player.h.
+#define MOVEFIFOSIZ         256
 
 #define MAXVOLUMES          7
 #define MAXLEVELS           64

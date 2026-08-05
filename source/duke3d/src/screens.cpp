@@ -1390,6 +1390,31 @@ void G_DisplayRest(int32_t smoothratio)
             Net_SendMessage();
         else
             Net_DisplaySyncMsg(); // MP: paint "Out Of Sync" verdicts (also latches g_foundSyncError)
+
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        // Q3-style "connection interrupted": the lockstep consume gate has been
+        // starved for over a second. Names the peers we are waiting on; the
+        // master drops them (deterministically) after NET_STALL_DROP.
+        if (numplayers > 1 && (g_player[myconnectindex].ps->gm & MODE_GAME) && g_netStallSince)
+        {
+            if (g_netStallSince > (int32_t)totalclock)   // totalclock reset
+                g_netStallSince = (int32_t)totalclock;
+            int32_t const stalled = (int32_t)totalclock - g_netStallSince;
+            if (stalled > 120)
+            {
+                Bsprintf(tempbuf, "CONNECTION INTERRUPTED (%d)", stalled / 120);
+                printext256(4, 100, 31, 1, tempbuf, 0);
+                int ypos = 108;
+                for (bssize_t i = 0; i < MAXPLAYERS; i++)
+                    if ((g_netStallMask & (1 << i)) && i != myconnectindex && g_player[i].connected)
+                    {
+                        Bsprintf(tempbuf, "WAITING FOR %s", g_player[i].user_name);
+                        printext256(4, ypos, 31, 1, tempbuf, 0);
+                        ypos += 8;
+                    }
+            }
+        }
+#endif
     M_DisplayMenus();
     }
 

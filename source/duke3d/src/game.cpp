@@ -6542,7 +6542,7 @@ void dukeFillInputForTic(void)
     // this is where we fill the input_t struct that is actually processed by P_ProcessInput()
     auto const pPlayer = g_player[myconnectindex].ps;
     auto const q16ang  = fix16_to_int(pPlayer->q16ang);
-    auto& input   = inputfifo[0][myconnectindex];
+    input_t input;
 
     input = localInput;
     input.fvel = mulscale9(localInput.fvel, sintable[(q16ang + 2560) & 2047]) +
@@ -6555,6 +6555,20 @@ void dukeFillInputForTic(void)
         input.fvel += pPlayer->fric.x;
         input.svel += pPlayer->fric.y;
     }
+
+#ifdef NETDUKE32
+    // MP samples into a dedicated staging slot, never inputfifo[0]: with the
+    // deep lockstep ring, [0] IS ring slot 0 (every tic == 0 mod MOVEFIFOSIZ) --
+    // writing the live sample there overwrites the stored, already-TRANSMITTED
+    // input for those tics before the sim consumes them, and the local replay
+    // silently diverges from what every remote peer replays.
+    if (numplayers > 1)
+        g_netStagedInput = input;
+    else
+        inputfifo[0][myconnectindex] = input;
+#else
+    inputfifo[0][myconnectindex] = input;
+#endif
 
     localInput = {};
 }
@@ -7175,7 +7189,7 @@ MAIN_LOOP_RESTART:
                             // Lockstep: feed our already-rotated local input to the FIFO,
                             // latch+send it and advance movefifoend (Net_HandleInput), then
                             // advance the sim only over confirmed ticks (G_MoveLoop).
-                            netInput = inputfifo[0][myconnectindex];
+                            netInput = g_netStagedInput;
                             Net_HandleInput();
                             G_MoveLoop();
                         }
@@ -7351,6 +7365,14 @@ int G_DoMoveThings(void)
         Bmemcpy(&g_player[i].input, &inputfifo[numplayers > 1 ? (movefifoplc & (MOVEFIFOSIZ - 1)) : 0][i], sizeof(input_t));
     if (numplayers > 1)
         movefifoplc++;
+
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // Voluntary leaves ride the input stream (SK_GAMEQUIT): every peer consumes
+    // the same tic, so excising here is deterministic. Classic did this too;
+    // the call had been lost (the block below stayed commented out for years).
+    if (numplayers > 1)
+        Net_ConsumeQuitInputs();
+#endif
 #else
     for (bssize_t TRAVERSE_CONNECT(i))
         Bmemcpy(&g_player[i].input, &inputfifo[(g_netServer && myconnectindex == i)][i], sizeof(input_t));
@@ -7450,6 +7472,15 @@ int G_DoMoveThings(void)
 // MP only -- single-player never calls this (it stays on the per-frame path).
 int G_MoveLoop(void)
 {
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // Deterministic involuntary drops: excise exactly at the master-stamped
+    // tic BEFORE prediction runs and before the gate would wait on the
+    // departed player's never-coming input.
+    Net_ApplyPendingDrops();
+    if (numplayers < 2)
+        return 0;   // dropped to solo: app_main's numplayers gate reroutes next frame
+#endif
+
     if (numplayers > 1)
         Net_DoPrediction(PREDICTSTATE_PROCESS);
     else
@@ -7462,8 +7493,29 @@ int G_MoveLoop(void)
             // Don't process a tic until every peer has sent their input for it.
             for (bssize_t TRAVERSE_CONNECT(i))
                 if ((g_player[i].movefifoend <= movefifoplc) && !g_gameQuit)
+                {
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                    // Stall bookkeeping for the interruption HUD (screens.cpp).
+                    if (!g_netStallSince || g_netStallSince > (int32_t)totalclock)
+                        g_netStallSince = (int32_t)totalclock;
+                    g_netStallMask |= (1 << i);
+#endif
                     return 0;
+                }
         }
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        else
+            // The session shrank to solo INSIDE this loop (an excise in
+            // G_DoMoveThings/quit consumption): bail out. In solo mode
+            // movefifoplc never advances, so continuing here spins forever
+            // (soak-caught: the host hard-froze the frame a guest was dropped).
+            return 0;
+#endif
+
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        g_netStallSince = 0;
+        g_netStallMask  = 0;
+#endif
 
         int const doMoveReturn = G_DoMoveThings();
         Net_GetSyncStat();

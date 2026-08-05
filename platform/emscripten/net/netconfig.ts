@@ -132,17 +132,19 @@ export type DcLabel = (typeof DC_LABELS)[number];
 /** channel index (net_channel_t) -> data channel label. */
 export const CHANNEL_TO_LABEL: readonly DcLabel[] = ["duke-move", "duke-rel", "duke-bulk"];
 
-/** RTCDataChannelInit per label. duke-move MUST be reliable+ordered: oldnet's
- *  SLAVE_TO_MASTER / MASTER_TO_SLAVE packets are DELTA-CODED against the previous
- *  tic and carry no sequence numbers -- the classic engine ran them over a
- *  lossless in-order link (COMMIT). One dropped or reordered datagram desyncs the
- *  delta decoder and the affected player's input turns to garbage from then on
- *  (live-reported: "player 2 isn't doing the multiplayer loop properly" -- fine on
- *  a quiet loopback bench, broken under real-machine load). Revisit only together
- *  with seq numbers + input redundancy in the packet format. duke-bulk stays a
- *  SEPARATE channel so a large transfer cannot head-of-line-block per-tic input. */
+/** RTCDataChannelInit per label. duke-move is UNRELIABLE + UNORDERED as of the
+ *  tic-indexed move protocol (oldnet.cpp "wire format" comment): every M2S/S2M
+ *  packet is self-contained -- absolute tic range, per-packet delta chains from
+ *  a zero base, and a resend window covering everything the receiver has not
+ *  acked. Loss costs nothing (the next packet re-carries it), reorder is
+ *  dedup'd by tic index, and a burst beyond the window triggers an automatic
+ *  repair resend. Retransmitting stale move frames (the old reliable mode)
+ *  would only add head-of-line latency for data the window already re-sent.
+ *  duke-rel stays reliable+ordered (control/votes/snapshot stream); duke-bulk
+ *  stays a SEPARATE reliable channel so a large GRP transfer cannot
+ *  head-of-line-block anything else. */
 export const DC_INIT: Record<DcLabel, RTCDataChannelInit> = {
-  "duke-move": { ordered: true },
+  "duke-move": { ordered: false, maxRetransmits: 0 },
   "duke-rel": { ordered: true },
   "duke-bulk": { ordered: true },
 };

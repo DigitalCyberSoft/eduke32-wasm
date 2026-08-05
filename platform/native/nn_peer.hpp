@@ -1,8 +1,9 @@
 //-------------------------------------------------------------------------
 // nn_peer.hpp - WebRTC peer manager for the native transport, mirroring
 // platform/emscripten/net/peer.ts:
-//   * THREE data channels per peer, ALL reliable/ordered (oldnet's delta-coded
-//     move packets tolerate no loss/reorder), created by the offerer.
+//   * THREE data channels per peer, created by the offerer: duke-move is
+//     unreliable/unordered (the tic-indexed move protocol self-repairs loss),
+//     duke-rel and duke-bulk are reliable/ordered.
 //   * Deterministic initiator: only the smaller device id offers (glare avoid).
 //   * Non-trickle ICE: wait for gathering to complete, send a self-contained SDP.
 //   * Per-peer phase gate ("attached"): before attach, strings on duke-rel are
@@ -303,10 +304,16 @@ private:
         for (int ch = 0; ch < CH_MAX; ch++)
         {
             rtc::DataChannelInit init;
-            // ALL channels reliable+ordered, duke-move included: oldnet's move packets
-            // are delta-coded with no sequence numbers -- the classic engine assumed a
-            // lossless in-order link, and a single drop/reorder corrupts that player's
-            // decoded input from then on (mirrors netconfig.ts DC_INIT).
+            // duke-move is UNRELIABLE + UNORDERED: the tic-indexed move protocol
+            // (oldnet.cpp) makes every packet self-contained with an ack-driven
+            // resend window, so loss/reorder self-repairs and SCTP retransmits
+            // of stale frames would only add head-of-line latency. duke-rel and
+            // duke-bulk stay reliable+ordered (mirrors netconfig.ts DC_INIT).
+            if (ch == CH_MOVE)
+            {
+                init.reliability.unordered = true;
+                init.reliability.maxRetransmits = 0;
+            }
             auto dc = c->pc->createDataChannel(dcLabel(ch), init);
             setupDcLocked(c, dc);
         }
