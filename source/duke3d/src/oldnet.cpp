@@ -1007,6 +1007,20 @@ static void Net_RebuildConnectChain(void)
     connecthead = (head < 0) ? 0 : head;
     numplayers  = max(count, 1);
 
+    // Every seated player must be PROCESSABLE: P_ProcessInput early-outs on
+    // playerquitflag==0 (player.cpp:5018), and the only thing that ever set it was
+    // app_main's boot loop over ud.multimode -- which is 1 on every transport-track
+    // boot (the classic -net connect path never runs). Result: player 2 could
+    // receive input, sync CRCs, render -- and NEVER MOVE, on every stack, since the
+    // transport track existed (live-reported: "player 2 isn't doing the multiplayer
+    // loop properly"). This is the single chokepoint every seat path funnels
+    // through (peer-up, seat mask, Net_SetLocalIndex, late join). Quit handling
+    // zeroes the flag again on PACKET_TYPE_QUIT (game.cpp:7373) after which the
+    // peer-down also drops `connected`, so we never resurrect a quitter here.
+    for (int k = 0; k < MAXPLAYERS; k++)
+        if (g_player[k].connected)
+            g_player[k].playerquitflag = 1;
+
     // Session size follows the live lobby, established at CONNECT time exactly
     // like the classic connect path did via PACKET_TYPE_INIT_SETTINGS (which
     // nothing on the transport track sends). This matters twice over:

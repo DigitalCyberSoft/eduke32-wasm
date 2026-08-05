@@ -132,12 +132,17 @@ export type DcLabel = (typeof DC_LABELS)[number];
 /** channel index (net_channel_t) -> data channel label. */
 export const CHANNEL_TO_LABEL: readonly DcLabel[] = ["duke-move", "duke-rel", "duke-bulk"];
 
-/** RTCDataChannelInit per label. duke-move is fully unreliable/unordered so a lost
- *  input tic is never retransmitted (stale by the time it arrives); duke-rel and
- *  duke-bulk are reliable+ordered. duke-bulk is a SEPARATE channel so a large GRP
- *  transfer cannot head-of-line-block per-tic input. */
+/** RTCDataChannelInit per label. duke-move MUST be reliable+ordered: oldnet's
+ *  SLAVE_TO_MASTER / MASTER_TO_SLAVE packets are DELTA-CODED against the previous
+ *  tic and carry no sequence numbers -- the classic engine ran them over a
+ *  lossless in-order link (COMMIT). One dropped or reordered datagram desyncs the
+ *  delta decoder and the affected player's input turns to garbage from then on
+ *  (live-reported: "player 2 isn't doing the multiplayer loop properly" -- fine on
+ *  a quiet loopback bench, broken under real-machine load). Revisit only together
+ *  with seq numbers + input redundancy in the packet format. duke-bulk stays a
+ *  SEPARATE channel so a large transfer cannot head-of-line-block per-tic input. */
 export const DC_INIT: Record<DcLabel, RTCDataChannelInit> = {
-  "duke-move": { ordered: false, maxRetransmits: 0 },
+  "duke-move": { ordered: true },
   "duke-rel": { ordered: true },
   "duke-bulk": { ordered: true },
 };

@@ -8958,18 +8958,31 @@ void M_DisplayMenus(void)
                 char scr[256];
                 // p0/p1: player positions (>>8) -- input-routing diagnosis: if both
                 // move in lockstep with one player's input, the input fanout is wrong.
-                int32_t p0x = 0, p0y = 0, p1x = 0, p1y = 0;
-                if (g_player[0].ps != NULL) { p0x = g_player[0].ps->pos.x >> 8; p0y = g_player[0].ps->pos.y >> 8; }
-                if (g_player[1].ps != NULL) { p1x = g_player[1].ps->pos.x >> 8; p1y = g_player[1].ps->pos.y >> 8; }
+                int32_t p0x = 0, p0y = 0, p1x = 0, p1y = 0, p1z = 0, p1a = 0;
+                if (g_player[0].ps != NULL) { p0x = g_player[0].ps->pos.x; p0y = g_player[0].ps->pos.y; }
+                int32_t o1x = 0, o1y = 0;
+                if (g_player[1].ps != NULL)
+                {
+                    p1x = g_player[1].ps->pos.x; p1y = g_player[1].ps->pos.y;
+                    p1z = g_player[1].ps->pos.z; p1a = (int32_t)(g_player[1].ps->q16ang >> 16);
+                    o1x = g_player[1].ps->opos.x; o1y = g_player[1].ps->opos.y;
+                }
                 extern int32_t g_netPumpCalls, g_netGateC1, g_netGateC2, g_mainLoopIter, g_demoLoopIter;
                 Bsnprintf(scr, sizeof scr,
-                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d}",
+                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d,%d,%d],o1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d,in:[%d,%d],ap1:[%d,%d,%d],gate1:[%d,%d,%d]}",
                           menuOpen, (int)m_currentMenu->menuID, inGame, (int)nngm,
                           (int)numplayers, (int)myconnectindex, g_foundSyncError ? 1 : 0, (int)sel,
-                          p0x, p0y, p1x, p1y,
+                          p0x, p0y, p1x, p1y, p1z, p1a, o1x, o1y,
                           (int)movefifoplc, (int)g_player[0].movefifoend, (int)g_player[1].movefifoend,
                           (int)ready2send, (int)g_netPumpCalls, (int)(totalclock - ototalclock),
-                          (int)g_netGateC1, (int)g_netGateC2, (int)g_mainLoopIter, (int)g_demoLoopIter);
+                          (int)g_netGateC1, (int)g_netGateC2, (int)g_mainLoopIter, (int)g_demoLoopIter,
+                          (int)netInput.fvel, (int)netInput.bits,
+                          (int)g_player[1].input.fvel,
+                          (g_player[1].ps != NULL) ? (int)g_player[1].ps->i : -1,
+                          (g_player[1].ps != NULL && (unsigned)g_player[1].ps->i < MAXSPRITES) ? (int)sprite[g_player[1].ps->i].statnum : -1,
+                          (g_player[1].ps != NULL) ? (int)g_player[1].ps->newowner : -99,
+                          (g_player[1].ps != NULL) ? (int)g_player[1].ps->dead_flag : -99,
+                          (int)g_player[1].playerquitflag);
                 emscripten_run_script(scr);
             }
         }
