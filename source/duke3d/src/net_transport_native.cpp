@@ -61,6 +61,7 @@ extern "C" {
     // Engine seam (common.cpp): path of the selected GRP, so this TU can fingerprint
     // it without pulling engine headers into an -fexceptions translation unit.
     const char *Net_NativeGrpPath(void);
+    void Net_SnapshotReady(int seatMask); // oldnet.cpp: late-join snapshot file landed
 }
 
 namespace {
@@ -96,7 +97,8 @@ struct InboundItem
     {
         Frame,
         PeerEvent,
-        SetLocalIndex
+        SetLocalIndex,
+        SnapshotReady
     } kind;
     int peer = 0;    // connectindex/slot (Frame, PeerEvent) or slot (SetLocalIndex)
     int channel = 0; // Frame
@@ -372,6 +374,7 @@ public:
             {
                 case InboundItem::SetLocalIndex: Net_SetLocalIndex(it.peer); break;
                 case InboundItem::PeerEvent: Net_PeerEvent(it.peer, it.event); break;
+                case InboundItem::SnapshotReady: Net_SnapshotReady(it.event); break;
                 case InboundItem::Frame:
                     Net_ReceiveFrame(it.peer, it.channel, it.data.data(), (int)it.data.size());
                     break;
@@ -391,6 +394,52 @@ public:
     }
     void markLaunched() { launched_ = true; }
     void setInGame(bool on) { inGame_.store(on); }
+
+    // HOST: stream latejoin.esv to every joined peer as base64 control slices on
+    // duke-rel (strings are always control, even post-attach -- mirrors duke-net.ts).
+    void sendSnapshot(int seatMask)
+    {
+        FILE *f = fopen("latejoin.esv", "rb");
+        if (!f)
+            return;
+        std::vector<uint8_t> bytes;
+        {
+            fseek(f, 0, SEEK_END);
+            long const n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (n > 0)
+            {
+                bytes.resize((size_t)n);
+                if (fread(bytes.data(), 1, (size_t)n, f) != (size_t)n)
+                    bytes.clear();
+            }
+            fclose(f);
+        }
+        if (bytes.empty())
+            return;
+        std::vector<std::string> peers;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            for (auto &kv : deviceToToken_)
+                peers.push_back(kv.first);
+        }
+        printf("[nnet] -> snapshot %d bytes to %d peer(s), mask 0x%x\n",
+               (int)bytes.size(), (int)peers.size(), seatMask);
+        fflush(stdout);
+        size_t const CHUNK = 48 * 1024;
+        for (auto &peer : peers)
+        {
+            pm_->sendControl(peer, "{\"t\":\"sav_begin\",\"size\":" + std::to_string(bytes.size())
+                                   + ",\"mask\":" + std::to_string(seatMask) + "}");
+            for (size_t off = 0; off < bytes.size(); off += CHUNK)
+            {
+                size_t const len = std::min(CHUNK, bytes.size() - off);
+                std::vector<uint8_t> slice(bytes.begin() + off, bytes.begin() + off + len);
+                pm_->sendControl(peer, "{\"t\":\"sav_chunk\",\"d\":\"" + base64Encode(slice) + "\"}");
+            }
+            pm_->sendControl(peer, "{\"t\":\"sav_end\"}");
+        }
+    }
     bool isHost() const { return isHost_; }
 
     // Menu pulls (game thread only; the strings are not mutated concurrently).
@@ -535,6 +584,23 @@ private:
             if (!t)
                 return;
             type = t;
+            if (type == "sav_begin")
+            {
+                savSize_ = sjson_get_int(root, "size", 0);
+                savMask_ = sjson_get_int(root, "mask", 0);
+                savBuf_.clear();
+                savBuf_.reserve((size_t)savSize_);
+            }
+            else if (type == "sav_chunk")
+            {
+                const char *d = sjson_get_string(root, "d", nullptr);
+                if (d)
+                {
+                    std::vector<uint8_t> raw;
+                    if (base64Decode(d, raw))
+                        savBuf_.insert(savBuf_.end(), raw.begin(), raw.end());
+                }
+            }
             yourSlot = sjson_get_int(root, "yourSlot", -1);
             hostSlot = sjson_get_int(root, "hostSlot", 0);
             const char *jn = sjson_get_string(root, "name", nullptr);
@@ -569,6 +635,40 @@ private:
             hostHandleJoin(peer, joinName, joinGrpDigest);
         else if (type == "join_ok" && !isHost_)
             guestHandleJoinOk(peer, yourSlot, hostSlot, joinName); // joinName = host's name
+        else if (type == "sav_end" && !isHost_)
+        {
+            std::vector<uint8_t> bytes;
+            int mask = 0;
+            {
+                std::lock_guard<std::mutex> lk(sigMtx_);
+                bytes.swap(savBuf_);
+                mask = savMask_;
+                if ((int)bytes.size() != savSize_)
+                {
+                    printf("[nnet] snapshot SIZE MISMATCH (%d != %d) -- dropped\n", (int)bytes.size(), savSize_);
+                    fflush(stdout);
+                    bytes.clear();
+                }
+            }
+            if (!bytes.empty())
+            {
+                FILE *f = fopen("latejoin.esv", "wb");
+                if (f)
+                {
+                    fwrite(bytes.data(), 1, bytes.size(), f);
+                    fclose(f);
+                    InboundItem it;
+                    it.kind = InboundItem::SnapshotReady;
+                    it.event = mask;
+                    {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        inbound_.push_back(std::move(it));
+                    }
+                    printf("[nnet] snapshot ready (%d bytes, mask 0x%x)\n", (int)bytes.size(), mask);
+                    fflush(stdout);
+                }
+            }
+        }
         else if (type == "join_deny" && !isHost_)
             guestHandleJoinDeny(denyReason, denyGrpPaid, denyGrpLabel);
         else if (type == "grp_req" && isHost_)
@@ -863,6 +963,8 @@ private:
     std::thread upnpThread_;
     bool upnpStarted_ = false;
     uint16_t icePortBase_ = 0;
+    std::vector<uint8_t> savBuf_;  // late-join snapshot reassembly (under sigMtx_)
+    int savSize_ = 0, savMask_ = 0;
 
     // Menu update queue (produced on worker threads, applied by menuPump on the game thread).
     std::mutex menuMtx_;
@@ -945,6 +1047,12 @@ void net_native_mark_launched(void)
 }
 
 // ── Menu action bridge (called from menus.cpp on native; see NETMENU) ────────
+void net_native_send_snapshot(int seatMask)
+{
+    if (g_t)
+        g_t->sendSnapshot(seatMask);
+}
+
 void net_native_host(int isPublic, const char *name, int maxPlayers, const char *player, int localOnly)
 {
     if (g_t)

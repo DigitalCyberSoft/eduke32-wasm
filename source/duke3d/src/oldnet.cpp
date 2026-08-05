@@ -11,6 +11,9 @@ static void Net_RebuildConnectChain(void);
 #include "chatpipe.h"
 #include "demo.h"  // G_CloseDemoWrite (Net_CheckPlayerQuit)
 #include "savegame.h"  // late-join snapshot: sv_saveandmakesnapshot / G_LoadPlayer
+#ifdef __EMSCRIPTEN__
+# include <emscripten.h>
+#endif
 
 // NetDuke32's player-iteration macros differ from our tree's (ours are bare
 // loop clauses used as `for (TRAVERSE_CONNECT(i))`; netduke32's bake in the
@@ -683,6 +686,19 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 if (g_player[other].playerreadyflag == 0)
                     LOG_F(INFO, "Player %d is ready", other);
                 g_player[other].playerreadyflag++;
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                // MASTER ECHO (late-join rendezvous): the master's one-shot READY
+                // broadcast can land while a late joiner is still LOADING the
+                // snapshot -- the load then restores the saved (zero) readyflags
+                // over it and the joiner waits forever for a packet that already
+                // came. Echoing READY back at the sender is idempotent (flags are
+                // >= comparisons) and makes the rendezvous order-independent.
+                if (myconnectindex == connecthead && other != myconnectindex)
+                {
+                    packbuf[0] = PACKET_TYPE_PLAYER_READY;
+                    oldnet_sendpacket(other, (unsigned char *)packbuf, 1);
+                }
+#endif
                 return;
             }
             case PACKET_TYPE_PING:
@@ -1066,6 +1082,9 @@ extern "C" void Net_SnapshotReady(int seatMask)
 {
     g_netSnapshotMask  = (uint32_t)seatMask;
     g_netSnapshotReady = 1;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('[eng] Net_SnapshotReady mask=' + $0); }, seatMask);
+#endif
 }
 
 // HOST: materialize a late joiner in the running level. Mirrors what level entry
@@ -1111,6 +1130,9 @@ void Net_InsertLatePlayer(int k)
 // LOCAL identity (the snapshot was written by the host). 0 on success.
 int Net_ApplyLateJoinSnapshot(void)
 {
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('[eng] Apply: seat+load starting'); });
+#endif
     int const myIdx = myconnectindex;
     int const myPeek = screenpeek;
 
@@ -1133,6 +1155,12 @@ int Net_ApplyLateJoinSnapshot(void)
     myconnectindex = myIdx;
     screenpeek     = myPeek;
     Net_SeatLateJoiners(); // re-assert chain + quitflags over whatever the load restored
+
+    // Deterministic barrier slate: the load restored SAVED readyflags (zeros) over
+    // any READY that arrived mid-load. Zero everything; our own flag increments at
+    // barrier entry and the master's echo (PLAYER_READY case) re-raises its flag.
+    for (int k = 0; k < MAXPLAYERS; k++)
+        g_player[k].playerreadyflag = 0;
 
     if (r == 0)
         initprintf("net: late-join snapshot applied (%d players, I am %d)\n", numplayers, myconnectindex);

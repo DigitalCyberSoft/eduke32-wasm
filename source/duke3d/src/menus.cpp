@@ -1615,6 +1615,7 @@ extern "C" {
     void net_native_set_ingame(int in_game);
     void net_native_menu_pump(void);       // apply queued menu updates on the game thread
     int net_native_should_launch(void);    // headless auto-launch (NN_AUTOLAUNCH): host is ready
+    void net_native_send_snapshot(int seatMask); // late-join snapshot broadcast
     void net_native_mark_launched(void);
 }
 #endif
@@ -1751,6 +1752,20 @@ extern "C" void NetMenu_SetInGame(int in_game)
                                   : "window.DukeNet&&window.DukeNet.setInGame(false)");
 #else
     net_native_set_ingame(in_game);
+#endif
+}
+
+// Ship the late-join snapshot (written by Net_SaveLateJoinSnapshot) to every
+// attached peer, with the seat mask the receivers must apply BEFORE loading.
+static void netmenu_send_snapshot(int seatMask)
+{
+#ifdef __EMSCRIPTEN__
+    char scr[128];
+    Bsnprintf(scr, sizeof scr,
+              "window.DukeNet&&window.DukeNet.sendSnapshot&&window.DukeNet.sendSnapshot(%d)", seatMask);
+    emscripten_run_script(scr);
+#else
+    net_native_send_snapshot(seatMask);
 #endif
 }
 
@@ -8969,7 +8984,7 @@ void M_DisplayMenus(void)
                 }
                 extern int32_t g_netPumpCalls, g_netGateC1, g_netGateC2, g_mainLoopIter, g_demoLoopIter;
                 Bsnprintf(scr, sizeof scr,
-                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d,%d,%d],o1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d,in:[%d,%d],ap1:[%d,%d,%d],gate1:[%d,%d,%d]}",
+                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d,%d,%d],o1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d,in:[%d,%d],ap1:[%d,%d,%d],gate1:[%d,%d,%d],snr:%d}",
                           menuOpen, (int)m_currentMenu->menuID, inGame, (int)nngm,
                           (int)numplayers, (int)myconnectindex, g_foundSyncError ? 1 : 0, (int)sel,
                           p0x, p0y, p1x, p1y, p1z, p1a, o1x, o1y,
@@ -8983,7 +8998,8 @@ void M_DisplayMenus(void)
                           (g_player[1].ps != NULL && (unsigned)g_player[1].ps->i < MAXSPRITES) ? (int)sprite[g_player[1].ps->i].statnum : -1,
                           (g_player[1].ps != NULL) ? (int)g_player[1].ps->newowner : -99,
                           (g_player[1].ps != NULL) ? (int)g_player[1].ps->dead_flag : -99,
-                          (int)g_player[1].playerquitflag);
+                          (int)g_player[1].playerquitflag,
+                          (int)g_netSnapshotReady);
                 // NEVER eval a truncated script: Bsnprintf cuts mid-expression, the
                 // SyntaxError unwinds through callUserCallback -> doRewind and KILLS
                 // the ASYNCIFY resume -- the engine hard-freezes while the page stays
@@ -9030,20 +9046,63 @@ void M_DisplayMenus(void)
             ready2send = 1;         // input pump ON, whatever attract-loop path we returned through
             return;
         }
-        // HOST: late joiners. Their peer-up landed while we were IN GAME, so oldnet
-        // only QUEUED them (touching the connect chain under the tic loop starved it
-        // -- the live-reported host freeze). Seat them here, at a safe frame point,
-        // then relaunch the CURRENT map: veterans, joiner and host all re-enter tic 0
-        // together through the same barrier. (Round resets -- state-preserving
-        // snapshot join is the recorded follow-up.)
+        // HOST: late joiners -- SNAPSHOT JOIN, the game does NOT reset. Their peer-up
+        // landed while we were IN GAME, so oldnet only QUEUED them. At this safe
+        // frame point: materialize each joiner in the LIVE world, seat them, write
+        // a full savegame snapshot, hand it to the transport (streams to every
+        // peer), and hold the barrier until veterans + joiners have reloaded the
+        // identical bytes. The host's own state IS the snapshot -- no reload, no
+        // reset, positions and frags stay.
         if (g_netLateJoinMask && myconnectindex == connecthead
             && g_player[myconnectindex].ps != NULL
             && (g_player[myconnectindex].ps->gm & MODE_GAME))
         {
-            Net_SeatLateJoiners();
-            initprintf("net: late join -> relaunching E%dL%d for %d players\n",
-                       ud.volume_number + 1, ud.level_number + 1, numplayers);
-            netmenu_relaunch(ud.volume_number, ud.level_number);
+            for (int k = 0; k < MAXPLAYERS; k++)
+                if (g_netLateJoinMask & (1 << k))
+                    Net_InsertLatePlayer(k);
+            Net_SeatLateJoiners(); // connected/quitflag/chain; clears the mask
+            ud.multimode            = numplayers;
+            g_mostConcurrentPlayers = ud.multimode;
+            if (Net_SaveLateJoinSnapshot() == 0)
+            {
+                int seatMask = 0;
+                for (int k = 0; k < MAXPLAYERS && k < 16; k++)
+                    if (g_player[k].connected)
+                        seatMask |= (1 << k);
+                initprintf("net: late join -> snapshot for %d players (mask 0x%x), holding the barrier\n",
+                           numplayers, seatMask);
+                netmenu_send_snapshot(seatMask);
+                Net_WaitForPlayers();  // rendezvous once every receiver has reloaded
+                ready2send = 1;
+            }
+            else
+            {
+                initprintf("net: snapshot save FAILED -> falling back to relaunch\n");
+                netmenu_relaunch(ud.volume_number, ud.level_number);
+            }
+            return;
+        }
+        // RECEIVER (veteran mid-game or the joiner in menus): the snapshot file
+        // landed. Seat + load the identical world state, then rendezvous.
+        if (g_netSnapshotReady)
+        {
+#ifdef __EMSCRIPTEN__
+            EM_ASM({ console.log('[eng] snapshot consumer firing'); });
+#endif
+            g_netSnapshotReady = 0;
+            if (Net_ApplyLateJoinSnapshot() == 0)
+            {
+                Menu_Close(myconnectindex);
+                g_player[myconnectindex].ps->gm = MODE_GAME;
+                NetMenu_SetInGame(1);
+                Net_WaitForPlayers();
+                ready2send = 1;
+            }
+            else
+            {
+                NetMenu_SetStatus("!Join failed: could not load the game state");
+                netmenu_leave();
+            }
             return;
         }
         // GUEST: the host vanished (peer-down on connecthead). Tear the match down

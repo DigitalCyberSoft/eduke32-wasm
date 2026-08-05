@@ -4675,6 +4675,13 @@ void Net_WaitForServer(void)
     if (numplayers < 2 || g_netServer)
         return;
 
+    // WebRTC transport track: there IS no ENet server/client. Without this a
+    // GUEST loading a savegame (the late-join snapshot!) span forever in the
+    // "Waiting for server" loop below -- it pings via g_netClientPeer, which is
+    // NULL here, so the reply it waits for can never arrive.
+    if (g_netClientPeer == NULL)
+        return;
+
     P_SetGamePalette(g_player[myconnectindex].ps, TITLEPAL, 8 + 2 + 1);
 
     do

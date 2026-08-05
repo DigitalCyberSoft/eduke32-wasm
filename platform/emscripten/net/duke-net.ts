@@ -56,6 +56,9 @@ type Ctl =
   | { t: "grp_begin"; offer: GrpOffer }
   | { t: "grp_end" }
   | { t: "grp_deny"; reason: "paid" | "optout" | "notplaying" | "mismatch" }
+  | { t: "sav_begin"; size: number; mask: number }
+  | { t: "sav_chunk"; d: string }
+  | { t: "sav_end" }
   | { t: "rtt_ping"; id: number }
   | { t: "rtt_pong"; id: number }
   | { t: "kick"; reason: string };
@@ -109,6 +112,11 @@ class DukeNet {
   // Host slot allocation (host = 0; guests take 1..maxPlayers-1).
   private slots = new Map<string, number>(); // deviceId -> slot
   private rttTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Late-join snapshot receive state (guest/veteran side).
+  private savBuf: Uint8Array[] | null = null;
+  private savSize = 0;
+  private savMask = 0;
 
   // GRP receive state (guest side).
   private grpRecv: GrpReceiver | null = null;
@@ -216,6 +224,37 @@ class DukeNet {
     if (!m) return null;
     const up = m.players().filter((p) => p.connected).length;
     return `role=${m.role} status=${m.status()} idx=${this.myConnectIndex} roster=${m.players().length} connected=${up} attached=${this.slots.size}`;
+  }
+
+  /** HOST: stream the late-join snapshot (written by the engine to /latejoin.esv)
+   *  to every ATTACHED peer as base64 control slices on duke-rel. Called from the
+   *  engine (menus.cpp netmenu_send_snapshot) right before it holds the barrier. */
+  sendSnapshot(seatMask: number): void {
+    const m = this.match;
+    if (!m || m.role !== "host") return;
+    let bytes: Uint8Array;
+    try {
+      const FS = (globalThis as unknown as { Module?: { FS?: { readFile: (p: string) => Uint8Array } } }).Module?.FS;
+      if (!FS) return;
+      bytes = FS.readFile("/latejoin.esv");
+    } catch (e) {
+      console.log("[dnet] sendSnapshot: read failed: " + String(e));
+      return;
+    }
+    const CHUNK = 48 * 1024;
+    const targets = [...this.slots.keys()].filter((id) => m.peers.isAttached(id));
+    console.log(`[dnet] -> snapshot ${bytes.length} bytes to ${targets.length} peer(s), mask 0x${seatMask.toString(16)}`);
+    for (const peerId of targets) {
+      m.peers.sendControl(peerId, { t: "sav_begin", size: bytes.length, mask: seatMask } as Ctl);
+      for (let off = 0; off < bytes.length; off += CHUNK) {
+        const slice = bytes.subarray(off, Math.min(off + CHUNK, bytes.length));
+        let bin = "";
+        for (let i = 0; i < slice.length; i += 0x8000)
+          bin += String.fromCharCode.apply(null, Array.from(slice.subarray(i, i + 0x8000)));
+        m.peers.sendControl(peerId, { t: "sav_chunk", d: btoa(bin) } as Ctl);
+      }
+      m.peers.sendControl(peerId, { t: "sav_end" } as Ctl);
+    }
   }
 
   /** The engine calls this when the local match actually starts (true) or ends
@@ -409,6 +448,48 @@ class DukeNet {
       case "grp_deny":
         this.events.onError?.("GRP download refused: " + msg.reason);
         break;
+      case "sav_begin":
+        // Late-join snapshot incoming (host only). Buffered as base64 control
+        // slices on duke-rel: strings are ALWAYS control, even post-attach, so
+        // this coexists with live netcode frames without touching the seam.
+        if (m.role === "guest" && peerId === m.hostId) {
+          this.savBuf = [];
+          this.savSize = msg.size | 0;
+          this.savMask = msg.mask | 0;
+          console.log(`[dnet] <- snapshot begin (${msg.size} bytes, mask 0x${(msg.mask | 0).toString(16)})`);
+          this.events.onStatus?.("Syncing game state…");
+        }
+        break;
+      case "sav_chunk":
+        if (this.savBuf && m.role === "guest" && peerId === m.hostId) {
+          const bin = atob(msg.d);
+          const arr = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+          this.savBuf.push(arr);
+        }
+        break;
+      case "sav_end": {
+        if (!this.savBuf || m.role !== "guest" || peerId !== m.hostId) break;
+        const total = this.savBuf.reduce((n, a) => n + a.length, 0);
+        const bytes = new Uint8Array(total);
+        let off = 0;
+        for (const a of this.savBuf) { bytes.set(a, off); off += a.length; }
+        this.savBuf = null;
+        if (total !== this.savSize) {
+          console.log(`[dnet] snapshot SIZE MISMATCH (${total} != ${this.savSize}) -- dropped`);
+          break;
+        }
+        try {
+          const FS = (globalThis as unknown as { Module?: { FS?: { writeFile: (p: string, d: Uint8Array) => void } } }).Module?.FS;
+          FS?.writeFile("/latejoin.esv", bytes);
+          const mod = (globalThis as unknown as { Module?: { ccall?: (...a: unknown[]) => unknown } }).Module;
+          mod?.ccall?.("Net_SnapshotReady", null, ["number"], [this.savMask]);
+          console.log(`[dnet] snapshot ready (${total} bytes) -> engine notified`);
+        } catch (e) {
+          console.log("[dnet] snapshot write failed: " + String(e));
+        }
+        break;
+      }
       case "rtt_ping":
         m.peers.sendControl(peerId, { t: "rtt_pong", id: msg.id } as Ctl);
         break;
