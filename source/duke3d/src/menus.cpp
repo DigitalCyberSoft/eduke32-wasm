@@ -9114,11 +9114,14 @@ void M_DisplayMenus(void)
             ready2send = 1;         // input pump ON, whatever attract-loop path we returned through
             return;
         }
-        // HOST, SOLO (numplayers==1): classic barrier join. There is nobody else
-        // to stall, and the barrier also carries the SP->MP loop transition the
-        // barrier-free flow cannot (a solo host never pumps M2S: movefifoplc is
-        // frozen on the single-player path, so there is no live timeline for a
-        // joiner to catch up to).
+        // HOST with only ONE alive player (solo "active match"): a join RESETS
+        // the match -- both players enter the map fresh at tic 0. Design rule:
+        // a running match with a single alive player is a warmup, not a game
+        // state worth preserving; the real match starts when the second player
+        // arrives. (This is also the only sound option mechanically: a solo
+        // host runs the SP loop -- movefifoplc frozen, no live MP timeline --
+        // so there is nothing for a barrier-free joiner to catch up to. The
+        // 2+ alive case never comes here: Net_HostJoinFlow streams those.)
         if (g_netLateJoinMask && numplayers < 2 && myconnectindex == connecthead
             && g_player[myconnectindex].ps != NULL
             && (g_player[myconnectindex].ps->gm & MODE_GAME))
@@ -9126,30 +9129,9 @@ void M_DisplayMenus(void)
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
             Net_FlushPendingDrops();
 #endif
-            for (int k = 0; k < MAXPLAYERS; k++)
-                if (g_netLateJoinMask & (1 << k))
-                    Net_InsertLatePlayer(k);
             Net_SeatLateJoiners(); // connected/quitflag/chain; clears the mask
-            ud.multimode            = numplayers;
-            g_mostConcurrentPlayers = ud.multimode;
-            if (Net_SaveLateJoinSnapshot() == 0)
-            {
-                int seatMask = 0;
-                for (int k = 0; k < MAXPLAYERS && k < 16; k++)
-                    if (g_player[k].connected)
-                        seatMask |= (1 << k);
-                g_netMoveEpoch = (uint8_t)(g_netMoveEpoch + 1);
-                seatMask |= ((int)g_netMoveEpoch) << 16;
-                initprintf("net: solo-host join -> snapshot (mask 0x%x), holding the barrier\n", seatMask);
-                netmenu_send_snapshot(seatMask);
-                Net_WaitForPlayers();  // rendezvous once the joiner has reloaded
-                ready2send = 1;
-            }
-            else
-            {
-                initprintf("net: snapshot save FAILED -> falling back to relaunch\n");
-                netmenu_relaunch(ud.volume_number, ud.level_number);
-            }
+            initprintf("net: join with 1 alive player -> match resets (%d players)\n", numplayers);
+            netmenu_relaunch(ud.volume_number, ud.level_number);
             return;
         }
         // HOST, RUNNING MATCH (numplayers>=2): barrier-free late join. The old
