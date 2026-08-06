@@ -9185,11 +9185,12 @@ void M_DisplayMenus(void)
             }
             return;
         }
-        // HOST: the lockstep CRC flagged a DIVERGENCE. Q3-style self-heal: push a
-        // fresh authoritative snapshot through the late-join machinery -- every
-        // peer reloads identical state and play continues, instead of the match
-        // silently splitting into parallel realities (mirrored movement, kills
-        // that never propagate).
+        // HOST: the lockstep CRC flagged a DIVERGENCE. TARGETED heal (the join
+        // streamer minus the seat): stream a fresh authoritative snapshot to
+        // the diverged guest ONLY -- it reloads and catches up as a watcher
+        // while everyone else plays on untouched. The old broadcast pushed the
+        // snapshot to every peer and held a barrier: one guest's divergence
+        // (or one watcher's noise) froze and reloaded the entire match.
         {
             static int32_t s_lastResyncTic = -100000;
             if ((int32_t)totalclock < s_lastResyncTic)
@@ -9198,17 +9199,42 @@ void M_DisplayMenus(void)
                 && g_player[myconnectindex].ps != NULL
                 && (g_player[myconnectindex].ps->gm & MODE_GAME)
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
-                // A join mid-flight would be forked by the broadcast (its roster
-                // excludes the half-seated joiner); heal right after it lands.
+                // A join mid-flight owns the streamer (and a heal would race
+                // the half-seated roster); heal right after it lands.
                 && !Net_JoinFlowActive()
 #endif
                 && (int32_t)totalclock - s_lastResyncTic > 600)
             {
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                // Pick the diverged peer: a guest that reported, or one whose
+                // stamps mismatched ours. Heals run one at a time; if several
+                // flagged, the next cooldown lap takes the next one.
+                int target = -1;
+                for (int k = 0; k < MAXPLAYERS; k++)
+                    if (k != myconnectindex && g_player[k].connected
+                        && ((g_netDesyncReporters & (1 << k)) || desynched_players[k]))
+                    { target = k; break; }
+
+                s_lastResyncTic = (int32_t)totalclock;
+                if (target >= 0)
+                {
+                    initprintf("net: DESYNC detected -> targeted heal for slot %d\n", target);
+#ifdef __EMSCRIPTEN__
+                    EM_ASM({ console.log('[eng] AUTO-RESYNC: targeted heal p=' + $0); }, target);
+#endif
+                    Net_StartHealFlow(target);   // on failure the cooldown retries
+                }
+                else
+                {
+                    // Latch without a live culprit (raced a drop, stale noise):
+                    // clear it -- real divergence re-flags with a name attached.
+                    initprintf("net: desync latch without a target -> cleared\n");
+                    Net_ResetSyncCheck();
+                }
+#else
+                // Non-transport builds keep the legacy broadcast heal.
                 s_lastResyncTic = (int32_t)totalclock;
                 initprintf("net: DESYNC detected -> auto-resync snapshot\n");
-#ifdef __EMSCRIPTEN__
-                EM_ASM({ console.log('[eng] AUTO-RESYNC firing (CRC divergence)'); });
-#endif
                 if (Net_SaveLateJoinSnapshot() == 0)
                 {
                     int seatMask = 0;
@@ -9222,6 +9248,7 @@ void M_DisplayMenus(void)
                     ready2send = 1;
                 }
                 Net_ResetSyncCheck();
+#endif
                 return;
             }
         }

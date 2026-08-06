@@ -1404,6 +1404,12 @@ void G_DisplayRest(int32_t smoothratio)
             Net_DisplaySyncMsg(); // MP: paint "Out Of Sync" verdicts (also latches g_foundSyncError)
 
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        // Watcher mode (late join / targeted heal): the world is streaming to
+        // live. Say so honestly -- before this line existed, the sync verdicts
+        // screamed "Out Of Sync" at a joiner that was never out of anything.
+        if (numplayers > 1 && g_netJoinCatchup)
+            printext256(4, 100, 31, 1, "SYNCHRONIZING...", 0);
+
         // Q3-style "connection interrupted": the lockstep consume gate has been
         // starved for over a second. Names the peers we are waiting on; the
         // master drops them (deterministically) after NET_STALL_DROP.

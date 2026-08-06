@@ -438,7 +438,8 @@ static int32_t s_sessionStartClock;  // stamped at every barrier (warm-up window
 input_t g_netSendRing[MOVEFIFOSIZ];  // slave: local samples staged for the wire + predictor
 int32_t g_netSampleHead;             // slave: absolute tic of the next local sample
 int32_t g_netFillTics;               // master: synthesized tics (deadline/join fill)
-int32_t g_netJoinCatchup;            // joiner: applied the snapshot, streaming to live
+int32_t g_netJoinCatchup;            // joiner/healing guest: applied the snapshot, streaming to live
+int32_t g_netDesyncReporters;        // host: bitmask of guests whose DESYNC_REPORT named them diverged
 
 // Join boundary table, the exact mirror of s_goneTic: >= 0 names the first tic
 // WITH this player. Persists for the session (record membership for tics below
@@ -467,6 +468,20 @@ static int32_t s_joinFlowBase;       // movefifoplc at snapshot save: the joiner
 static int32_t  s_snapshotPlc;       // host movefifoplc at snapshot save
 static int      s_snapshotIsJoin;    // 1 = barrier-free join/catchup, 0 = legacy resync broadcast
 
+// Targeted heal (a JOIN flow for an already-seated guest: same snapshot stream,
+// same retry/kick machinery, no seat -- the guest self-resumes at the live edge).
+static int      s_joinFlowIsHeal;    // host: the active flow heals a seated guest
+static int32_t  s_healBasePlc = -1;  // guest: snapshot tic of the heal being caught up
+// Ack-generation fence: unlike a joiner (fresh peer), a heal target has stale
+// S2Ms in flight that still ack the PRE-apply stream near live. The monotonic
+// ack guard would lift the rebased s_slaveAck back up, complete the flow
+// early, and then reject the guest's post-apply (regressed) acks forever --
+// a permanent gap-drop wedge. Post-apply S2Ms are unmistakable: the apply
+// zeroes the guest's sample cursor, so its packets carry startTic==0 (a live
+// mid-session guest's start is its master-acked sample tic, never 0). Ignore
+// the heal slot's acks until that marker arrives.
+static int      s_healAckFence;      // host: 1 = post-apply acks are flowing
+
 static struct JoinTicInit { JoinTicInit() { for (auto &t : s_joinTic) t = -1; } } s_joinTicInit;
 
 static void Net_ResetProtocolState(void)
@@ -479,11 +494,15 @@ static void Net_ResetProtocolState(void)
     g_netSampleHead = 0;
     Bmemset(g_netSendRing, 0, sizeof(g_netSendRing));
     g_netJoinCatchup = 0;
+    g_netDesyncReporters = 0;
     s_joinAwaitReal  = 0;
     s_fillActive     = 0;
     s_joinFlowSlot   = -1;
     s_joinFlowClock  = 0;
     s_joinFlowTries  = 0;
+    s_joinFlowIsHeal = 0;
+    s_healBasePlc    = -1;
+    s_healAckFence   = 0;
     for (int i = 0; i < MAXPLAYERS; i++)
     {
         s_slaveAck[i] = s_lastSendClock[i] = 0;
@@ -623,6 +642,13 @@ static void Net_CheckPeerHealth(void)
             continue;
 
         if (s_peerDownMask & (1 << i)) { Net_ScheduleDrop(i, "connection lost"); continue; }
+
+        // A guest mid-HEAL is chain-connected but deliberately silent: it is
+        // reloading the snapshot and its catchup S2Ms carry only acks (no real
+        // records), so the silence axe would kick it in the middle of the cure.
+        // The flow has its own failure handling (retry -> kick); keep its
+        // liveness clock fresh so the axe restarts cleanly after the resume.
+        if (i == s_joinFlowSlot) { s_lastRealRecvClock[i] = now; continue; }
 
         if (s_lastRealRecvClock[i] > now)   // totalclock reset
             s_lastRealRecvClock[i] = now;
@@ -809,8 +835,11 @@ void Net_HandleInput(void)
     {
         // Divergence visibility is lag-asymmetric: this guest's compares can
         // flag a split the host's never will. Report it (reliable, throttled);
-        // the host latches g_foundSyncError and pushes the healing snapshot.
-        if (g_foundSyncError || Net_SyncErrorDetected())
+        // the host latches g_foundSyncError and streams a healing snapshot.
+        // WATCHERS (unseated joiners / healing guests mid-catchup) never
+        // report: their compares are gated off, and any stale latch from
+        // before the catchup must not re-trigger the heal that just ran.
+        if (seated && (g_foundSyncError || Net_SyncErrorDetected()))
         {
             static int32_t s_lastReportClock;
             int32_t const now = (int32_t)totalclock;
@@ -1351,7 +1380,16 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 int32_t const count = (uint8_t)packbuf[j++];
                 {
                     int32_t const ack = (int32_t)B_UNBUF32(&packbuf[j]); j += 4;
-                    if (ack > s_slaveAck[other])   // monotonic: reorder-safe
+                    if (s_joinFlowIsHeal && other == s_joinFlowSlot && !s_healAckFence)
+                    {
+                        // Heal in flight: stale pre-apply acks must not lift the
+                        // rebased cursor (see s_healAckFence). Every post-apply
+                        // catchup S2M carries startTic==0 -- that arms the fence.
+                        if (start == 0)
+                            s_healAckFence = 1;
+                    }
+                    if ((!s_joinFlowIsHeal || other != s_joinFlowSlot || s_healAckFence)
+                        && ack > s_slaveAck[other])   // monotonic: reorder-safe
                         s_slaveAck[other] = ack;
                 }
 
@@ -1501,13 +1539,17 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
             case PACKET_TYPE_DESYNC_REPORT:
             {
                 // A guest's CRCs flagged a split we may never see ourselves.
-                // Latch the verdict; the auto-resync consumer (menus.cpp,
-                // host-gated, cooldown) pushes the healing snapshot.
-                if (myconnectindex == connecthead)
+                // Latch the verdict AND the reporter; the heal consumer
+                // (menus.cpp, host-gated, cooldown) streams a targeted
+                // snapshot to the diverged peer only -- veterans play on.
+                // Reports from unseated peers are noise by the watcher
+                // contract (they should not send them; old builds might).
+                if (myconnectindex == connecthead && g_player[other].connected)
                 {
                     g_foundSyncError = true;
+                    g_netDesyncReporters |= (1 << other);
 #ifdef __EMSCRIPTEN__
-                    EM_ASM({ console.log('[eng] desync report from peer ' + $0 + ' -> resync'); }, other);
+                    EM_ASM({ console.log('[eng] desync report from peer ' + $0 + ' -> targeted heal'); }, other);
 #endif
                 }
                 break;
@@ -1961,18 +2003,21 @@ extern "C" void Web_ForceDesync(void)
     auto const ps = g_player[myconnectindex].ps;
     if (ps == NULL || !(ps->gm & MODE_GAME))
         return;
-    // Multi-target on purpose: the ccall can land while the engine is
-    // suspended inside a predicted-view swap (ps would be the predicted COPY,
-    // wiped at the next reconcile) and the player sprite is rewritten from ps
-    // every tic -- but walls and sectors have no predicted copies and nothing
-    // rewrites them, so Sync_Map flags them for as long as the fork lives.
+    // Fork like a REAL desync: divergent-but-VALID state. The old wall/sector
+    // teleport corrupted geometry outright -- under the targeted heal the
+    // diverged peer keeps SIMMING until the snapshot lands (the old broadcast
+    // stopped the world almost immediately), and clipmove over a degenerate
+    // wall can spin the wasm main loop (soak: guest heartbeat died seconds
+    // after the fork, before sav_begin ever arrived). randomseed is genuine
+    // lockstep state (post-5l): every krand consumer diverges from the next
+    // tic on, self-sustaining, and the world stays self-consistent -- exactly
+    // the shape of an organic desync. The ps nudge makes it instant + visible
+    // (cat 1 RNG + cat 2/7 positions flag on the next stamp).
     ps->pos.x += 256;
     if ((unsigned)ps->i < MAXSPRITES)
         sprite[ps->i].x += 256;
-    if (numwalls > 0)
-        wall[0].x += 16;
-    if (numsectors > 0)
-        sector[0].floorz += 256;
+    randomseed ^= 0x5A5A;
+    g_globalRandom ^= 0xA5;
     EM_ASM({ console.log('[eng] Web_ForceDesync: forked (psIsPredicted=' + $0 + ')'); },
            (ps == &predictedPlayer) ? 1 : 0);
 }
@@ -2054,6 +2099,12 @@ int Net_ApplyLateJoinSnapshot(void)
 
     // Seat BEFORE loading: G_LoadPlayer rejects h.numplayers != ud.multimode.
     uint32_t const seatBits = g_netSnapshotMask & 0xffffu;
+    // TARGETED HEAL: a "join" snapshot whose roster contains US. We are a
+    // seated player being handed fresh authoritative state: same catchup
+    // stream, but our ps comes from the save (no host shadow), we keep our
+    // own view, and there is no seat coming -- we self-resume at the live
+    // edge (Net_CheckHealResume). A real joiner is NEVER in the mask.
+    bool const healMode = joinMode && ((seatBits >> myIdx) & 1);
     // Adopt the sender's move epoch EXACTLY (a resync host bumped before sending;
     // a join host did NOT -- the joiner slots into the RUNNING generation).
     g_netMoveEpoch = (uint8_t)((g_netSnapshotMask >> 16) & 0xff);
@@ -2078,7 +2129,9 @@ int Net_ApplyLateJoinSnapshot(void)
     // The snapshot carries the HOST's view of every per-player struct; OUR identity
     // is local state and must survive the load.
     myconnectindex = myIdx;
-    screenpeek     = joinMode ? connecthead : myPeek;   // joiner: spectate while syncing
+    // Joiner: spectate the host while syncing. Healing guest: keep own view
+    // (our player exists in the snapshot; the world fast-forwards around it).
+    screenpeek     = (joinMode && !healMode) ? connecthead : myPeek;
     Net_SeatLateJoiners(); // re-assert chain + quitflags over whatever the load restored
 
     if (joinMode && r == 0)
@@ -2100,12 +2153,17 @@ int Net_ApplyLateJoinSnapshot(void)
             extern int32_t g_worldExecs;   // align the epoch-relative world-step count
             g_worldExecs = s_snapshotPlc;
         }
-        // Our slot is NOT in the world yet; input/HUD paths still dereference our
-        // ps. Shadow the host's player until the deterministic seat replaces it.
-        G_MaybeAllocPlayer(myIdx);
-        if (g_player[connecthead].ps != NULL)
-            Bmemcpy(g_player[myIdx].ps, g_player[connecthead].ps, sizeof(DukePlayer_t));
-        g_player[myIdx].ps->gm = MODE_GAME;
+        if (!healMode)
+        {
+            // Our slot is NOT in the world yet; input/HUD paths still dereference our
+            // ps. Shadow the host's player until the deterministic seat replaces it.
+            G_MaybeAllocPlayer(myIdx);
+            if (g_player[connecthead].ps != NULL)
+                Bmemcpy(g_player[myIdx].ps, g_player[connecthead].ps, sizeof(DukePlayer_t));
+            g_player[myIdx].ps->gm = MODE_GAME;
+        }
+        else
+            s_healBasePlc = s_snapshotPlc;   // arms the self-resume check
         ready2send = 1;                 // pump ON: the catchup acks must flow
     }
     else if (joinMode)
@@ -2236,17 +2294,46 @@ void Net_HostJoinFlow(void)
     if (s_joinFlowSlot >= 0)
     {
         int const k = s_joinFlowSlot;
-        if (g_player[k].connected)   // insert applied on our own sim: flow done
+        if (!s_joinFlowIsHeal && g_player[k].connected)   // insert applied on our own sim: flow done
         {
             s_joinFlowSlot = -1;
             return;
         }
-        if (s_joinTic[k] >= 0)       // stamped; every sim seats when it crosses the tic
+        if (s_joinFlowIsHeal && !g_player[k].connected)
+        {
+            // The heal target dropped mid-cure (peer-down/quit excised it):
+            // nothing left to heal. Latches were for this peer; clear them.
+            s_joinFlowSlot = -1;
+            s_joinFlowIsHeal = 0;
+            g_netDesyncReporters = 0;
+            Net_ResetSyncCheck();
+            return;
+        }
+        if (!s_joinFlowIsHeal && s_joinTic[k] >= 0)   // stamped; every sim seats when it crosses the tic
             return;
 
         int32_t const gap = movefifosendplc - s_slaveAck[k];
         if (s_slaveAck[k] > s_joinFlowBase && gap <= 8)
         {
+            if (s_joinFlowIsHeal)
+            {
+                // Healed guest is back at the live edge (it self-resumes at its
+                // end -- no seat: its membership never changed). Clear our own
+                // divergence latches NOW: everything they recorded described
+                // the world this snapshot just replaced.
+                initprintf("net: heal complete for slot %d (gap %d)\n", k, gap);
+#ifdef __EMSCRIPTEN__
+                EM_ASM({ console.log('[eng] healFlow complete p=' + $0); }, k);
+#endif
+                s_joinFlowSlot = -1;
+                s_joinFlowIsHeal = 0;
+                // Stale reports from before the guest's apply may still be in
+                // flight; drop ALL reporter bits -- a peer that is genuinely
+                // still diverged re-reports within seconds and re-targets.
+                g_netDesyncReporters = 0;
+                Net_ResetSyncCheck();
+                return;
+            }
             // Caught up FOR REAL (acks advanced past the snapshot base AND
             // near-live): seat at the aggregation head plus a margin every peer
             // will cross AFTER the announcement (it rides every M2S packet).
@@ -2264,9 +2351,16 @@ void Net_HostJoinFlow(void)
             // warmer every pass. Persistent failure -> kick.
             if (++s_joinFlowTries >= NET_JOIN_TRIES)
             {
-                initprintf("net: joiner %d cannot catch up -> kick\n", k);
+                initprintf("net: %s %d cannot catch up -> kick\n",
+                           s_joinFlowIsHeal ? "heal target" : "joiner", k);
                 net_kick(k);
                 s_joinFlowSlot = -1;
+                if (s_joinFlowIsHeal)
+                {
+                    s_joinFlowIsHeal = 0;
+                    g_netDesyncReporters = 0;
+                    Net_ResetSyncCheck();   // the diverged copy left with the kick
+                }
                 return;
             }
             if (Net_SaveLateJoinSnapshot() == 0)
@@ -2279,9 +2373,11 @@ void Net_HostJoinFlow(void)
                 s_joinFlowClock = now;
                 s_joinFlowBase  = movefifoplc;
                 s_slaveAck[k]   = movefifoplc;
+                if (s_joinFlowIsHeal)
+                    s_healAckFence = 0;   // fresh apply expected: re-fence
                 netmenu_send_snapshot_to(seatMask, k, movefifoplc, 1);
-                initprintf("net: join retry %d for slot %d (snapshot at tic %d)\n",
-                           s_joinFlowTries, k, movefifoplc);
+                initprintf("net: %s retry %d for slot %d (snapshot at tic %d)\n",
+                           s_joinFlowIsHeal ? "heal" : "join", s_joinFlowTries, k, movefifoplc);
             }
         }
         return;
@@ -2310,6 +2406,7 @@ void Net_HostJoinFlow(void)
     seatMask |= ((int)g_netMoveEpoch) << 16;
 
     s_joinFlowSlot  = k;
+    s_joinFlowIsHeal = 0;
     s_joinFlowClock = now;
     s_joinFlowTries = 0;
     s_joinTic[k]    = -1;
@@ -2320,6 +2417,88 @@ void Net_HostJoinFlow(void)
     initprintf("net: barrier-free join started for slot %d (snapshot at tic %d)\n", k, movefifoplc);
 #ifdef __EMSCRIPTEN__
     EM_ASM({ console.log('[eng] joinFlow start p=' + $0 + ' plc=' + $1); }, k, movefifoplc);
+#endif
+}
+
+// TARGETED RESYNC: heal ONE diverged guest with the join streamer, minus the
+// seat. The snapshot goes to the flagged peer only; veterans stream on
+// untouched (deadline-fill covers the healing guest's column while it
+// reloads). No epoch bump -- the running generation must keep flowing for
+// everyone else, exactly like a join. The old broadcast heal reloaded EVERY
+// peer through a barrier: one guest's divergence froze the whole match.
+// Returns 0 if the flow started.
+int Net_StartHealFlow(int k)
+{
+    if (myconnectindex != connecthead || s_joinFlowSlot >= 0
+        || (unsigned)k >= MAXPLAYERS || k == myconnectindex
+        || !g_player[k].connected || numplayers < 2)
+        return -1;
+
+    if (Net_SaveLateJoinSnapshot() != 0)
+    {
+        initprintf("net: heal snapshot save FAILED for slot %d\n", k);
+        return -1;
+    }
+
+    int seatMask = 0;
+    for (int i = 0; i < MAXPLAYERS && i < 16; i++)
+        if (g_player[i].connected)
+            seatMask |= (1 << i);
+    // Same generation, like a join: the target slots back into the RUNNING
+    // stream. (The receiver tells heal from join by finding ITSELF in the
+    // seat mask -- a join snapshot never includes the joiner.)
+    seatMask |= ((int)g_netMoveEpoch) << 16;
+
+    s_joinFlowSlot   = k;
+    s_joinFlowIsHeal = 1;
+    s_healAckFence   = 0;                    // ignore stale pre-apply acks (see decl)
+    s_joinFlowClock  = (int32_t)totalclock;
+    s_joinFlowTries  = 0;
+    s_joinFlowBase   = movefifoplc;
+    s_slaveAck[k]    = movefifoplc;          // resend window rebases to the snapshot tic
+    s_lastRealRecvClock[k] = (int32_t)totalclock;
+    // Fresh evidence only: whatever this peer reported described the world
+    // the snapshot replaces. (Our own latches clear when the flow ends.)
+    g_netDesyncReporters &= ~(1 << k);
+    desynched_players[k] = 0;
+    netmenu_send_snapshot_to(seatMask, k, movefifoplc, 1);
+    initprintf("net: targeted heal started for slot %d (snapshot at tic %d)\n", k, movefifoplc);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('[eng] healFlow start p=' + $0 + ' plc=' + $1); }, k, movefifoplc);
+#endif
+    return 0;
+}
+
+// Healing guest: back at the live edge -> leave watcher mode and resume
+// playing. Unlike a join there is NO deterministic boundary to honor: our
+// membership never changed and our column kept flowing (master fill), so the
+// only handoff is local -- restart the sampler at the live cursor and let the
+// first real record end the fill. movefifosendplc is the contiguous M2S
+// high-water: draining the consume cursor to within a few tics of it IS
+// "caught up" (the same measure the host applies to our acks).
+void Net_CheckHealResume(void)
+{
+    if (!g_netJoinCatchup || !g_player[myconnectindex].connected
+        || myconnectindex == connecthead || s_healBasePlc < 0)
+        return;
+    if (movefifoplc <= s_healBasePlc || movefifosendplc - movefifoplc > 8)
+        return;
+
+    g_netJoinCatchup = 0;
+    s_healBasePlc    = -1;
+    screenpeek       = myconnectindex;
+    g_netSampleHead  = movefifoplc;
+    s_ackOfMyInput   = movefifoplc;
+    // The catchup sampler never ran: reset the lag/jitter bookkeeping exactly
+    // like the join seat does, or the first timer-nudge jerks totalclock.
+    for (int p2 = 0; p2 < MAXPLAYERS; p2++)
+        g_player[p2].myminlag = 0x7fffffff;
+    mymaxlag = otherminlag = 0;
+    Net_InitializePrediction();
+    g_netCompareFloorTic = movefifoplc + 30;   // settle grace before compares re-arm
+    initprintf("net: heal caught up at tic %d -- resuming play\n", movefifoplc);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('[eng] healResume plc=' + $0); }, movefifoplc);
 #endif
 }
 

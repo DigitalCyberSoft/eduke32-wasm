@@ -61,6 +61,27 @@ static int32_t s_cmpTic[MAXPLAYERS][MOVEFIFOSIZ];
 // at tic 88: every category local=0, own input column zeroed, remote sane).
 int32_t g_syncStampTic[MOVEFIFOSIZ];
 
+// Comparison floor: no stamp below this tic is ever compared. The old check
+// was absolute (tickNum < 30) -- correct only for a tic-0 launch. Every OTHER
+// racy window this grace exists for starts mid-timeline (late-join catchup at
+// snapshotPlc, post-heal reload, the joiner's seat) where tics are in the
+// thousands and the absolute check was dead code: settle artifacts flagged
+// instantly. Reset sites raise the floor to "now + 1s of tics".
+int32_t g_netCompareFloorTic = 30;
+
+// PERSISTENCE GATE: a verdict must be proportionate to the evidence. The sim
+// produces occasional ONE-TIC flickers (something crosses a tic boundary out
+// of phase, then settles -- paired STATDUMPs prove the worlds equal at rest)
+// and a single flagged tic used to latch the full alarm/report/heal chain: a
+// 7-second reload cure for a self-healing hiccup, in a loop. A REAL fork
+// flags every compared tic, so score +3 per flagged tic, -1 per clean tic,
+// and only latch the verdict at 30 (~10 net flagged tics ~ 0.5s of genuine
+// divergence; isolated flickers decay to zero). Cats seen while the score is
+// nonzero accumulate so the eventual latch names every diverging category.
+static int32_t  s_flagScore;
+static uint32_t s_flagCatMask;
+enum { SYNC_LATCH_SCORE = 30 };
+
 // Clear the divergence verdict (auto-resync: the host just pushed an
 // authoritative snapshot and every peer reloaded identical state).
 void Net_ResetSyncCheck(void)
@@ -68,11 +89,15 @@ void Net_ResetSyncCheck(void)
     g_foundSyncError = false;
     Bmemset(syncError, 0, sizeof(syncError));
     Bmemset(g_szfirstSyncMsg, 0, sizeof(g_szfirstSyncMsg));
+    Bmemset(desynched_players, 0, sizeof(desynched_players));
     for (auto &row : s_cmpTic)
         for (auto &t : row)
             t = -1;
     for (auto &t : g_syncStampTic)
         t = -1;
+    g_netCompareFloorTic = movefifoplc + 30;
+    s_flagScore   = 0;
+    s_flagCatMask = 0;
 }
 bool g_foundSyncError = false;
 
@@ -595,6 +620,12 @@ void Net_DisplaySyncMsg(void)
     if (numplayers < 2)
         return;
 
+    // A watcher (joiner/healing guest mid-catchup) has nothing to say about
+    // sync -- and nothing should scream at it while it loads in. The catchup
+    // progress line lives in screens.cpp.
+    if (g_netJoinCatchup)
+        return;
+
     for (int32_t i = 0; i < NUM_SYNC_TYPES; i++)
     {
         // syncError is NON 0 - out of sync
@@ -635,12 +666,18 @@ void Net_DisplaySyncMsg(void)
             sprintf(tempbuf, "moveCount %d",moveCount);
             printext256(4, 52 + (i * 8), 31, 1, tempbuf, 0);
 
+            // Stock code reused `i` here. Latent for decades: with NUM_SYNC_TYPES
+            // <= MAXPLAYERS the clobber merely ended the outer loop early. The
+            // 5o deep categories (16-20) armed it: a latched message at index
+            // >= MAXPLAYERS resets i to 16 forever -> INFINITE LOOP in the
+            // render path = the whole wasm main loop wedges (browser tab
+            // freezes) on the first real deep-cat divergence.
             int ypos = 180;
-            for (i = 0; i < MAXPLAYERS; i++)
+            for (int32_t p = 0; p < MAXPLAYERS; p++)
             {
-                if (desynched_players[i] == 1)
+                if (desynched_players[p] == 1)
                 {
-                    Bsprintf(tempbuf, "DESYNCHED: %s (IDX: %d)", g_player[i].user_name, i);
+                    Bsprintf(tempbuf, "DESYNCHED: %s (IDX: %d)", g_player[p].user_name, p);
                     printext256(4, ypos, 31, 0, tempbuf, 0);
                     ypos += 8;
                 }
@@ -666,6 +703,16 @@ void Net_AddSyncInfoToPacket(int *j)
 
     if (g_gameQuit || numplayers < 2)
         return;
+
+    // WATCHER CONTRACT: a catchup peer ships no stamps -- its replay is not
+    // evidence about the live match, and stale catchup stamps arriving after
+    // the seat would compare against the wrong generation. Pinning the cursor
+    // means only tics stamped AFTER it goes live ever leave this machine.
+    if (g_netJoinCatchup)
+    {
+        p->lastSyncTick = movefifoplc;
+        return;
+    }
 
     int32_t const newest = movefifoplc;
     int32_t from = p->lastSyncTick + 1;
@@ -704,18 +751,27 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
     if (!ready2send || !g_player[otherconnectindex].connected || g_gameQuit)
         continue;
 
+    // WATCHER CONTRACT: a peer that is not alive in the match -- a joiner or
+    // healing guest mid-catchup -- is a spectator of the stream, not a sync
+    // participant. Its world is a replay-in-progress; comparing it latched
+    // "Out Of Sync" + the alarm on the joiner's screen before it ever played
+    // (live-reported). It neither compares nor reports until it is seated.
+    if (g_netJoinCatchup)
+        continue;
+
     // Reject tics outside the live ring window: the move channel is unreliable/
     // unordered, so a badly delayed packet could otherwise compare a REMOTE tic
     // against a syncData slot that has been REUSED by a newer generation
     // (tickNum & (MOVEFIFOSIZ-1) aliases every MOVEFIFOSIZ tics) and latch a
     // false "Out Of Sync" that triggers a needless resync.
-    // tickNum < 30: comparison grace for the first second of every session.
-    // The moments right after a barrier/snapshot reload are racy on purpose
-    // (rings refill, cursors reset, stale stamps drain) and comparing there
-    // produced false flags that re-triggered the auto-resync in a loop
-    // (soak-caught: post-heal sessions re-flagged at tic 1-2 with zero-hash
-    // artifacts). Real divergence persists past the grace and still flags.
-    if (tickNum < 30 || (tickNum > movefifoplc)
+    // The compare floor is the settle grace (~1s of tics past the last reset,
+    // seat, or heal): the moments right after a barrier/snapshot reload are
+    // racy on purpose (rings refill, cursors reset, stale stamps drain) and
+    // comparing there produced false flags that re-triggered the auto-resync
+    // in a loop. The floor is RELATIVE -- the old absolute tickNum<30 check
+    // only ever covered a tic-0 launch and was dead code for every
+    // mid-timeline reload. Real divergence persists past the grace and flags.
+    if (tickNum < g_netCompareFloorTic || (tickNum > movefifoplc)
         || tickNum <= movefifoplc - (MOVEFIFOSIZ - 8))
         continue;
     if (g_syncStampTic[tickNum & (MOVEFIFOSIZ - 1)] != tickNum)
@@ -727,6 +783,7 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
     g_netSyncCompares++; // debug surface: proves the CRC comparison actually runs
 
     // Grab sync info from packet buffer
+    uint32_t tickMask = 0;
     for (int32_t sb = 0; sb < NUM_SYNC_TYPES; sb++)
     {
         char head_sync = syncData[tickNum & (MOVEFIFOSIZ - 1)][sb];
@@ -734,11 +791,19 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
 
         if (player_sync != head_sync)
         {
-            if (!syncError[sb])
-            {
-                OSD_Printf("Desynchronized! Player: %d, Type: %s, Head CRC: %d, Player CRC: %d, TickNum: %d, MoveFifoPlc: %d\n", otherconnectindex, syncType[sb].name, head_sync, player_sync, tickNum, movefifoplc);
-                syncError[sb] = true;
-            }
+            // Cats 0-15 are GAMEPLAY truth (world/players/inputs/spawns/gates)
+            // and feed the verdict. Cats 16-20 are FORENSIC deep-hashes -- they
+            // sweep state no gameplay path reads (all-statnum positions include
+            // decoration/limbo sprites; krand counts; cumulative counters) and
+            // exist to NAME a fork for the hunt, not to prove one matters. A
+            // known benign residual lives there: after a heal load, one sprite
+            // runs a persistent one-tic phase lag (cat 18 flags every tic with
+            // +/-tiny CRC deltas; paired STATDUMPs match at ADJACENT tics; all
+            // gameplay cats stay clean for minutes). Latching on it produced a
+            // 7s reload cure, in a loop, for a cosmetic hiccup. If the laggard
+            // ever touches gameplay, cats 1-6/13/14 flag and the heal fires.
+            if (sb <= 15)
+                tickMask |= ((uint32_t)1 << sb);
 
 #if defined(__EMSCRIPTEN__)
             // DEBUG (desync validation): the first few RAW mismatches, typed.
@@ -815,8 +880,32 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
                 }
             }
 #endif
-            desynched_players[otherconnectindex] = 1;
         }
+    }
+
+    // Persistence scoring (see s_flagScore): raw per-tic mismatches feed the
+    // score; only a SUSTAINED run of flagged tics latches the verdict that
+    // drives the UI, the guest's DESYNC_REPORT, and the host's targeted heal.
+    if (tickMask)
+    {
+        s_flagCatMask |= tickMask;
+        s_flagScore = min(s_flagScore + 3, SYNC_LATCH_SCORE * 2);
+    }
+    else if (s_flagScore > 0 && --s_flagScore == 0)
+        s_flagCatMask = 0;
+
+    if (s_flagScore >= SYNC_LATCH_SCORE)
+    {
+        for (int32_t sb = 0; sb < NUM_SYNC_TYPES; sb++)
+        {
+            if ((s_flagCatMask & ((uint32_t)1 << sb)) && !syncError[sb])
+            {
+                OSD_Printf("Desynchronized! Player: %d, Type: %s, TickNum: %d, MoveFifoPlc: %d\n",
+                           otherconnectindex, syncType[sb].name, tickNum, movefifoplc);
+                syncError[sb] = true;
+            }
+        }
+        desynched_players[otherconnectindex] = 1;
     }
     }   // stamp loop
 }

@@ -181,10 +181,18 @@ void Net_FlushPendingDrops(void); // barrier entry: fold pending drops into the 
 extern input_t g_netSendRing[MOVEFIFOSIZ]; // slave: locally sampled inputs staged for S2M + prediction
 extern int32_t g_netSampleHead;   // slave: absolute tic of the next local sample
 extern int32_t g_netFillTics;     // master: tics synthesized past the fill deadline (telemetry)
-extern int32_t g_netJoinCatchup;  // joiner: snapshot applied, streaming to live; render spectates
+extern int32_t g_netJoinCatchup;  // joiner/healing guest: snapshot applied, streaming to live
 void Net_ApplyPendingJoins(void); // deterministic seat at the master-stamped joinTic (all peers)
 void Net_HostJoinFlow(void);      // host: barrier-free join state machine (menus.cpp frame point)
-int  Net_JoinFlowActive(void);    // a join is streaming/announced: defer the resync broadcast
+int  Net_JoinFlowActive(void);    // a join is streaming/announced: defer any heal until it lands
+
+// ── Targeted resync (the join streamer minus the seat) ───────────────────────
+// A diverged guest reloads a host snapshot and catches up while everyone else
+// plays on (deadline-fill covers its column). The old broadcast heal reloaded
+// every peer through a barrier: one guest's divergence froze the whole match.
+extern int32_t g_netDesyncReporters; // host: guests whose DESYNC_REPORT named them diverged
+int  Net_StartHealFlow(int k);    // host: begin healing seat k (0 = flow started)
+void Net_CheckHealResume(void);   // healing guest: leave watcher mode at the live edge
 
 //OLDNET_EXTERN PredictBackup_t predictBackup[MOVEFIFOSIZ];
 

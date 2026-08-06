@@ -2553,7 +2553,16 @@ static void postloadplayer(int32_t savegamep)
 
     //6
     g_showShareware = 0;
-    if (savegamep)
+    // everyothertime is LOCKSTEP STATE: it gates half-rate sim paths
+    // (G_AnimateWalls/A_MoveCyclers on even values -- with krand draws
+    // inside -- and per-actor A_SetSprite on odd). Zeroing it after an
+    // ASYMMETRIC net load (targeted heal, barrier-free join: only ONE peer
+    // reloads) flips that peer's parity against the others whenever the
+    // saved value was odd -> the krand stream and half-rate movement phase
+    // shift -> guaranteed same-inputs wholesale fork within a tic (this was
+    // the heal loop AND the joiner's instant "Out Of Sync"). The symmetric
+    // cases (SP, everyone-reloads broadcast) never cared either way.
+    if (savegamep && numplayers < 2)
         everyothertime = 0;
 
     //7

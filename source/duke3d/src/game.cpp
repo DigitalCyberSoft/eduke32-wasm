@@ -7550,6 +7550,9 @@ int G_MoveLoop(void)
     // prediction runs and before the gate looks at anyone's input.
     Net_ApplyPendingJoins();
     Net_ApplyPendingDrops();
+    // Healing guest at the live edge: hand back the controls (frame-top is
+    // fine -- unlike a seat, the resume tic has no cross-peer meaning).
+    Net_CheckHealResume();
     if (numplayers < 2)
         return 0;   // dropped to solo: app_main's numplayers gate reroutes next frame
 #endif

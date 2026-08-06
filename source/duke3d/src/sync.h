@@ -18,6 +18,8 @@ void Net_DisplaySyncMsg(void);
 extern int8_t syncData[MOVEFIFOSIZ][MAX_SYNC_TYPES];
 extern bool syncError[MAX_SYNC_TYPES];
 extern bool g_foundSyncError;
+extern int  desynched_players[MAXPLAYERS];   // per-peer mismatch flags (host: heal targeting)
+extern int32_t g_netCompareFloorTic;         // stamps below this tic are never compared
 
 void initsynccrc(void);
 void Net_GetSyncStat(void);

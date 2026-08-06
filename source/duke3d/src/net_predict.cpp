@@ -220,6 +220,11 @@ void Net_BeginPredictedView(void)
     extern int32_t g_netPredictMode;  // DEBUG bisect (oldnet.cpp)
     if (!(g_netPredictMode & 2))
         return;
+    // A healing guest mid-catchup keeps its own view but prediction is paused:
+    // predictedPlayer holds pre-heal state. Render authoritative -- the world
+    // visibly fast-forwards to live, then the resume re-inits prediction.
+    if (g_netJoinCatchup)
+        return;
     if (s_viewSwapSaved != NULL || numplayers < 2 || screenpeek != myconnectindex
         || originalPlayer == NULL || ud.pause_on)
         return;
