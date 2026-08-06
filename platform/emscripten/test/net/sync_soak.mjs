@@ -12,11 +12,21 @@ const LOG = `/tmp/sync_soak_${MODE}.log`;
 fs.writeFileSync(LOG, `=== sync soak ${MODE} ${new Date().toISOString()} ===\n`);
 const rec = (m) => fs.appendFileSync(LOG, m + '\n');
 const sh = (c) => { try { return execSync(c, { encoding: 'utf8' }).trim(); } catch { return ''; } };
-const keys = (...ks) => { for (const k of ks) { sh(`DISPLAY=:7 xdotool keydown --clearmodifiers ${k}`); sh(`sleep 0.15`); sh(`DISPLAY=:7 xdotool keyup ${k}`); sh(`sleep 0.7`); } };
+// FULLY HEADLESS input: CDP keyboard events land on the focused canvas and
+// reach emscripten-SDL identically to X keys. No Xvfb/xdotool/window focus --
+// kills the whole "unfocused window auto-opened the menu" rig-artifact class.
+// MACHINE SAFETY: this rig runs 3 chromium instances with WASM heaps and has
+// locked up the box before (swap exhaustion). Do not launch with swap pegged
+// or low MemAvailable, and if the browsers get killed externally that is the
+// OWNER stopping a run that is hurting the machine -- STOP, do not relaunch.
+const KEYMAP = { Up: 'ArrowUp', Down: 'ArrowDown', Left: 'ArrowLeft', Right: 'ArrowRight', Return: 'Enter', control: 'Control' };
+const kdown = (p, k) => p.keyboard.down(KEYMAP[k] || k).catch(() => {});
+const kup = (p, k) => p.keyboard.up(KEYMAP[k] || k).catch(() => {});
+const keys = async (...ks) => { for (const k of ks) { await kdown(H, k); sh(`sleep 0.15`); await kup(H, k); sh(`sleep 0.7`); } };
 const pids = () => { try { return new Set(execSync(`pgrep -f 'ms-playwright.*(chrome|chromium)|--headless'`, { encoding: 'utf8' }).split(/\s+/).filter(Boolean).map(Number)); } catch { return new Set(); } };
 const before = pids();
 
-const ringAll = { H: [], G: [] };
+const ringAll = { H: [], G: [], G2: [] };
 // PREDMODE env (debug bisect): bit0=correction pass, bit1=view swap. Applied
 // to every page right after boot; absent = engine default (3).
 const PREDMODE = process.env.PREDMODE;
@@ -25,6 +35,11 @@ async function applyPredMode(page) {
   await page.evaluate((m) => window.Module.ccall('Web_SetPredictMode', null, ['number'], [m]), Number(PREDMODE)).catch(() => {});
 }
 async function boot(page, tag) {
+  // Death forensics: a quiet all-page failure looks identical to an engine
+  // wedge in the polls. Timestamped events split crash / close / ext-kill.
+  page.on('crash', () => rec(`[${tag}:CRASH] ${new Date().toISOString()}`));
+  page.on('close', () => rec(`[${tag}:CLOSE] ${new Date().toISOString()}`));
+  page.context().browser()?.on('disconnected', () => rec(`[${tag}:BROWSER-GONE] ${new Date().toISOString()}`));
   page.on('console', m => { const r = ringAll[tag]; if (r) { r.push(m.text().slice(0, 200)); if (r.length > 40) r.shift(); } });
   await page.addInitScript(() => {
     window.__rejections = [];
@@ -45,16 +60,14 @@ async function boot(page, tag) {
 // LOSSQ (e.g. '?lossmove=25&jitmove=150') injects synthetic duke-move loss and
 // reorder on BOTH peers -- the loopback bench never drops anything on its own.
 const LOSSQ = process.env.LOSSQ || '';
-const hostBrowser = await chromium.launch({ headless: false, env: { ...process.env, DISPLAY: ':7' }, args: ['--mute-audio', '--autoplay-policy=no-user-gesture-required', '--window-position=0,0', '--window-size=1100,850', '--no-first-run'] });
+const HEADLESS_ARGS = ['--mute-audio', '--autoplay-policy=no-user-gesture-required',
+  '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows'];
+const hostBrowser = await chromium.launch({ headless: true, args: HEADLESS_ARGS });
 const H = await hostBrowser.newPage({ viewport: { width: 1024, height: 768 } });
 await H.goto('http://127.0.0.1:7800/' + LOSSQ, { waitUntil: 'commit', timeout: 60000 });
 if (!(await boot(H, 'H'))) { console.log('FAIL host boot'); process.exit(1); }
-const win = sh(`DISPLAY=:7 xdotool search --onlyvisible --class 'chrom' | tail -1`);
-sh(`DISPLAY=:7 xdotool windowfocus --sync ${win}`);
+await H.bringToFront().catch(() => {});
 await H.evaluate(() => { const c = document.querySelector('canvas'); if (c) { c.setAttribute('tabindex', '0'); c.focus(); } });
-const g = await H.evaluate(() => { const c = document.querySelector('canvas'); const r = c.getBoundingClientRect(); return { x: r.x, y: r.y, uiH: window.outerHeight - window.innerHeight }; });
-sh(`DISPLAY=:7 xdotool mousemove ${Math.round(g.x + 25)} ${Math.round(g.uiH + g.y + 25)}`);
-sh(`DISPLAY=:7 xdotool mousemove ${Math.round(g.x + 29)} ${Math.round(g.uiH + g.y + 29)}`);
 // evaluate() on a WEDGED (not crashed) page hangs forever -- no default
 // timeout. Race every poll so an engine wedge shows up as empty telemetry
 // instead of freezing the whole soak loop (learned: display-loop wedge run).
@@ -69,19 +82,19 @@ async function waitMenu(page, id, secs, label) {
 if (!(await waitMenu(H, 0, 30, 'MAIN'))) { console.log('FAIL main'); process.exit(1); }
 // SELECTION-VERIFIED navigation: press one arrow, confirm __e32menu.sel moved,
 // repeat -- immune to dropped/repeated keys at any frame rate.
-const tap = (k) => { sh(`DISPLAY=:7 xdotool keydown --clearmodifiers ${k}`); sh(`sleep 0.15`); sh(`DISPLAY=:7 xdotool keyup ${k}`); };
+const tap = async (k) => { await kdown(H, k); sh(`sleep 0.15`); await kup(H, k); };
 async function selTo(target, label, secs = 30) {
   for (let i = 0; i < secs * 2; i++) {
     const m = await st(H);
     if (m.sel === target) { rec(`${label}: sel=${target}`); return true; }
-    tap(m.sel >= 0 && m.sel > target ? 'Up' : 'Down');
+    await tap(m.sel >= 0 && m.sel > target ? 'Up' : 'Down');
     await new Promise(r => setTimeout(r, 500));
   }
   rec(`SEL TIMEOUT ${label}: ${JSON.stringify(await st(H))}`); return false;
 }
 async function enterTo(id, label, secs = 12) {
   for (let i = 0; i < secs; i++) {
-    tap('Return');
+    await tap('Return');
     for (let j = 0; j < 6; j++) { const m = await st(H); if (m.open === 1 && m.id === id) { rec(`${label} reached`); return true; } await new Promise(r => setTimeout(r, 500)); }
   }
   rec(`ENTER TIMEOUT ${label}: ${JSON.stringify(await st(H))}`); return false;
@@ -96,7 +109,7 @@ if (!invite) { console.log('FAIL invite'); process.exit(1); }
 rec(`invite ok (${invite.length})`);
 
 const preGuestPids = pids();
-const guestBrowser = await chromium.launch({ headless: false, env: { ...process.env, DISPLAY: ':8' }, args: ['--mute-audio', '--autoplay-policy=no-user-gesture-required', '--window-position=0,0', '--window-size=1100,850', '--no-first-run'] });
+const guestBrowser = await chromium.launch({ headless: true, args: HEADLESS_ARGS });
 const G = await guestBrowser.newPage({ viewport: { width: 1024, height: 768 } });
 await G.goto('http://127.0.0.1:7800/' + LOSSQ, { waitUntil: 'commit', timeout: 60000 });
 if (!(await boot(G, 'G'))) { console.log('FAIL guest boot'); process.exit(1); }
@@ -105,12 +118,8 @@ const guestOnlyPids = [...pids()].filter(x => !preGuestPids.has(x));
 // rendering -- every earlier "guest stuck at menu over black" screenshot was THIS
 // rig artifact, not the game. Park its pointer off the menu rows as well.
 {
-  const gwin = sh(`DISPLAY=:8 xdotool search --onlyvisible --class 'chrom' | tail -1`);
-  sh(`DISPLAY=:8 xdotool windowfocus --sync ${gwin}`);
+  await G.bringToFront().catch(() => {});
   await G.evaluate(() => { const c = document.querySelector('canvas'); if (c) { c.setAttribute('tabindex', '0'); c.focus(); } });
-  const gg = await G.evaluate(() => { const c = document.querySelector('canvas'); const r = c.getBoundingClientRect(); return { x: r.x, y: r.y, uiH: window.outerHeight - window.innerHeight }; });
-  sh(`DISPLAY=:8 xdotool mousemove ${Math.round(gg.x + 25)} ${Math.round(gg.uiH + gg.y + 25)}`);
-  sh(`DISPLAY=:8 xdotool mousemove ${Math.round(gg.x + 29)} ${Math.round(gg.uiH + gg.y + 29)}`);
 }
 
 if (MODE === 'normal' || MODE === 'loss' || MODE === 'guestexit' || MODE === 'desync' || MODE === 'latejoin3') {
@@ -126,7 +135,7 @@ if (MODE === 'normal' || MODE === 'loss' || MODE === 'guestexit' || MODE === 'de
   // NO-RESET proof: walk the host clearly off its spawn BEFORE the guest joins;
   // its position must SURVIVE the join (snapshot join preserves the world).
   await new Promise(r => setTimeout(r, 3000));
-  for (let b = 0; b < 3; b++) { sh(`DISPLAY=:7 xdotool keydown w`); sh(`sleep 0.7`); sh(`DISPLAY=:7 xdotool keyup w`); await new Promise(r => setTimeout(r, 500)); }
+  for (let b = 0; b < 3; b++) { await kdown(H, 'w'); sh(`sleep 0.7`); await kup(H, 'w'); await new Promise(r => setTimeout(r, 500)); }
   await new Promise(r => setTimeout(r, 1500));
   const pre = await st(H);
   global.__preJoinP0 = JSON.stringify(pre.p0);
@@ -185,9 +194,7 @@ if (MODE === 'hostexit') {
   // land back on the MAIN MENU (open:1 id:0 game:0) instead of starving/soloing.
   await new Promise(r => setTimeout(r, 8000));
   rec('killing host browser');
-  const hpids = sh(`pgrep -f 'ms-playwright.*chrom.*:7|--display=:7'`) || '';
   try { await hostBrowser.close(); } catch {}
-  sh(`DISPLAY=:7 true`);
   let backToMenu = false;
   for (let t = 0; t < 40; t++) {
     await new Promise(r => setTimeout(r, 1000));
@@ -207,8 +214,8 @@ if (MODE === 'guestexit') {
   // (b) deterministically drop the seat (np 2->1), then (c) accept a brand-new
   // guest into the running match via snapshot join.
   for (let t = 0; t < 8; t += 4) {
-    sh(`DISPLAY=:7 xdotool keydown w`); sh(`DISPLAY=:8 xdotool keydown w`); sh(`sleep 0.3`);
-    sh(`DISPLAY=:7 xdotool keyup w`); sh(`DISPLAY=:8 xdotool keyup w`);
+    await kdown(H, 'w'); await kdown(G, 'w'); sh(`sleep 0.3`);
+    await kup(H, 'w'); await kup(G, 'w');
     await new Promise(r => setTimeout(r, 3500));
   }
   const preKill = await st(H);
@@ -225,7 +232,7 @@ if (MODE === 'guestexit') {
     if (!npDropped && m.np === 1 && m.game === 1) {
       npDropped = true; dropSecs = t + 1; c2AtDrop = m.c2 | 0; p0AtDrop = JSON.stringify(m.p0);
       rec(`seat dropped @${dropSecs}s`);
-      sh(`DISPLAY=:7 xdotool keydown w`); sh(`sleep 1.2`); sh(`DISPLAY=:7 xdotool keyup w`);
+      await kdown(H, 'w'); sh(`sleep 1.2`); await kup(H, 'w');
       continue;
     }
     // Solo mode freezes movefifoplc BY DESIGN -- continuation is proven by the
@@ -242,7 +249,7 @@ if (MODE === 'guestexit') {
     const g2Browser = await chromium.launch({ headless: false, env: { ...process.env, DISPLAY: ':8' }, args: ['--mute-audio', '--autoplay-policy=no-user-gesture-required', '--window-position=0,0', '--window-size=1100,850', '--no-first-run'] });
     const G2 = await g2Browser.newPage({ viewport: { width: 1024, height: 768 } });
     await G2.goto('http://127.0.0.1:7800/' + LOSSQ, { waitUntil: 'commit', timeout: 60000 });
-    if (await boot(G2, 'G')) {
+    if (await boot(G2, 'G2')) {
       await G2.evaluate((c) => window.NetMenu.joinCode(c, 'Rejoiner'), invite);
       for (let t = 0; t < 90 && !rejoinFormed; t++) {
         await new Promise(r => setTimeout(r, 1000));
@@ -256,8 +263,8 @@ if (MODE === 'guestexit') {
         // liveness signal, and sync:0 with growth means clean comparisons.)
         const h0 = await st(H), g0 = await st(G2);
         for (let t = 0; t < 15; t += 5) {
-          sh(`DISPLAY=:7 xdotool keydown w`); sh(`DISPLAY=:8 xdotool keydown Left`); sh(`sleep 0.3`);
-          sh(`DISPLAY=:7 xdotool keyup w`); sh(`DISPLAY=:8 xdotool keyup Left`);
+          await kdown(H, 'w'); await kdown(G, 'Left'); sh(`sleep 0.3`);
+          await kup(H, 'w'); await kup(G, 'Left');
           await new Promise(r => setTimeout(r, 4500));
         }
         const hm = await st(H), gm = await st(G2);
@@ -282,8 +289,8 @@ if (MODE === 'desync') {
   // push a healing snapshot (epoch bump), and the match must come back
   // CRC-clean and playable -- the exact route a real desync bug would take.
   for (let t = 0; t < 10; t += 5) {
-    sh(`DISPLAY=:7 xdotool keydown w`); sh(`DISPLAY=:8 xdotool keydown Left`); sh(`sleep 0.3`);
-    sh(`DISPLAY=:7 xdotool keyup w`); sh(`DISPLAY=:8 xdotool keyup Left`);
+    await kdown(H, 'w'); await kdown(G, 'Left'); sh(`sleep 0.3`);
+    await kup(H, 'w'); await kup(G, 'Left');
     await new Promise(r => setTimeout(r, 4500));
   }
   const pre = await st(H);
@@ -342,8 +349,8 @@ if (MODE === 'desync') {
   if (healed) {
     const h0 = await st(H), g0 = await st(G);
     for (let t = 0; t < 20; t += 5) {
-      sh(`DISPLAY=:7 xdotool keydown w`); sh(`DISPLAY=:8 xdotool keydown Right`); sh(`sleep 0.3`);
-      sh(`DISPLAY=:7 xdotool keyup w`); sh(`DISPLAY=:8 xdotool keyup Right`);
+      await kdown(H, 'w'); await kdown(G, 'Right'); sh(`sleep 0.3`);
+      await kup(H, 'w'); await kup(G, 'Right');
       await new Promise(r => setTimeout(r, 4500));
     }
     let h1 = await st(H), g1 = await st(G);
@@ -374,8 +381,8 @@ if (MODE === 'latejoin3') {
   // counters climbing through G2's entire snapshot/texture-load/catchup, seat
   // G2 deterministically (np=3 everywhere), and stay CRC-clean afterward.
   for (let t = 0; t < 10; t += 5) {
-    sh(`DISPLAY=:7 xdotool keydown w`); sh(`DISPLAY=:8 xdotool keydown Left`); sh(`sleep 0.3`);
-    sh(`DISPLAY=:7 xdotool keyup w`); sh(`DISPLAY=:8 xdotool keyup Left`);
+    await kdown(H, 'w'); await kdown(G, 'Left'); sh(`sleep 0.3`);
+    await kup(H, 'w'); await kup(G, 'Left');
     await new Promise(r => setTimeout(r, 4500));
   }
   // Stall monitor: track the longest wall-clock gap in which each veteran's
@@ -394,6 +401,11 @@ if (MODE === 'latejoin3') {
     }
   }, 250);
   rec('launching G2 (headless) into the running match');
+  // System sampler: if chromium pids vanish while node lives, the kill was
+  // external -- on this box that means the owner killed browsers that were
+  // locking up the machine: abort the campaign, never relaunch into it.
+  // If counts hold but pages die, it's in-browser; shm/mem catch aborts.
+  const sysMon = setInterval(() => rec(`sys ${new Date().toISOString()} chrom=${sh("pgrep -c -f 'ms-playwrigh[t]'")} shmMB=${sh("df --output=used -m /dev/shm | tail -1").trim()} availMB=${sh("awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo")}`), 2000);
   // Headless pages throttle rAF when chromium decides they are backgrounded --
   // the engine loop then stops SAMPLING and the host's 10s real-progress axe
   // (correctly) kicks the "dead" peer. These flags keep a headless G2 running
@@ -403,7 +415,7 @@ if (MODE === 'latejoin3') {
   const G2 = await g2Browser.newPage({ viewport: { width: 1024, height: 768 } });
   await G2.goto('http://127.0.0.1:7800/' + LOSSQ, { waitUntil: 'commit', timeout: 60000 });
   let joined3 = false, joinSecs = -1, g2jnSeen = false;
-  if (await boot(G2, 'G')) {
+  if (await boot(G2, 'G2')) {
     const t0 = Date.now();
     await G2.evaluate((c) => window.NetMenu.joinCode(c, 'LateThird'), invite);
     for (let t = 0; t < 120 && !joined3; t++) {
@@ -423,8 +435,8 @@ if (MODE === 'latejoin3') {
   if (joined3) {
     const h0 = await st(H), g20 = await G2.evaluate(() => window.__e32menu || {}).catch(() => ({}));
     for (let t = 0; t < 15; t += 5) {
-      sh(`DISPLAY=:7 xdotool keydown w`); sh(`DISPLAY=:8 xdotool keydown Right`); sh(`sleep 0.3`);
-      sh(`DISPLAY=:7 xdotool keyup w`); sh(`DISPLAY=:8 xdotool keyup Right`);
+      await kdown(H, 'w'); await kdown(G, 'Right'); sh(`sleep 0.3`);
+      await kup(H, 'w'); await kup(G, 'Right');
       await new Promise(r => setTimeout(r, 4500));
     }
     const hm = await st(H), g1m = await st(G), g2m = await G2.evaluate(() => window.__e32menu || {}).catch(() => ({}));
@@ -434,6 +446,9 @@ if (MODE === 'latejoin3') {
     rec(`post-join G1=${JSON.stringify(g1m)}`);
     rec(`post-join G2=${JSON.stringify(g2m)}`);
   }
+  clearInterval(sysMon);
+  if (!joined3)  // engines' last words before whatever killed the join
+    for (const [tg, r] of Object.entries(ringAll)) for (const l of r.slice(-15)) rec(`${tg}>> ` + l);
   const verdict = { mode: MODE, formed, joined3, joinSecs, g2jnSeen, postSync,
     hostMaxStallMs: stall.H.max, g1MaxStallMs: stall.G.max };
   rec('VERDICT ' + JSON.stringify(verdict));
@@ -461,8 +476,8 @@ const hostActs = [['w', 0.25], ['Right', 0.35], ['w', 0.2], ['control', 0.3], ['
 const guestActs = [['w', 0.2], ['Left', 0.35], ['w', 0.25], ['Right', 0.35]];
 for (let t = 0; t < 90; t += 5) {
   const ha = hostActs[(t / 5) % hostActs.length], ga = guestActs[(t / 5) % guestActs.length];
-  sh(`DISPLAY=:7 xdotool keydown ${ha[0]}`); sh(`sleep ${ha[1]}`); sh(`DISPLAY=:7 xdotool keyup ${ha[0]}`);
-  sh(`DISPLAY=:8 xdotool keydown ${ga[0]}`); sh(`sleep ${ga[1]}`); sh(`DISPLAY=:8 xdotool keyup ${ga[0]}`);
+  await kdown(H, ha[0]); sh(`sleep ${ha[1]}`); await kup(H, ha[0]);
+  await kdown(G, ga[0]); sh(`sleep ${ga[1]}`); await kup(G, ga[0]);
   await new Promise(r => setTimeout(r, 1000));
   const hm = await st(H), gm = await st(G);
   rec(`t=${t} H=${JSON.stringify(hm)} G=${JSON.stringify(gm)}`);
@@ -479,7 +494,7 @@ for (let t = 0; t < 90; t += 5) {
 // QUIESCE: all input off, let the fifos drain, then compare EXACT world state.
 // release EVERY key we ever pressed (a lost keyup walks a player through the
 // "quiesce" and aliases as divergence in stale surface emits)
-for (const k of ['w', 'Left', 'Right', 'control']) { sh(`DISPLAY=:7 xdotool keyup ${k}`); sh(`DISPLAY=:8 xdotool keyup ${k}`); }
+for (const k of ['w', 'Left', 'Right', 'control']) { await kup(H, k); await kup(G, k); }
 await new Promise(r => setTimeout(r, 6000));
 // plc-matched compare: sample repeatedly; only compare when both peers report the
 // SAME simulated tic (falling/settling players otherwise alias as divergence).
