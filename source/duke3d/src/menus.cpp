@@ -8988,7 +8988,7 @@ void M_DisplayMenus(void)
                 }
                 extern int32_t g_netPumpCalls, g_netGateC1, g_netGateC2, g_mainLoopIter, g_demoLoopIter;
                 Bsnprintf(scr, sizeof scr,
-                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d,%d,%d],o1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d,in:[%d,%d],ap1:[%d,%d,%d],gate1:[%d,%d,%d],snr:%d,ep:%d,epd:%d,sc:%d,du:%d,gp:%d,st:%d,pf:%d,cr:[%d,%d,%d,%d,%d]}",
+                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d,%d,%d],o1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d,in:[%d,%d],ap1:[%d,%d,%d],gate1:[%d,%d,%d],snr:%d,ep:%d,epd:%d,sc:%d,du:%d,gp:%d,st:%d,pf:%d,cr:[%d,%d,%d,%d,%d],car:[%d,%d,%d]}",
                           menuOpen, (int)m_currentMenu->menuID, inGame, (int)nngm,
                           (int)numplayers, (int)myconnectindex, (g_foundSyncError || Net_SyncErrorDetected()) ? 1 : 0, (int)sel,
                           p0x, p0y, p1x, p1y, p1z, p1a, o1x, o1y,
@@ -9026,7 +9026,23 @@ void M_DisplayMenus(void)
                              int h = 0; for (unsigned k = 0; k < sizeof(input_t); k++) h = (h * 31 + b[k]) & 0xffff; h; }),
                           ({ int32_t const rt = ((movefifoplc - 1) & ~63) & (MOVEFIFOSIZ - 1);
                              uint8_t const *b = (uint8_t const *)&inputfifo[rt][1];
-                             int h = 0; for (unsigned k = 0; k < sizeof(input_t); k++) h = (h * 31 + b[k]) & 0xffff; h; }));
+                             int h = 0; for (unsigned k = 0; k < sizeof(input_t); k++) h = (h * 31 + b[k]) & 0xffff; h; }),
+                          // car:[count, statnum, t_data[0]] -- DUKECAR (2491)
+                          // residual-fork forensics: both peers' car timelines
+                          // must match tic-for-tic in a synced match
+                          ({ int n = 0, st = -1, td = -1;
+                             for (int s = 0; s < MAXSPRITES; s++)
+                                 if (sprite[s].statnum < MAXSTATUS && sprite[s].picnum == 2491)
+                                 { n++; if (st < 0) { st = sprite[s].statnum; td = (int)(actor[s].t_data[0] % 100000); } }
+                             n; }),
+                          ({ int st = -1;
+                             for (int s = 0; s < MAXSPRITES; s++)
+                                 if (sprite[s].statnum < MAXSTATUS && sprite[s].picnum == 2491) { st = sprite[s].statnum; break; }
+                             st; }),
+                          ({ int td = -1;
+                             for (int s = 0; s < MAXSPRITES; s++)
+                                 if (sprite[s].statnum < MAXSTATUS && sprite[s].picnum == 2491) { td = (int)(actor[s].t_data[0] % 100000); break; }
+                             td; }));
                 // NEVER eval a truncated script: Bsnprintf cuts mid-expression, the
                 // SyntaxError unwinds through callUserCallback -> doRewind and KILLS
                 // the ASYNCIFY resume -- the engine hard-freezes while the page stays

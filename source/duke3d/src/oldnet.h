@@ -205,6 +205,13 @@ enum DukePacket_t
     PACKET_TYPE_FRAGLIMIT_CHANGED,
     PACKET_TYPE_EOL,
     PACKET_TYPE_PING,
+    // A guest's CRC comparisons flagged a divergence the host's own compares
+    // may never see (stamp visibility is lag-asymmetric: future-stamped tics
+    // are dropped, not deferred). Only the HOST can heal (snapshot push), so
+    // guests report; the host latches g_foundSyncError and the auto-resync
+    // consumer takes it from there. Soak-caught: a guest sat visibly desynced
+    // for 70+ seconds while the host stayed blind -- permanent silent split.
+    PACKET_TYPE_DESYNC_REPORT,
     PACKET_END, // Should remain last in list.
 };
 

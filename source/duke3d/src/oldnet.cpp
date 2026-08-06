@@ -709,6 +709,26 @@ void Net_HandleInput(void)
 
     if (myconnectindex != connecthead)   // ── SLAVE ──
     {
+        // Divergence visibility is lag-asymmetric: this guest's compares can
+        // flag a split the host's never will. Report it (reliable, throttled);
+        // the host latches g_foundSyncError and pushes the healing snapshot.
+        if (g_foundSyncError || Net_SyncErrorDetected())
+        {
+            static int32_t s_lastReportClock;
+            int32_t const now = (int32_t)totalclock;
+            if (s_lastReportClock > now)
+                s_lastReportClock = 0;
+            if (now - s_lastReportClock > 300)   // ~2.5s
+            {
+                s_lastReportClock = now;
+                uint8_t rpt[1] = { PACKET_TYPE_DESYNC_REPORT };
+                oldnet_sendpacket(connecthead, rpt, 1);
+#ifdef __EMSCRIPTEN__
+                EM_ASM({ console.log('[eng] guest desync -> reporting to host'); });
+#endif
+            }
+        }
+
         // Host silence watchdog: a host that stops sending entirely (crash,
         // pulled cable AND dead transport events) ends the match gracefully.
         {
@@ -1290,6 +1310,20 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
             }
             case PACKET_TYPE_NULL_PACKET:
             {
+                break;
+            }
+            case PACKET_TYPE_DESYNC_REPORT:
+            {
+                // A guest's CRCs flagged a split we may never see ourselves.
+                // Latch the verdict; the auto-resync consumer (menus.cpp,
+                // host-gated, cooldown) pushes the healing snapshot.
+                if (myconnectindex == connecthead)
+                {
+                    g_foundSyncError = true;
+#ifdef __EMSCRIPTEN__
+                    EM_ASM({ console.log('[eng] desync report from peer ' + $0 + ' -> resync'); }, other);
+#endif
+                }
                 break;
             }
             case PACKET_TYPE_PLAYER_READY:
