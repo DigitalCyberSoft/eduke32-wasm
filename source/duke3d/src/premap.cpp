@@ -518,9 +518,11 @@ void G_CacheMapData(void)
                 }
             }
 
+#ifndef __EMSCRIPTEN__
             gameHandleEvents();
             if (KB_KeyPressed(sc_Space))
                 break;
+#endif
         }
         i++;
 
@@ -531,6 +533,18 @@ void G_CacheMapData(void)
             pctDisplayed = logapproach(pctDisplayed, percentComplete);
             Bsprintf(tempbuf, "Loaded %d%% (%d/%d textures)\n", pctDisplayed, cntDisplayed, g_precacheCount);
             G_DoLoadScreen(tempbuf, pctDisplayed);
+#ifdef __EMSCRIPTEN__
+            // One browser yield per PRESENTED PROGRESS FRAME, not per tile:
+            // handleevents() ends in emscripten_sleep(1) -- a setTimeout the
+            // browser clamps to >=4ms -- and this loop used to pump it once
+            // per flagged tile (500-1500 per level). "Texture loading" was
+            // 1500 event-loop round-trips (2-24s wall clock) wrapped around
+            // ~50ms of actual work; decode is a MEMFS memcpy and cache1d
+            // already keeps tiles warm across entries.
+            gameHandleEvents();
+            if (KB_KeyPressed(sc_Space))
+                break;
+#endif
         }
     }
 

@@ -9200,11 +9200,14 @@ void M_DisplayMenus(void)
                 s_lastResyncTic = (int32_t)totalclock;
                 if (target >= 0)
                 {
-                    initprintf("net: DESYNC detected -> targeted heal for slot %d\n", target);
+                    initprintf("net: DESYNC detected -> correcting slot %d\n", target);
 #ifdef __EMSCRIPTEN__
-                    EM_ASM({ console.log('[eng] AUTO-RESYNC: targeted heal p=' + $0); }, target);
+                    EM_ASM({ console.log('[eng] AUTO-RESYNC: correcting p=' + $0); }, target);
 #endif
-                    Net_StartHealFlow(target);   // on failure the cooldown retries
+                    // Ladder: in-place soft state snap first (no reload, no
+                    // texture churn); the full snapshot heal only when soft
+                    // corrections repeatedly fail to hold.
+                    Net_CorrectDivergence(target);
                 }
                 else
                 {

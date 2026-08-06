@@ -481,6 +481,9 @@ static int32_t  s_healBasePlc = -1;  // guest: snapshot tic of the heal being ca
 // mid-session guest's start is its master-acked sample tic, never 0). Ignore
 // the heal slot's acks until that marker arrives.
 static int      s_healAckFence;      // host: 1 = post-apply acks are flowing
+// Soft-correction ladder bookkeeping (machinery lives further down).
+static int32_t  s_softStrikes[MAXPLAYERS];
+static int32_t  s_softStrikeClock[MAXPLAYERS];
 
 static struct JoinTicInit { JoinTicInit() { for (auto &t : s_joinTic) t = -1; } } s_joinTicInit;
 
@@ -503,6 +506,8 @@ static void Net_ResetProtocolState(void)
     s_joinFlowIsHeal = 0;
     s_healBasePlc    = -1;
     s_healAckFence   = 0;
+    for (int i = 0; i < MAXPLAYERS; i++)
+        s_softStrikes[i] = s_softStrikeClock[i] = 0;
     for (int i = 0; i < MAXPLAYERS; i++)
     {
         s_slaveAck[i] = s_lastSendClock[i] = 0;
@@ -1554,6 +1559,60 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 }
                 break;
             }
+            case PACKET_TYPE_STATE_SNAP:
+            {
+                // Host pushed an in-place correction: adopt RNG + player state
+                // without touching the level. Watchers skip it (their pending
+                // snapshot supersedes anything corrected here).
+                if (myconnectindex == connecthead || other != connecthead || g_netJoinCatchup)
+                    break;
+                int jj = 1;
+                int const cnt = (uint8_t)packbuf[jj++];
+                randomseed     = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                g_globalRandom = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                for (int e = 0; e < cnt; e++)
+                {
+                    int const slot = (uint8_t)packbuf[jj++];
+                    if ((unsigned)slot >= MAXPLAYERS || g_player[slot].ps == NULL)
+                        { jj += 68; continue; }
+                    auto const ps = g_player[slot].ps;
+                    ps->pos.x  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    ps->pos.y  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    ps->pos.z  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    ps->opos.x = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    ps->opos.y = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    ps->opos.z = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    ps->bobpos.x = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    ps->bobpos.y = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    ps->vel.x  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    ps->vel.y  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    ps->vel.z  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    ps->q16ang   = ps->oq16ang   = (fix16_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    ps->q16horiz = ps->oq16horiz = (fix16_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    vec3_t sp;
+                    sp.x = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    sp.y = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    sp.z = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    int16_t const sprExtra = (int16_t)B_UNBUF16(&packbuf[jj]); jj += 2;
+                    int16_t const cursect  = (int16_t)B_UNBUF16(&packbuf[jj]); jj += 2;
+                    if ((unsigned)ps->i < MAXSPRITES)
+                    {
+                        setsprite(ps->i, &sp);
+                        sprite[ps->i].extra = sprExtra;
+                        actor[ps->i].bpos   = sp;
+                    }
+                    if ((unsigned)cursect < (unsigned)numsectors)
+                        ps->cursectnum = cursect;
+                }
+                Net_InitializePrediction();   // fresh prediction base off corrected state
+                Net_ResetSyncCheck();         // stale verdicts described the pre-snap world
+#ifdef __EMSCRIPTEN__
+                EM_ASM({ console.log('[eng] softsnap applied (' + $0 + ' players)'); }, cnt);
+#else
+                initprintf("net: soft state snap applied (%d players)\n", cnt);
+#endif
+                break;
+            }
             case PACKET_TYPE_PLAYER_READY:
             {
                 if (g_player[other].playerreadyflag == 0)
@@ -2418,6 +2477,94 @@ void Net_HostJoinFlow(void)
 #ifdef __EMSCRIPTEN__
     EM_ASM({ console.log('[eng] joinFlow start p=' + $0 + ' plc=' + $1); }, k, movefifoplc);
 #endif
+}
+
+// ── Soft correction (the first rung of the divergence ladder) ────────────────
+// The user's contract: "not perfect sync -- periodic correction so positions/
+// health are correct", and NEVER a map reload for drift. On a divergence latch
+// the host first pushes an IN-PLACE correction to the diverged guest: RNG
+// seeds + every player's position/velocity/angles/health, applied without
+// touching the level (no G_LoadPlayer, no texture churn, sub-second). RNG
+// convergence makes future krand-driven behavior line up prospectively;
+// residual world drift either fades or keeps latching, and only REPEATED
+// failures escalate to the full snapshot heal (the reload becomes the rare
+// last resort instead of the first response).
+enum
+{
+    NET_SOFT_STRIKES     = 4,      // soft attempts before escalating to a reload heal
+    NET_SOFT_DECAY_TICKS = 14400,  // strike counter forgets after ~2min of peace
+};
+
+void Net_SendStateSnap(int k)
+{
+    if (myconnectindex != connecthead || (unsigned)k >= MAXPLAYERS || !g_player[k].connected)
+        return;
+
+    int j = 0;
+    packbuf[j++] = PACKET_TYPE_STATE_SNAP;
+    int const countPos = j++;
+    B_BUF32(&packbuf[j], randomseed);     j += 4;
+    B_BUF32(&packbuf[j], g_globalRandom); j += 4;
+
+    int n = 0, i;
+    TRAVERSE_CONNECT(i)
+    {
+        auto const ps = g_player[i].ps;
+        if (ps == NULL || (unsigned)ps->i >= MAXSPRITES)
+            continue;
+        packbuf[j++] = (char)i;
+        B_BUF32(&packbuf[j], ps->pos.x);   j += 4;
+        B_BUF32(&packbuf[j], ps->pos.y);   j += 4;
+        B_BUF32(&packbuf[j], ps->pos.z);   j += 4;
+        B_BUF32(&packbuf[j], ps->opos.x);  j += 4;
+        B_BUF32(&packbuf[j], ps->opos.y);  j += 4;
+        B_BUF32(&packbuf[j], ps->opos.z);  j += 4;
+        B_BUF32(&packbuf[j], ps->bobpos.x); j += 4;
+        B_BUF32(&packbuf[j], ps->bobpos.y); j += 4;
+        B_BUF32(&packbuf[j], ps->vel.x);   j += 4;
+        B_BUF32(&packbuf[j], ps->vel.y);   j += 4;
+        B_BUF32(&packbuf[j], ps->vel.z);   j += 4;
+        B_BUF32(&packbuf[j], (int32_t)ps->q16ang);   j += 4;
+        B_BUF32(&packbuf[j], (int32_t)ps->q16horiz); j += 4;
+        B_BUF32(&packbuf[j], sprite[ps->i].x); j += 4;
+        B_BUF32(&packbuf[j], sprite[ps->i].y); j += 4;
+        B_BUF32(&packbuf[j], sprite[ps->i].z); j += 4;
+        B_BUF16(&packbuf[j], (int16_t)sprite[ps->i].extra); j += 2;
+        B_BUF16(&packbuf[j], ps->cursectnum); j += 2;
+        n++;
+    }
+    packbuf[countPos] = (char)n;
+    oldnet_sendpacket(k, (unsigned char *)packbuf, j);
+    initprintf("net: soft state snap -> slot %d (%d players, %d bytes)\n", k, n, j);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('[eng] softsnap sent p=' + $0 + ' bytes=' + $1); }, k, j);
+#endif
+}
+
+// Divergence response ladder: soft in-place corrections first; the full
+// snapshot heal (guest reloads the level) only after repeated failures.
+// Returns 0 if some correction was dispatched.
+int Net_CorrectDivergence(int k)
+{
+    if (myconnectindex != connecthead || (unsigned)k >= MAXPLAYERS || !g_player[k].connected)
+        return -1;
+
+    int32_t const now = (int32_t)totalclock;
+    if (s_softStrikeClock[k] > now || now - s_softStrikeClock[k] > NET_SOFT_DECAY_TICKS)
+        s_softStrikes[k] = 0;
+    s_softStrikeClock[k] = now;
+
+    g_netDesyncReporters &= ~(1 << k);
+    if (++s_softStrikes[k] <= NET_SOFT_STRIKES)
+    {
+        Net_SendStateSnap(k);
+        Net_ResetSyncCheck();   // fresh evidence only, from corrected state
+        return 0;
+    }
+    // Soft corrections are not holding: the worlds have genuinely forked.
+    initprintf("net: soft corrections exhausted for slot %d -> snapshot heal\n", k);
+    s_softStrikes[k] = 0;
+    return Net_StartHealFlow(k);
 }
 
 // TARGETED RESYNC: heal ONE diverged guest with the join streamer, minus the

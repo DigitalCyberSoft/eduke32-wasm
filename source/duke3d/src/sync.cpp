@@ -626,6 +626,18 @@ void Net_DisplaySyncMsg(void)
     if (g_netJoinCatchup)
         return;
 
+    // The red verdict wall (FIRST Out Of Sync / DESYNCHED) is a FORENSIC
+    // surface. Players never see it: divergence is handled by the correction
+    // ladder (soft state snap -> snapshot heal) and screaming about it was
+    // pure alarm with no action the player could take (live feedback: "it
+    // regularly thinks things are out of sync"). Web_SetForensics(1) re-arms
+    // it for hunts, alarm sound included.
+    {
+        extern int32_t g_netForensics;
+        if (!g_netForensics)
+            return;
+    }
+
     for (int32_t i = 0; i < NUM_SYNC_TYPES; i++)
     {
         // syncError is NON 0 - out of sync

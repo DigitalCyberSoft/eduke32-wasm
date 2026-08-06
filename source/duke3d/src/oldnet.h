@@ -193,6 +193,8 @@ int  Net_JoinFlowActive(void);    // a join is streaming/announced: defer any he
 extern int32_t g_netDesyncReporters; // host: guests whose DESYNC_REPORT named them diverged
 int  Net_StartHealFlow(int k);    // host: begin healing seat k (0 = flow started)
 void Net_CheckHealResume(void);   // healing guest: leave watcher mode at the live edge
+void Net_SendStateSnap(int k);    // host: in-place RNG+player correction to one guest
+int  Net_CorrectDivergence(int k);// host: correction ladder (soft snaps -> snapshot heal)
 
 //OLDNET_EXTERN PredictBackup_t predictBackup[MOVEFIFOSIZ];
 
@@ -235,6 +237,7 @@ enum DukePacket_t
     // consumer takes it from there. Soak-caught: a guest sat visibly desynced
     // for 70+ seconds while the host stayed blind -- permanent silent split.
     PACKET_TYPE_DESYNC_REPORT,
+    PACKET_TYPE_STATE_SNAP,   // host -> diverged guest: in-place RNG+player correction (no reload)
     PACKET_END, // Should remain last in list.
 };
 
