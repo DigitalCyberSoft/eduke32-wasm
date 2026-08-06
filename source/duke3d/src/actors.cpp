@@ -34,6 +34,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #ifdef NETDUKE32
 # include "net_predict.h"  // oldnet_predicting (G_MovePlayerSprite prediction guard)
 #endif
+#ifdef __EMSCRIPTEN__
+# include <emscripten.h>   // EM_ASM breadcrumbs (residual-fork tripwires)
+#endif
 
 #if KRANDDEBUG
 # define ACTOR_STATIC
@@ -816,10 +819,14 @@ void A_DeleteSprite(int spriteNum)
     }
 
 #ifdef NETDUKE32
-    // DEBUG (residual-fork hunt): per-tic delete accounting (sync.cpp cat 13).
+    // DEBUG (residual-fork hunt): per-tic delete accounting (sync.cpp cat 13),
+    // with the victims' picnums so a one-peer-only delete names itself.
     if (numplayers > 1 && !oldnet_predicting)
     {
-        extern int32_t g_dbgDelCount;
+        extern int32_t g_dbgDelCount, g_dbgDelRingN;
+        extern int16_t g_dbgDelRing[32];
+        g_dbgDelRing[g_dbgDelRingN & 31] = ((unsigned)spriteNum < MAXSPRITES) ? sprite[spriteNum].picnum : -1;
+        g_dbgDelRingN++;
         g_dbgDelCount++;
     }
 #endif
@@ -851,7 +858,16 @@ void A_DeleteSprite(int spriteNum)
 
 void A_AddToDeleteQueue(int spriteNum)
 {
+#ifdef NETDUKE32
+    // LOCKSTEP: every peer must run the SAME deletion policy. The snapshot-era
+    // special case below made guests delete queued decals/gibs INSTANTLY while
+    // the host rotated them through the 64-slot queue -- a structural per-role
+    // sim fork (sprite freelists diverge on the first bullethole, and every
+    // insertsprite after that returns different indexes per peer).
+    if (g_deleteQueueSize == 0)
+#else
     if (g_netClient || (g_deleteQueueSize == 0)) // [75] Clients should not use SpriteDeletionQueue[] and just set the sprites invisible immediately in A_DeleteSprite
+#endif
     {
         A_DeleteSprite(spriteNum);
         return;
@@ -1971,12 +1987,31 @@ ACTOR_STATIC void G_MoveFX(void)
                         T5(spriteNum)--;
                     else
                     {
+#ifdef NETDUKE32
+                        // LOCKSTEP: T5 is sim state (this very timer). The stock
+                        // form wrote it only on the peer whose LOCAL player
+                        // stood in the sector, so every session's actor state
+                        // forked within seconds of spawn (soak-caught: the
+                        // deep-actor CRC flagged at tic 30, the first tic the
+                        // comparison grace allows). The timer now arms on EVERY
+                        // peer for the first in-chain player in the sector;
+                        // only that player's own machine plays the sound.
+                        for (int TRAVERSE_CONNECT(playerNum))
+                            if (g_player[playerNum].ps->cursectnum == pSprite->sectnum)
+                            {
+                                if (playerNum == myconnectindex)
+                                    S_PlaySound(pSprite->lotag + (unsigned)g_globalRandom % (pSprite->hitag+1));
+                                T5(spriteNum) = GAMETICSPERSEC*40 + g_globalRandom%(GAMETICSPERSEC*40);
+                                break;
+                            }
+#else
                         for (int TRAVERSE_CONNECT(playerNum))
                             if (playerNum == myconnectindex && g_player[playerNum].ps->cursectnum == pSprite->sectnum)
                             {
                                 S_PlaySound(pSprite->lotag + (unsigned)g_globalRandom % (pSprite->hitag+1));
                                 T5(spriteNum) = GAMETICSPERSEC*40 + g_globalRandom%(GAMETICSPERSEC*40);
                             }
+#endif
                     }
                 }
             }
@@ -4634,6 +4669,17 @@ ACTOR_STATIC void G_MoveActors(void)
         case DUKECAR__:
             pSprite->z += pSprite->zvel;
             pData[0]++;
+
+#if defined(__EMSCRIPTEN__) && !defined(NETCODE_DISABLE)
+            // Residual-fork tripwire: one peer's car drifted 2 executions
+            // against the tic counter inside the first 30 tics of a session
+            // (cats 13/14 flagged its EXPLOSION2 phase; every other category
+            // stayed clean). Log the phase directly for the first ~2s so a
+            // cross-peer diff names the tic the drift is born on.
+            if (numplayers > 1 && pData[0] <= 60 && (pData[0] & 7) == 1)
+                EM_ASM({ console.log('[eng] CAR pd=' + $0 + ' plc=' + $1 + ' pic=' + $2); },
+                       pData[0], movefifoplc, pSprite->picnum);
+#endif
 
             if (pData[0] == 4)
                 A_PlaySound(WAR_AMBIENCE2,spriteNum);

@@ -56,7 +56,7 @@ type Ctl =
   | { t: "grp_begin"; offer: GrpOffer }
   | { t: "grp_end" }
   | { t: "grp_deny"; reason: "paid" | "optout" | "notplaying" | "mismatch" }
-  | { t: "sav_begin"; size: number; mask: number }
+  | { t: "sav_begin"; size: number; mask: number; plc?: number; join?: number }
   | { t: "sav_chunk"; d: string }
   | { t: "sav_end" }
   | { t: "rtt_ping"; id: number }
@@ -117,6 +117,8 @@ class DukeNet {
   private savBuf: Uint8Array[] | null = null;
   private savSize = 0;
   private savMask = 0;
+  private savPlc = 0; // sender's movefifoplc at save (catchup stream base)
+  private savJoin = 0; // 1 = barrier-free join apply, 0 = legacy resync apply
 
   // GRP receive state (guest side).
   private grpRecv: GrpReceiver | null = null;
@@ -274,10 +276,13 @@ class DukeNet {
     return `role=${m.role} status=${m.status()} idx=${this.myConnectIndex} roster=${m.players().length} connected=${up} attached=${this.slots.size}`;
   }
 
-  /** HOST: stream the late-join snapshot (written by the engine to /latejoin.esv)
-   *  to every ATTACHED peer as base64 control slices on duke-rel. Called from the
-   *  engine (menus.cpp netmenu_send_snapshot) right before it holds the barrier. */
-  sendSnapshot(seatMask: number): void {
+  /** HOST: stream the snapshot (written by the engine to /latejoin.esv) as
+   *  base64 control slices on duke-rel. targetSlot < 0 broadcasts to every
+   *  ATTACHED peer (legacy resync: everyone reloads); otherwise ONLY that
+   *  slot's peer receives it (barrier-free join / targeted resync -- the match
+   *  never pauses and veterans reload nothing). plc = engine movefifoplc at
+   *  save (the catchup stream base); isJoin selects the engine's apply mode. */
+  sendSnapshot(seatMask: number, targetSlot = -1, plc = 0, isJoin = 0): void {
     const m = this.match;
     if (!m || m.role !== "host") return;
     let bytes: Uint8Array;
@@ -290,10 +295,14 @@ class DukeNet {
       return;
     }
     const CHUNK = 48 * 1024;
-    const targets = [...this.slots.keys()].filter((id) => m.peers.isAttached(id));
-    console.log(`[dnet] -> snapshot ${bytes.length} bytes to ${targets.length} peer(s), mask 0x${seatMask.toString(16)}`);
+    let targets = [...this.slots.keys()].filter((id) => m.peers.isAttached(id));
+    if (targetSlot >= 0)
+      targets = targets.filter((id) => this.slots.get(id) === targetSlot);
+    console.log(
+      `[dnet] -> snapshot ${bytes.length} bytes to ${targets.length} peer(s), mask 0x${seatMask.toString(16)}, slot ${targetSlot}, plc ${plc}, join ${isJoin}`,
+    );
     for (const peerId of targets) {
-      m.peers.sendControl(peerId, { t: "sav_begin", size: bytes.length, mask: seatMask } as Ctl);
+      m.peers.sendControl(peerId, { t: "sav_begin", size: bytes.length, mask: seatMask, plc, join: isJoin } as Ctl);
       for (let off = 0; off < bytes.length; off += CHUNK) {
         const slice = bytes.subarray(off, Math.min(off + CHUNK, bytes.length));
         let bin = "";
@@ -504,7 +513,11 @@ class DukeNet {
           this.savBuf = [];
           this.savSize = msg.size | 0;
           this.savMask = msg.mask | 0;
-          console.log(`[dnet] <- snapshot begin (${msg.size} bytes, mask 0x${(msg.mask | 0).toString(16)})`);
+          this.savPlc = (msg.plc ?? 0) | 0;
+          this.savJoin = (msg.join ?? 0) | 0;
+          console.log(
+            `[dnet] <- snapshot begin (${msg.size} bytes, mask 0x${(msg.mask | 0).toString(16)}, plc ${this.savPlc}, join ${this.savJoin})`,
+          );
           this.events.onStatus?.("Syncing game state…");
         }
         break;
@@ -531,8 +544,8 @@ class DukeNet {
           const FS = (globalThis as unknown as { Module?: { FS?: { writeFile: (p: string, d: Uint8Array) => void } } }).Module?.FS;
           FS?.writeFile("/latejoin.esv", bytes);
           const mod = (globalThis as unknown as { Module?: { ccall?: (...a: unknown[]) => unknown } }).Module;
-          mod?.ccall?.("Net_SnapshotReady", null, ["number"], [this.savMask]);
-          console.log(`[dnet] snapshot ready (${total} bytes) -> engine notified`);
+          mod?.ccall?.("Net_SnapshotReady", null, ["number", "number", "number"], [this.savMask, this.savPlc, this.savJoin]);
+          console.log(`[dnet] snapshot ready (${total} bytes, plc ${this.savPlc}, join ${this.savJoin}) -> engine notified`);
         } catch (e) {
           console.log("[dnet] snapshot write failed: " + String(e));
         }

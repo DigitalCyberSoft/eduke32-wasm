@@ -1619,7 +1619,7 @@ extern "C" {
     void net_native_set_ingame(int in_game);
     void net_native_menu_pump(void);       // apply queued menu updates on the game thread
     int net_native_should_launch(void);    // headless auto-launch (NN_AUTOLAUNCH): host is ready
-    void net_native_send_snapshot(int seatMask); // late-join snapshot broadcast
+    void net_native_send_snapshot(int seatMask, int targetToken, int plc, int isJoin); // snapshot: broadcast (target<0) or one peer
     void net_native_mark_launched(void);
 }
 #endif
@@ -1761,15 +1761,32 @@ extern "C" void NetMenu_SetInGame(int in_game)
 
 // Ship the late-join snapshot (written by Net_SaveLateJoinSnapshot) to every
 // attached peer, with the seat mask the receivers must apply BEFORE loading.
+// Legacy RESYNC broadcast: every veteran reloads and rendezvouses (mode 0).
 static void netmenu_send_snapshot(int seatMask)
 {
 #ifdef __EMSCRIPTEN__
-    char scr[128];
+    char scr[160];
     Bsnprintf(scr, sizeof scr,
-              "window.DukeNet&&window.DukeNet.sendSnapshot&&window.DukeNet.sendSnapshot(%d)", seatMask);
+              "window.DukeNet&&window.DukeNet.sendSnapshot&&window.DukeNet.sendSnapshot(%d,-1,0,0)", seatMask);
     emscripten_run_script(scr);
 #else
-    net_native_send_snapshot(seatMask);
+    net_native_send_snapshot(seatMask, -1, 0, 0);
+#endif
+}
+
+// Targeted variant (barrier-free join / targeted resync): stream the snapshot
+// to ONE peer with the catchup base tic; nobody else receives or reloads
+// anything. Called from the oldnet.cpp join state machine.
+void netmenu_send_snapshot_to(int seatMask, int slot, int plc, int isJoin)
+{
+#ifdef __EMSCRIPTEN__
+    char scr[192];
+    Bsnprintf(scr, sizeof scr,
+              "window.DukeNet&&window.DukeNet.sendSnapshot&&window.DukeNet.sendSnapshot(%d,%d,%d,%d)",
+              seatMask, slot, plc, isJoin);
+    emscripten_run_script(scr);
+#else
+    net_native_send_snapshot(seatMask, slot, plc, isJoin);
 #endif
 }
 
@@ -8974,7 +8991,7 @@ void M_DisplayMenus(void)
             {
                 lastExposed = cur;
                 lastEmitClock = (int32_t)totalclock;
-                char scr[576];
+                char scr[640];
                 // p0/p1: player positions (>>8) -- input-routing diagnosis: if both
                 // move in lockstep with one player's input, the input fanout is wrong.
                 int32_t p0x = 0, p0y = 0, p1x = 0, p1y = 0, p1z = 0, p1a = 0;
@@ -8988,7 +9005,7 @@ void M_DisplayMenus(void)
                 }
                 extern int32_t g_netPumpCalls, g_netGateC1, g_netGateC2, g_mainLoopIter, g_demoLoopIter;
                 Bsnprintf(scr, sizeof scr,
-                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d,%d,%d],o1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d,in:[%d,%d],ap1:[%d,%d,%d],gate1:[%d,%d,%d],snr:%d,ep:%d,epd:%d,sc:%d,du:%d,gp:%d,st:%d,pf:%d,cr:[%d,%d,%d,%d,%d],car:[%d,%d,%d]}",
+                          "window.__e32menu={open:%d,id:%d,game:%d,gm:%d,np:%d,idx:%d,sync:%d,sel:%d,p0:[%d,%d],p1:[%d,%d,%d,%d],o1:[%d,%d],plc:%d,fe:[%d,%d],r2s:%d,nhi:%d,dtc:%d,c1:%d,c2:%d,ml:%d,dl:%d,in:[%d,%d],ap1:[%d,%d,%d],gate1:[%d,%d,%d],snr:%d,ep:%d,epd:%d,sc:%d,du:%d,gp:%d,st:%d,pf:%d,jn:%d,fl:%d,sh:%d,cr:[%d,%d,%d,%d,%d],car:[%d,%d,%d]}",
                           menuOpen, (int)m_currentMenu->menuID, inGame, (int)nngm,
                           (int)numplayers, (int)myconnectindex, (g_foundSyncError || Net_SyncErrorDetected()) ? 1 : 0, (int)sel,
                           p0x, p0y, p1x, p1y, p1z, p1a, o1x, o1y,
@@ -9009,6 +9026,14 @@ void M_DisplayMenus(void)
                           (int)(g_netDupTics % 1000000), (int)(g_netGapDrops % 1000000),
                           g_netStallSince ? 1 : 0,
                           (int)(predictfifoplc % 10000000),
+                          // jn: joiner catchup active; fl: master-synthesized
+                          // tics (deadline/join fill); sh: local sample head
+                          // ahead of the consume cursor (slave prediction depth)
+                          (int)g_netJoinCatchup,
+                          (int)(g_netFillTics % 1000000),
+                          (int)((numplayers > 1 && myconnectindex != connecthead)
+                                    ? (g_netSampleHead - movefifoplc)
+                                    : (g_player[myconnectindex].movefifoend - movefifoplc)),
                           // Raw per-tic CRC bytes (PlayerPos=2, Map=6) at a
                           // STABLE shared reference tic -- the last multiple of
                           // 64 -- so laggy cross-peer samples still compare the
@@ -9089,20 +9114,15 @@ void M_DisplayMenus(void)
             ready2send = 1;         // input pump ON, whatever attract-loop path we returned through
             return;
         }
-        // HOST: late joiners -- SNAPSHOT JOIN, the game does NOT reset. Their peer-up
-        // landed while we were IN GAME, so oldnet only QUEUED them. At this safe
-        // frame point: materialize each joiner in the LIVE world, seat them, write
-        // a full savegame snapshot, hand it to the transport (streams to every
-        // peer), and hold the barrier until veterans + joiners have reloaded the
-        // identical bytes. The host's own state IS the snapshot -- no reload, no
-        // reset, positions and frags stay.
-        if (g_netLateJoinMask && myconnectindex == connecthead
+        // HOST, SOLO (numplayers==1): classic barrier join. There is nobody else
+        // to stall, and the barrier also carries the SP->MP loop transition the
+        // barrier-free flow cannot (a solo host never pumps M2S: movefifoplc is
+        // frozen on the single-player path, so there is no live timeline for a
+        // joiner to catch up to).
+        if (g_netLateJoinMask && numplayers < 2 && myconnectindex == connecthead
             && g_player[myconnectindex].ps != NULL
             && (g_player[myconnectindex].ps->gm & MODE_GAME))
         {
-            // Fold any pending disconnect drops into the roster FIRST: the seat
-            // mask and the snapshot both embed the roster, and a dead peer must
-            // not be seated into (or ghost-statue inside) the new session.
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
             Net_FlushPendingDrops();
 #endif
@@ -9118,14 +9138,11 @@ void M_DisplayMenus(void)
                 for (int k = 0; k < MAXPLAYERS && k < 16; k++)
                     if (g_player[k].connected)
                         seatMask |= (1 << k);
-                // bits 16..23: the NEW move generation. Bumped here (the only writer
-                // besides adoption); receivers adopt it from the snapshot.
                 g_netMoveEpoch = (uint8_t)(g_netMoveEpoch + 1);
                 seatMask |= ((int)g_netMoveEpoch) << 16;
-                initprintf("net: late join -> snapshot for %d players (mask 0x%x), holding the barrier\n",
-                           numplayers, seatMask);
+                initprintf("net: solo-host join -> snapshot (mask 0x%x), holding the barrier\n", seatMask);
                 netmenu_send_snapshot(seatMask);
-                Net_WaitForPlayers();  // rendezvous once every receiver has reloaded
+                Net_WaitForPlayers();  // rendezvous once the joiner has reloaded
                 ready2send = 1;
             }
             else
@@ -9135,6 +9152,16 @@ void M_DisplayMenus(void)
             }
             return;
         }
+        // HOST, RUNNING MATCH (numplayers>=2): barrier-free late join. The old
+        // flow pushed the snapshot to EVERY peer and held Net_WaitForPlayers
+        // until all of them (joiner with cold texture caches included) reloaded
+        // -- the whole match froze for the slowest loader, live-reported by the
+        // user. The state machine in oldnet.cpp never pauses anyone: snapshot to
+        // the JOINER ONLY, stream the missed tics, seat deterministically at the
+        // announced joinTic. Veterans notice nothing but a new player walking in.
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        Net_HostJoinFlow();
+#endif
         // RECEIVER (veteran mid-game or the joiner in menus): the snapshot file
         // landed. Seat + load the identical world state, then rendezvous.
         if (g_netSnapshotReady)
@@ -9170,6 +9197,11 @@ void M_DisplayMenus(void)
             if ((g_foundSyncError || Net_SyncErrorDetected()) && myconnectindex == connecthead && numplayers > 1
                 && g_player[myconnectindex].ps != NULL
                 && (g_player[myconnectindex].ps->gm & MODE_GAME)
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                // A join mid-flight would be forked by the broadcast (its roster
+                // excludes the half-seated joiner); heal right after it lands.
+                && !Net_JoinFlowActive()
+#endif
                 && (int32_t)totalclock - s_lastResyncTic > 600)
             {
                 s_lastResyncTic = (int32_t)totalclock;

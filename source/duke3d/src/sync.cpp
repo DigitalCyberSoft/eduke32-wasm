@@ -48,6 +48,19 @@ int Net_SyncErrorDetected(void)
     return 0;
 }
 
+// Per-sender compared-tic ring: multi-stamp batches arrive on an UNORDERED
+// channel, so a monotonic "last compared tic" cursor silently discards any
+// batch that arrives behind a newer one -- exactly the coverage holes that hid
+// fork birth tics. Each tic is compared at most once, in ANY arrival order.
+static int32_t s_cmpTic[MAXPLAYERS][MOVEFIFOSIZ];
+
+// Which tic each LOCAL syncData slot was actually stamped for. A remote stamp
+// may only be compared against a slot stamped for the SAME tic -- comparing
+// against an unstamped (post-ClearFIFO zeroed) or lapped slot produced
+// all-category "local=0" storms that fired needless auto-resyncs (soak-caught
+// at tic 88: every category local=0, own input column zeroed, remote sane).
+int32_t g_syncStampTic[MOVEFIFOSIZ];
+
 // Clear the divergence verdict (auto-resync: the host just pushed an
 // authoritative snapshot and every peer reloaded identical state).
 void Net_ResetSyncCheck(void)
@@ -55,6 +68,11 @@ void Net_ResetSyncCheck(void)
     g_foundSyncError = false;
     Bmemset(syncError, 0, sizeof(syncError));
     Bmemset(g_szfirstSyncMsg, 0, sizeof(g_szfirstSyncMsg));
+    for (auto &row : s_cmpTic)
+        for (auto &t : row)
+            t = -1;
+    for (auto &t : g_syncStampTic)
+        t = -1;
 }
 bool g_foundSyncError = false;
 
@@ -329,9 +347,11 @@ static char Sync_DbgInp1(void) { return Sync_DbgInputHash(1); }
 int32_t g_dbgInsCount, g_dbgDelCount;
 int16_t g_dbgInsRing[32], g_dbgInsOwnRing[32];
 int32_t g_dbgInsRingN;
+int16_t g_dbgDelRing[32];   // picnums of this tic's DELETED sprites
+int32_t g_dbgDelRingN;
 // [tic & mask][0]=insert count (capped 6), [1]=delete count, [2..7]=picnums,
-// [8..13]=spawner (owner) picnums
-static int16_t g_dbgSpawnHist[MOVEFIFOSIZ][14];
+// [8..13]=spawner (owner) picnums, [14..16]=deleted picnums
+static int16_t g_dbgSpawnHist[MOVEFIFOSIZ][18];
 static char Sync_DbgSpawnCount(void)
 {
     unsigned short crc = 0;
@@ -346,6 +366,130 @@ static char Sync_DbgSpawnPicnums(void)
     { updatecrc(crc, g_dbgInsRing[k]); updatecrc(crc, (g_dbgInsRing[k] >> 8)); }
     return ((char)crc & 255);
 }
+
+// Per-tic EXECUTION GATES. G_DoMoveThings advances movefifoplc unconditionally
+// but gates the world step (krand draw, P_ProcessInput, G_MoveWorld) on
+// ud.pause_on -- so any per-peer asymmetry in these gates silently shifts every
+// actor's execution phase against the tic counter (residual-fork suspect: the
+// DUKECAR's pData[0] drifted 2 tics on one peer inside the first 30 tics).
+// This category flags the exact tic a gate ever differs.
+static char Sync_DbgGates(void)
+{
+    unsigned short crc = 0;
+    updatecrc(crc, ud.pause_on);
+    updatecrc(crc, numplayers);
+    updatecrc(crc, (char)(g_player[connecthead].ps ? (g_player[connecthead].ps->gm & 0xff) : 0xee));
+    return ((char)crc & 255);
+}
+
+// Per-tic krand() DRAW COUNT (reset after each stamp, incremented inside krand
+// itself -- random.h). A count mismatch at the fork tic names "one peer ran an
+// extra RNG consumer HERE"; equal counts with a diverged randomseed (cat 1)
+// mean the state feeding the draws forked earlier. Frame-rate callers (render
+// code polluting the sim stream) show up as constant flake of this category.
+static char Sync_DbgKrand(void)
+{
+    return (char)(g_krandCalls & 255);
+}
+
+// Cumulative world-step executions (game.cpp increments inside the pause gate).
+// Divergence = one peer skipped a world tic the other ran: flags from the first
+// skip onward and never re-converges, naming the exact birth tic.
+int32_t g_worldExecs;
+static char Sync_DbgWorldExec(void)
+{
+    return (char)(g_worldExecs & 255);
+}
+
+// DEEP WORLD hashes: the observed forks are born in state none of the classic
+// categories cover (zombie wake counters first of all -- timetosleep drifts
+// invisibly for tens of tics before a wake threshold makes it visible as
+// "different krand draws"). With gap-free stamp streaming, the FIRST of these
+// to flag names the subsystem and the exact birth tic.
+static char Sync_DbgZombies(void)
+{
+    unsigned short crc = 0;
+    int guard = 0;
+    for (int i = headspritestat[STAT_ZOMBIEACTOR]; i >= 0 && guard < MAXSPRITES; i = nextspritestat[i], guard++)
+    {
+        updatecrc(crc, i);
+        updatecrc(crc, actor[i].timetosleep);
+        updatecrc(crc, (actor[i].timetosleep >> 8));
+        updatecrc(crc, actor[i].t_data[0]);
+    }
+    return ((char)crc & 255);
+}
+// STAT_FX (MUSICANDSFX) is EXCLUDED from the deep hashes: its t_data is
+// per-viewer audio state BY DESIGN (ambient start/stop keys on the local
+// screenpeek player's distance) and its divergence cannot cascade into the
+// world -- hashing it buried the real signals under permanent tic-30 noise.
+static char Sync_DbgAllPos(void)
+{
+    unsigned short crc = 0;
+    int guard = 0;
+    for (int st = 0; st < MAXSTATUS; st++)
+    {
+        if (st == STAT_FX)
+            continue;
+        for (int i = headspritestat[st]; i >= 0 && guard < MAXSPRITES; i = nextspritestat[i], guard++)
+        {
+            updatecrc(crc, sprite[i].x); updatecrc(crc, (sprite[i].x >> 8));
+            updatecrc(crc, sprite[i].y); updatecrc(crc, (sprite[i].y >> 8));
+            updatecrc(crc, sprite[i].z); updatecrc(crc, (sprite[i].z >> 8));
+        }
+    }
+    return ((char)crc & 255);
+}
+static char Sync_DbgAllActor(void)
+{
+    unsigned short crc = 0;
+    int guard = 0;
+    for (int st = 0; st < MAXSTATUS; st++)
+    {
+        if (st == STAT_FX)
+            continue;
+        for (int i = headspritestat[st]; i >= 0 && guard < MAXSPRITES; i = nextspritestat[i], guard++)
+        {
+            updatecrc(crc, actor[i].htextra);
+            updatecrc(crc, actor[i].htowner);
+            updatecrc(crc, actor[i].t_data[0]);
+            updatecrc(crc, actor[i].t_data[4]);
+        }
+    }
+    return ((char)crc & 255);
+}
+
+// Per-statnum sub-hash (positions + actor fields), dumped when cat 18/19
+// mismatches: diffing the two peers' STATDUMP lines names the diverging
+// statnum in one run.
+static void Sync_DumpStatHashes(int32_t tickNum)
+{
+#if defined(__EMSCRIPTEN__)
+    int h[16];
+    int guard = 0;
+    for (int st = 0; st < 16; st++)
+    {
+        unsigned short crc = 0;
+        if (st != STAT_FX)
+            for (int i = headspritestat[st]; i >= 0 && guard < MAXSPRITES; i = nextspritestat[i], guard++)
+            {
+                updatecrc(crc, sprite[i].x); updatecrc(crc, sprite[i].y); updatecrc(crc, sprite[i].z);
+                updatecrc(crc, actor[i].htextra); updatecrc(crc, actor[i].t_data[0]);
+            }
+        h[st] = (int)(crc & 255);
+    }
+    EM_ASM({ console.log('[eng] STATDUMP tic=' + $0 + ' lo=[' + $1 + ',' + $2 + ',' + $3 + ',' + $4 + ',' + $5 + ',' + $6 + ',' + $7 + ',' + $8 + ']'); },
+           tickNum, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+    EM_ASM({ console.log('[eng] STATDUMP tic=' + $0 + ' hi=[' + $1 + ',' + $2 + ',' + $3 + ',' + $4 + ',' + $5 + ',' + $6 + ',' + $7 + ',' + $8 + ']'); },
+           tickNum, h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]);
+#else
+    (void)tickNum;
+#endif
+}
+
+// RNG TRACE ring history (krand_traced lives in engine.cpp via random.h's
+// engine_c_ block; g_krandSiteRing holds the CURRENT tic's first sites).
+static const char *s_krandSiteHist[MOVEFIFOSIZ][6];
 
 // This must not exceed MAX_SYNC_TYPES
 static SyncType_t syncType[] = {
@@ -364,6 +508,12 @@ static SyncType_t syncType[] = {
     DEFINE_SYNCFUNC(Sync_DbgInp1),    // 12  consumed input, player 1
     DEFINE_SYNCFUNC(Sync_DbgSpawnCount),   // 13  per-tic insert/delete counts
     DEFINE_SYNCFUNC(Sync_DbgSpawnPicnums), // 14  per-tic inserted picnums
+    DEFINE_SYNCFUNC(Sync_DbgGates),        // 15  pause/gm execution gates
+    DEFINE_SYNCFUNC(Sync_DbgKrand),        // 16  per-tic krand draw count
+    DEFINE_SYNCFUNC(Sync_DbgZombies),      // 17  zombie wake bookkeeping (timetosleep)
+    DEFINE_SYNCFUNC(Sync_DbgAllPos),       // 18  every live sprite's position
+    DEFINE_SYNCFUNC(Sync_DbgAllActor),     // 19  every live actor's damage/timers
+    DEFINE_SYNCFUNC(Sync_DbgWorldExec),    // 20  cumulative world-step executions
 #if 0
     DEFINE_SYNCFUNC(Sync_GameSettings),
 #endif
@@ -394,6 +544,7 @@ void Net_GetSyncStat(void)
 
     for (int32_t i = 0; i < NUM_SYNC_TYPES; i++)
         syncData[INPUTFIFO_CURTICK][i] = syncType[i].func();
+    g_syncStampTic[INPUTFIFO_CURTICK] = movefifoplc;
 
     // spawn accounting window = one consumed tic (stamped above). Keep a
     // per-tic history so the mismatch handler (which runs when the compare
@@ -407,9 +558,14 @@ void Net_GetSyncStat(void)
             g_dbgSpawnHist[slot][2 + k] = (k < g_dbgInsRingN && k < 32) ? g_dbgInsRing[k] : -1;
             g_dbgSpawnHist[slot][8 + k] = (k < g_dbgInsRingN && k < 32) ? g_dbgInsOwnRing[k] : -1;
         }
+        for (int k = 0; k < 3; k++)
+            g_dbgSpawnHist[slot][14 + k] = (k < g_dbgDelRingN && k < 32) ? g_dbgDelRing[k] : -1;
+        for (int k = 0; k < 6; k++)
+            s_krandSiteHist[slot][k] = (k < g_krandCalls && k < 8) ? g_krandSiteRing[k] : NULL;
     }
     g_dbgInsCount = g_dbgDelCount = 0;
-    g_dbgInsRingN = 0;
+    g_dbgInsRingN = g_dbgDelRingN = 0;
+    g_krandCalls  = 0;
 
 #if defined(__EMSCRIPTEN__)
     // DEBUG (desync validation): prove the ring is being FILLED, with what, at
@@ -493,39 +649,60 @@ void Net_DisplaySyncMsg(void)
     }
 }
 
+// MULTI-STAMP sync block: [count u8][count x (tic i32 + NUM_SYNC_TYPES bytes)].
+// The old one-stamp-per-packet form only ever sent the CURRENT tic's stamp:
+// any burst of consumed tics (echo batches, catchup fast-forwards) left holes
+// in compare coverage, so a fork's BIRTH tic was routinely never compared and
+// the first visible mismatch was a many-categories-at-once storm tics later.
+// Now every consumed tic's stamp ships exactly once (cursor = own lastSyncTick),
+// capped per packet; the receiver walks them all. Slot semantics, both roles:
+// syncData[T] is written when movefifoplc becomes T = state AFTER consuming
+// tic T-1; label is T. (The old role-split labeling is gone.)
 void Net_AddSyncInfoToPacket(int *j)
 {
     auto p = &g_player[myconnectindex];
-    int32_t const tickNum = (myconnectindex == connecthead) ? movefifoplc-1 : movefifoplc;
-    
-    if(tickNum == p->lastSyncTick || g_gameQuit) // Already sent this one, or disconnecting.
-    {
-        B_BUF32(&packbuf[(*j)], -1);
-        (*j) += sizeof(int32_t);
+    int const countPos = (*j)++;
+    packbuf[countPos] = 0;
+
+    if (g_gameQuit || numplayers < 2)
         return;
-    }
 
-    p->lastSyncTick = tickNum;
-    B_BUF32(&packbuf[(*j)], tickNum);
-    (*j) += sizeof(int32_t);
+    int32_t const newest = movefifoplc;
+    int32_t from = p->lastSyncTick + 1;
+    if (from < newest - 15)
+        from = newest - 15;                    // per-packet cap (oldest dropped)
+    if (from < newest - (MOVEFIFOSIZ - 8))
+        from = newest - (MOVEFIFOSIZ - 8);     // ring-reuse safety
+    if (from > newest)
+        return;
 
-    for (int32_t sb = 0; sb < NUM_SYNC_TYPES; sb++)
+    int n = 0;
+    for (int32_t t = from; t <= newest && n < 16; t++, n++)
     {
-        packbuf[(*j)++] = syncData[tickNum & (MOVEFIFOSIZ-1)][sb];
+        B_BUF32(&packbuf[(*j)], t);
+        (*j) += sizeof(int32_t);
+        Bmemcpy(&packbuf[(*j)], syncData[t & (MOVEFIFOSIZ - 1)], NUM_SYNC_TYPES);
+        (*j) += NUM_SYNC_TYPES;
     }
+    packbuf[countPos] = (char)n;
+    p->lastSyncTick = newest;
 }
 
 extern int32_t g_netSyncCompares;
 void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
 {
-    // if ready2send is not set, or player is disconnected then don't try to get sync info
-#if 1
-    if (!ready2send || !g_player[otherconnectindex].connected || g_gameQuit)
-        return;
-#endif
+    int const stampCount = (uint8_t)packbuf[(*j)++];
 
+    for (int s = 0; s < stampCount; s++)
+    {
     int32_t const tickNum = (int32_t)B_UNBUF32(&packbuf[(*j)]);
     (*j) += sizeof(int32_t);
+    int const bytesPos = (*j);
+    (*j) += NUM_SYNC_TYPES;   // ALWAYS consume the stamp bytes, even when skipping
+
+    // if ready2send is not set, or player is disconnected then don't compare
+    if (!ready2send || !g_player[otherconnectindex].connected || g_gameQuit)
+        continue;
 
     // Reject tics outside the live ring window: the move channel is unreliable/
     // unordered, so a badly delayed packet could otherwise compare a REMOTE tic
@@ -538,18 +715,22 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
     // produced false flags that re-triggered the auto-resync in a loop
     // (soak-caught: post-heal sessions re-flagged at tic 1-2 with zero-hash
     // artifacts). Real divergence persists past the grace and still flags.
-    if (tickNum < 30 || tickNum == g_player[otherconnectindex].lastSyncTick || (tickNum > movefifoplc)
+    if (tickNum < 30 || (tickNum > movefifoplc)
         || tickNum <= movefifoplc - (MOVEFIFOSIZ - 8))
-        return;
+        continue;
+    if (g_syncStampTic[tickNum & (MOVEFIFOSIZ - 1)] != tickNum)
+        continue;   // local slot unstamped/lapped for this tic: nothing to compare
+    if (s_cmpTic[otherconnectindex][tickNum & (MOVEFIFOSIZ - 1)] == tickNum)
+        continue;   // already compared (resend/reorder)
+    s_cmpTic[otherconnectindex][tickNum & (MOVEFIFOSIZ - 1)] = tickNum;
 
     g_netSyncCompares++; // debug surface: proves the CRC comparison actually runs
-    g_player[otherconnectindex].lastSyncTick = tickNum;
 
     // Grab sync info from packet buffer
     for (int32_t sb = 0; sb < NUM_SYNC_TYPES; sb++)
     {
         char head_sync = syncData[tickNum & (MOVEFIFOSIZ - 1)][sb];
-        char player_sync = packbuf[(*j)++];
+        char player_sync = packbuf[bytesPos + sb];
 
         if (player_sync != head_sync)
         {
@@ -563,10 +744,15 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
             // DEBUG (desync validation): the first few RAW mismatches, typed.
             // One category flaking = real divergence in that subsystem; ALL
             // categories at once = comparison misalignment.
+            // g_netForensics gates the whole dump machinery (default OFF for
+            // ship builds): guest renderers died repeatedly right at storm-time
+            // dump bursts, and comparisons/auto-resync work without the spam.
+            // The soak harness enables it via Web_SetForensics for hunts.
             {
+                extern int32_t g_netForensics;
                 static int s_worldLogs, s_inputLogs;
                 bool const isInputCat = (sb >= 11);
-                if (isInputCat ? (s_inputLogs < 24) : (s_worldLogs < 8))
+                if (g_netForensics && (isInputCat ? (s_inputLogs < 24) : (s_worldLogs < 8)))
                 {
                     (isInputCat ? s_inputLogs : s_worldLogs)++;
                     EM_ASM({ console.log('[eng] MISMATCH cat=' + $0 + ' tic=' + $1 + ' local=' + $2 + ' remote=' + $3 + ' plc=' + $4 + ' ep=' + $5); },
@@ -574,8 +760,14 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
                            (int)g_netMoveEpoch);
                     // Input-hash mismatch: dump the LOCAL ring's raw fields for
                     // that tic, both players, so the two sides' logs can be
-                    // diffed field-by-field.
-                    if (isInputCat)
+                    // diffed field-by-field. Throttled: a storm printing dozens
+                    // of EM_ASM lines in one tic correlated with renderer
+                    // deaths on the bench -- the data value is in the FIRST
+                    // dumps anyway.
+                    static int32_t s_lastInpDump = -1000;
+                    if (isInputCat && tickNum - s_lastInpDump > 8)
+                    {
+                        s_lastInpDump = tickNum;
                         for (int plr = 0; plr < 2; plr++)
                         {
                             input_t const *in = &inputfifo[(tickNum - 1) & (MOVEFIFOSIZ - 1)][plr];
@@ -583,13 +775,42 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
                                    tickNum - 1, plr, in->fvel, in->svel, (int)in->q16avel, (int)in->q16horz,
                                    (int)in->bits, (int)in->extbits);
                         }
+                    }
+                    // krand-count mismatch: dump the fork tic's local call
+                    // sites -- diffing the peers' dumps names the asymmetric
+                    // RNG consumer directly.
+                    if (sb == 16)
+                    {
+                        const char *const *sites = s_krandSiteHist[tickNum & (MOVEFIFOSIZ - 1)];
+                        EM_ASM({ console.log('[eng] RNGDUMP tic=' + $0 + ' n=' + $7 + ' sites='
+                                             + ($1 ? UTF8ToString($1) : '')
+                                             + ($2 ? ',' + UTF8ToString($2) : '')
+                                             + ($3 ? ',' + UTF8ToString($3) : '')
+                                             + ($4 ? ',' + UTF8ToString($4) : '')
+                                             + ($5 ? ',' + UTF8ToString($5) : '')
+                                             + ($6 ? ',' + UTF8ToString($6) : '')); },
+                               tickNum, sites[0], sites[1], sites[2], sites[3], sites[4], sites[5],
+                               (int)(uint8_t)syncData[tickNum & (MOVEFIFOSIZ - 1)][16]);
+                    }
+                    // Deep-hash mismatch: name the diverging statnum. (Runs on
+                    // CURRENT state, not the fork tic's -- close enough while
+                    // the divergence is fresh; the tic label ties dumps together.)
+                    if (sb == 18 || sb == 19)
+                    {
+                        static int32_t s_lastStatDump = -1000;
+                        if (tickNum - s_lastStatDump > 8)
+                        {
+                            s_lastStatDump = tickNum;
+                            Sync_DumpStatHashes(tickNum);
+                        }
+                    }
                     // Spawn-count/picnum mismatch: dump the FORK tic's local
                     // spawn history -- the picnums name the one-peer spawner.
                     if (sb == 13 || sb == 14)
                     {
                         int16_t const *h = g_dbgSpawnHist[tickNum & (MOVEFIFOSIZ - 1)];
-                        EM_ASM({ console.log('[eng] SPAWNDUMP tic=' + $0 + ' ins=' + $1 + ' del=' + $2 + ' pics=[' + $3 + ',' + $4 + ',' + $5 + '] by=[' + $6 + ',' + $7 + ',' + $8 + ']'); },
-                               tickNum, h[0], h[1], h[2], h[3], h[4], h[8], h[9], h[10]);
+                        EM_ASM({ console.log('[eng] SPAWNDUMP tic=' + $0 + ' ins=' + $1 + ' del=' + $2 + ' pics=[' + $3 + ',' + $4 + ',' + $5 + '] by=[' + $6 + ',' + $7 + ',' + $8 + '] delpics=[' + $9 + ',' + $10 + ',' + $11 + ']'); },
+                               tickNum, h[0], h[1], h[2], h[3], h[4], h[8], h[9], h[10], h[14], h[15], h[16]);
                     }
                 }
             }
@@ -597,6 +818,5 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
             desynched_players[otherconnectindex] = 1;
         }
     }
+    }   // stamp loop
 }
-
-

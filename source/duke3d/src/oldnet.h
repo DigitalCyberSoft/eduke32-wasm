@@ -171,6 +171,21 @@ void Net_ExcisePlayer(int i);     // remove a player from the running match (cla
 extern int32_t g_netPredictMode;  // DEBUG bisect: bit0 = correction pass, bit1 = view swap
 void Net_FlushPendingDrops(void); // barrier entry: fold pending drops into the roster, no world edits
 
+// ── Canonical stream + no-stall join (host = input sequencer) ────────────────
+// The master's M2S stream is THE timeline: slaves consume every column from the
+// echo, INCLUDING their own (local samples go to g_netSendRing for the wire and
+// the predictor, never straight into the consume fifo). That makes master-side
+// synthesis (deadline-fill for laggards, zero-fill for a seating joiner) safe
+// by construction -- every peer consumes identical bytes, so lag can no longer
+// desync anyone and a slow peer stalls nobody but themself.
+extern input_t g_netSendRing[MOVEFIFOSIZ]; // slave: locally sampled inputs staged for S2M + prediction
+extern int32_t g_netSampleHead;   // slave: absolute tic of the next local sample
+extern int32_t g_netFillTics;     // master: tics synthesized past the fill deadline (telemetry)
+extern int32_t g_netJoinCatchup;  // joiner: snapshot applied, streaming to live; render spectates
+void Net_ApplyPendingJoins(void); // deterministic seat at the master-stamped joinTic (all peers)
+void Net_HostJoinFlow(void);      // host: barrier-free join state machine (menus.cpp frame point)
+int  Net_JoinFlowActive(void);    // a join is streaming/announced: defer the resync broadcast
+
 //OLDNET_EXTERN PredictBackup_t predictBackup[MOVEFIFOSIZ];
 
 enum DukePacket_t

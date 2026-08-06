@@ -61,7 +61,7 @@ extern "C" {
     // Engine seam (common.cpp): path of the selected GRP, so this TU can fingerprint
     // it without pulling engine headers into an -fexceptions translation unit.
     const char *Net_NativeGrpPath(void);
-    void Net_SnapshotReady(int seatMask); // oldnet.cpp: late-join snapshot file landed
+    void Net_SnapshotReady(int seatMask, int plc, int isJoin); // oldnet.cpp: snapshot file landed
 }
 
 namespace {
@@ -102,7 +102,9 @@ struct InboundItem
     } kind;
     int peer = 0;    // connectindex/slot (Frame, PeerEvent) or slot (SetLocalIndex)
     int channel = 0; // Frame
-    int event = 0;   // PeerEvent
+    int event = 0;   // PeerEvent; seat mask (SnapshotReady)
+    int a = 0;       // SnapshotReady: catchup base tic (sender's movefifoplc)
+    int b = 0;       // SnapshotReady: 1 = barrier-free join, 0 = legacy resync
     std::vector<uint8_t> data;
 };
 
@@ -390,7 +392,7 @@ public:
             {
                 case InboundItem::SetLocalIndex: Net_SetLocalIndex(it.peer); break;
                 case InboundItem::PeerEvent: Net_PeerEvent(it.peer, it.event); break;
-                case InboundItem::SnapshotReady: Net_SnapshotReady(it.event); break;
+                case InboundItem::SnapshotReady: Net_SnapshotReady(it.event, it.a, it.b); break;
                 case InboundItem::Frame:
                     Net_ReceiveFrame(it.peer, it.channel, it.data.data(), (int)it.data.size());
                     break;
@@ -411,9 +413,11 @@ public:
     void markLaunched() { launched_ = true; }
     void setInGame(bool on) { inGame_.store(on); }
 
-    // HOST: stream latejoin.esv to every joined peer as base64 control slices on
-    // duke-rel (strings are always control, even post-attach -- mirrors duke-net.ts).
-    void sendSnapshot(int seatMask)
+    // HOST: stream latejoin.esv as base64 control slices on duke-rel (strings are
+    // always control, even post-attach -- mirrors duke-net.ts). targetToken < 0
+    // broadcasts (legacy resync); otherwise ONLY that peer receives it
+    // (barrier-free join / targeted resync -- veterans reload nothing).
+    void sendSnapshot(int seatMask, int targetToken, int plc, int isJoin)
     {
         FILE *f = fopen("latejoin.esv", "rb");
         if (!f)
@@ -436,17 +440,28 @@ public:
         std::vector<std::string> peers;
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            for (auto &kv : deviceToToken_)
-                peers.push_back(kv.first);
+            if (targetToken < 0)
+            {
+                for (auto &kv : deviceToToken_)
+                    peers.push_back(kv.first);
+            }
+            else
+            {
+                auto it = tokenToDevice_.find(targetToken);
+                if (it != tokenToDevice_.end())
+                    peers.push_back(it->second);
+            }
         }
-        printf("[nnet] -> snapshot %d bytes to %d peer(s), mask 0x%x\n",
-               (int)bytes.size(), (int)peers.size(), seatMask);
+        printf("[nnet] -> snapshot %d bytes to %d peer(s), mask 0x%x, plc %d, join %d\n",
+               (int)bytes.size(), (int)peers.size(), seatMask, plc, isJoin);
         fflush(stdout);
         size_t const CHUNK = 48 * 1024;
         for (auto &peer : peers)
         {
             pm_->sendControl(peer, "{\"t\":\"sav_begin\",\"size\":" + std::to_string(bytes.size())
-                                   + ",\"mask\":" + std::to_string(seatMask) + "}");
+                                   + ",\"mask\":" + std::to_string(seatMask)
+                                   + ",\"plc\":" + std::to_string(plc)
+                                   + ",\"join\":" + std::to_string(isJoin) + "}");
             for (size_t off = 0; off < bytes.size(); off += CHUNK)
             {
                 size_t const len = std::min(CHUNK, bytes.size() - off);
@@ -604,6 +619,8 @@ private:
             {
                 savSize_ = sjson_get_int(root, "size", 0);
                 savMask_ = sjson_get_int(root, "mask", 0);
+                savPlc_  = sjson_get_int(root, "plc", 0);
+                savJoin_ = sjson_get_int(root, "join", 0);
                 savBuf_.clear();
                 savBuf_.reserve((size_t)savSize_);
             }
@@ -654,11 +671,13 @@ private:
         else if (type == "sav_end" && !isHost_)
         {
             std::vector<uint8_t> bytes;
-            int mask = 0;
+            int mask = 0, plc = 0, join = 0;
             {
                 std::lock_guard<std::mutex> lk(sigMtx_);
                 bytes.swap(savBuf_);
                 mask = savMask_;
+                plc  = savPlc_;
+                join = savJoin_;
                 if ((int)bytes.size() != savSize_)
                 {
                     printf("[nnet] snapshot SIZE MISMATCH (%d != %d) -- dropped\n", (int)bytes.size(), savSize_);
@@ -676,11 +695,14 @@ private:
                     InboundItem it;
                     it.kind = InboundItem::SnapshotReady;
                     it.event = mask;
+                    it.a     = plc;
+                    it.b     = join;
                     {
                         std::lock_guard<std::mutex> lk(mtx_);
                         inbound_.push_back(std::move(it));
                     }
-                    printf("[nnet] snapshot ready (%d bytes, mask 0x%x)\n", (int)bytes.size(), mask);
+                    printf("[nnet] snapshot ready (%d bytes, mask 0x%x, plc %d, join %d)\n",
+                           (int)bytes.size(), mask, plc, join);
                     fflush(stdout);
                 }
             }
@@ -980,7 +1002,7 @@ private:
     bool upnpStarted_ = false;
     uint16_t icePortBase_ = 0;
     std::vector<uint8_t> savBuf_;  // late-join snapshot reassembly (under sigMtx_)
-    int savSize_ = 0, savMask_ = 0;
+    int savSize_ = 0, savMask_ = 0, savPlc_ = 0, savJoin_ = 0;
 
     // Menu update queue (produced on worker threads, applied by menuPump on the game thread).
     std::mutex menuMtx_;
@@ -1069,10 +1091,10 @@ void net_native_mark_launched(void)
 }
 
 // ── Menu action bridge (called from menus.cpp on native; see NETMENU) ────────
-void net_native_send_snapshot(int seatMask)
+void net_native_send_snapshot(int seatMask, int targetToken, int plc, int isJoin)
 {
     if (g_t)
-        g_t->sendSnapshot(seatMask);
+        g_t->sendSnapshot(seatMask, targetToken, plc, isJoin);
 }
 
 void net_native_host(int isPublic, const char *name, int maxPlayers, const char *player, int localOnly)

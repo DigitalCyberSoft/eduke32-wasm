@@ -1034,7 +1034,7 @@ ifeq ($(RENDERTYPE),SDL)
         LINKERFLAGS += -sEXPORTED_RUNTIME_METHODS=FS,callMain,ccall,cwrap
         ifeq (1,$(NETDUKE32))
             LINKERFLAGS += --js-library platform/emscripten/net/seam_library.js
-            LINKERFLAGS += -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_Net_ReceiveFrame,_Net_PeerEvent,_Net_SetLocalIndex,_NetMenu_SetStatus,_NetMenu_SetLobby,_NetMenu_SetRoster,_NetMenu_SetGrpList,_NetMenu_SetProgress,_NetMenu_OnJoined,_Web_SetMute,_Net_SnapshotReady,_Web_ForceDesync,_Web_SetPredictMode
+            LINKERFLAGS += -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_Net_ReceiveFrame,_Net_PeerEvent,_Net_SetLocalIndex,_NetMenu_SetStatus,_NetMenu_SetLobby,_NetMenu_SetRoster,_NetMenu_SetGrpList,_NetMenu_SetProgress,_NetMenu_OnJoined,_Web_SetMute,_Net_SnapshotReady,_Web_ForceDesync,_Web_SetPredictMode,_Web_SetForensics
         endif
         ifneq (0,$(EM_SINGLE_FILE))
             LINKERFLAGS += -sSINGLE_FILE=1 --shell-file platform/emscripten/shell.html

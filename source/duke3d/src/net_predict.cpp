@@ -21,7 +21,17 @@ static void Net_ProcessPrediction(void)
 {
     input_t backupInput = g_player[myconnectindex].input;
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // Canonical stream: a slave's consume fifo holds the master's echo (its own
+    // column included, RTT late). The predictor exists to hide exactly that
+    // latency, so it replays the LOCALLY SAMPLED inputs from g_netSendRing.
+    // The master's samples go straight into its fifo, which stays its source.
+    g_player[myconnectindex].input = (numplayers > 1 && myconnectindex != connecthead)
+        ? g_netSendRing[INPUTFIFO_PREDICTTICK]
+        : inputfifo[INPUTFIFO_PREDICTTICK][myconnectindex];
+#else
     g_player[myconnectindex].input = inputfifo[INPUTFIFO_PREDICTTICK][myconnectindex];
+#endif
 
     // Clear bits that could cause trouble
     g_player[myconnectindex].input.bits &= ~(BIT(SK_PAUSE) | BIT(SK_MULTIFLAG) | BIT(SK_GAMEQUIT));
@@ -283,6 +293,9 @@ void Net_DoPrediction(int state)
     // Backup data
     backupActor  = actor[pSpriteNum];
     backupSeed   = randomseed;
+    // The per-tic krand draw counter (sync.cpp cat 16) is lockstep state like
+    // randomseed itself: replay draws must not leak into it.
+    int32_t const backupKrandCalls = g_krandCalls;
 
     // Change to predicted sprite/actor
     sprite[pSpriteNum].cstat &= ~257;
@@ -290,8 +303,16 @@ void Net_DoPrediction(int state)
 
     Net_SwapPredictedLinkedLists();
 
-    // Process
+    // Process. A canonical-stream slave replays to its SAMPLE head (movefifoend
+    // is the master-echo high-water there, RTT behind the samples).
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    int32_t const predictEnd = (numplayers > 1 && myconnectindex != connecthead)
+        ? g_netSampleHead
+        : g_player[myconnectindex].movefifoend;
+    while (predictfifoplc < predictEnd) Net_ProcessPrediction();
+#else
     while (predictfifoplc < g_player[myconnectindex].movefifoend) Net_ProcessPrediction();
+#endif
     // -------
 
     Net_SwapPredictedLinkedLists();
@@ -304,7 +325,8 @@ void Net_DoPrediction(int state)
     // Restore from backup
     actor[pSpriteNum] = backupActor;
 
-    randomseed = backupSeed;
+    randomseed   = backupSeed;
+    g_krandCalls = backupKrandCalls;
 
     oldnet_predicting = PREDICTSTATE_OFF;
 }

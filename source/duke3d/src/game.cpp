@@ -7455,6 +7455,15 @@ int G_DoMoveThings(void)
 
     if (ud.pause_on == 0)
     {
+#ifdef NETDUKE32
+        // Cumulative WORLD-STEP counter (sync.cpp cat 20): movefifoplc advances
+        // unconditionally, so any per-peer skip of this block silently shifts
+        // every actor's age against the tic count. A cumulative count makes the
+        // FIRST skipped tic flag forever after (forensics: the post-heal car
+        // aged 1 tic in 31 consumed tics on the host, with cat15/pause clean).
+        extern int32_t g_worldExecs;
+        g_worldExecs++;
+#endif
         g_globalRandom = krand();
         A_MoveDummyPlayers();//ST 13
     }
@@ -7493,7 +7502,11 @@ int G_DoMoveThings(void)
     // never absorbs remote effects on the local player (knockback, damage,
     // moving sectors). Sounds fired during the replay are centrally
     // suppressed (sounds.cpp oldnet_predicting guards).
-    if (g_netPredictMode & 1)
+    if ((g_netPredictMode & 1)
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        && !g_netJoinCatchup
+#endif
+        )
         Net_CorrectPrediction();
 #endif
 
@@ -7532,15 +7545,23 @@ int G_DoMoveThings(void)
 int G_MoveLoop(void)
 {
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
-    // Deterministic involuntary drops: excise exactly at the master-stamped
-    // tic BEFORE prediction runs and before the gate would wait on the
-    // departed player's never-coming input.
+    // Deterministic seats and drops: insert announced joiners exactly at their
+    // joinTic and excise dropped players exactly at their goneTic, BEFORE
+    // prediction runs and before the gate looks at anyone's input.
+    Net_ApplyPendingJoins();
     Net_ApplyPendingDrops();
     if (numplayers < 2)
         return 0;   // dropped to solo: app_main's numplayers gate reroutes next frame
 #endif
 
-    if (numplayers > 1)
+    if (numplayers > 1
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        // A joiner mid-catchup has no player in the world and no prediction
+        // state yet (Net_InitializePrediction runs at its seat): fast-forward
+        // the authoritative sim only.
+        && !g_netJoinCatchup
+#endif
+        )
         Net_DoPrediction(PREDICTSTATE_PROCESS);
     else
         bufferjitter = 0;
@@ -7574,6 +7595,12 @@ int G_MoveLoop(void)
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
         g_netStallSince = 0;
         g_netStallMask  = 0;
+
+        // Seats must land EXACTLY at their joinTic. This loop consumes many
+        // tics per frame (a catchup fast-forwards hundreds), so the frame-top
+        // call alone would let the cursor sail past the boundary mid-loop and
+        // insert the player tics late -- divergence on the very peer joining.
+        Net_ApplyPendingJoins();
 #endif
 
         int const doMoveReturn = G_DoMoveThings();

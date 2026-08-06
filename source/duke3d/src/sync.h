@@ -1,7 +1,7 @@
 #ifndef SYNC_H
 #define SYNC_H
 
-#define MAX_SYNC_TYPES 16
+#define MAX_SYNC_TYPES 24
 
 #define DEFINE_SYNCFUNC(funcname) { #funcname, funcname }
 typedef struct

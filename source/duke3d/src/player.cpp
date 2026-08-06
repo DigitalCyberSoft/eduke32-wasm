@@ -4103,8 +4103,20 @@ void P_FragPlayer(int playerNum)
     auto const pPlayer = g_player[playerNum].ps;
     auto const pSprite = &sprite[pPlayer->i];
 
+#if !defined(NETDUKE32)
     if (g_netClient) // [75] The server should not overwrite its own randomseed
         randomseed = ticrandomseed;
+#else
+    // LOCKSTEP: the third and last of the snapshot-era ticrandomseed clobbers
+    // (game.cpp per-tic and gameexec.cpp per-actor fell when the CRC system was
+    // resurrected; this one hid in the FRAG path). On a kill, the guest PEER
+    // zeroed its RNG stream (ticrandomseed is never written on this track) and
+    // then drew dead_flag from it two lines down while the host drew from its
+    // live stream -- the match forked on the first frag of every session, in
+    // combat only. Soak-caught by the per-tic krand forensics: cat 1/16 flags
+    // born the tic the first 'fire' burst landed a kill (~200 tics into every
+    // healed epoch), world categories storming tics later.
+#endif
 
     if (pSprite->pal != 1)
     {
@@ -4220,6 +4232,22 @@ void P_FragPlayer(int playerNum)
 
 static void P_ProcessWeapon(int playerNum)
 {
+#ifdef NETDUKE32
+    // NEVER under prediction. The replay sandbox covers the predicted player,
+    // its sprite arrays/lists, gamevars, actor[own sprite] and randomseed --
+    // but the weapon pipeline (A_Shoot -> A_DamageObject and friends) writes
+    // into OTHER sprites' real actor[] entries and other players' real ps.
+    // A replayed trigger-pull therefore dealt REAL phantom damage on this peer
+    // only, re-applied by every correction replay of the same tic: the match
+    // forked in combat with identical consumed inputs, clean spawn/gate CRCs
+    // and a diverged RNG stream (the victim's reaction draws). Soak-caught as
+    // the recurring ~15-19s world fork (9 auto-resyncs in one 90s run once
+    // RTT-deep replays landed). Weapons run at authoritative time only; the
+    // predicted VIEW shows the authoritative weapon state RTT late -- the
+    // classic client-prediction scope (movement + angles, not fire).
+    if (oldnet_predicting)
+        return;
+#endif
     auto const     pPlayer      = g_player[playerNum].ps;
     uint8_t *const weaponFrame  = &pPlayer->kickback_pic;
     int const      playerShrunk = (sprite[pPlayer->i].yrepeat < 32);

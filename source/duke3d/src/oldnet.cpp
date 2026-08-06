@@ -392,18 +392,25 @@ enum
                              // perfectly alive peers, deliberate backgrounding
                              // is reaped faster by the visibility auto-leave
                              // (5s), and true deaths by transport peer-down.
-    NET_JOIN_GRACE  = 7200,  // 60s limit while a peer is WARMING UP: fewer than
-                             // NET_WARM_TICS delivered inside the session's
-                             // first 60s. A joiner loads for many seconds after
-                             // its interior-barrier READY already released the
-                             // master (Net_WaitForServer maps onto the barrier),
-                             // then hitches for seconds more on first render --
-                             // soak-caught twice: the short axe kicked every
-                             // rejoiner either mid-load or mid-warm-up.
-    NET_WARM_TICS   = 120,   // delivered tics that end a peer's warm-up early
-    NET_RATE_WIN    = 960,   // master: zombie-rate sample window (8s)
-    NET_RATE_MIN    = 60,    // master: fewer tics than this per window -> drop
     NET_HOST_SILENT = 1200,  // guest: nothing from the host at all -> host gone (10s)
+    NET_FIRST_GRACE = 7200,  // master: a peer that has NEVER delivered a record
+                             // this session is presumed LOADING (launch-barrier
+                             // art load takes 5-30s) -- reap only after 60s.
+                             // Soak-caught: the bare 10s silence axe kicked the
+                             // guest mid-level-load on the very first launch.
+
+    // Canonical-stream synthesis + barrier-free join (see oldnet.h):
+    NET_FILL_DEADLINE = 40,   // master: aggregation blocked on one peer this long
+                              // (totalclock, ~330ms) -> synthesize their tic from
+                              // their last real input and move on. The match never
+                              // stalls longer than this on anyone's ping.
+    NET_JOIN_MARGIN   = 26,   // joinTic = aggregation head + this (~1s): every peer
+                              // sees the directory announcement well before consuming
+                              // the seat tic (it rides every M2S until then)
+    NET_JOIN_ANNOUNCE = 1200, // announce a join boundary in the directory this long
+    NET_JOIN_RING_MAX = 200,  // catchup gap above this -> re-snapshot (256-tic ring)
+    NET_JOIN_RETRY    = 1200, // wait this long (10s) before re-snapshotting a slow joiner
+    NET_JOIN_TRIES    = 4,    // re-snapshot attempts before the joiner is kicked
 };
 
 static input_t const s_zeroInput = {};
@@ -421,10 +428,46 @@ static int32_t s_goneAnnounceUntil[MAXPLAYERS]; // master keeps flagging the dro
 // and the host silently unseated every guest at first launch (soak-caught).
 static struct GoneTicInit { GoneTicInit() { for (auto &t : s_goneTic) t = -1; } } s_goneTicInit;
 static int32_t s_stallSince[MAXPLAYERS];        // master: when aggregation first blocked on peer
-static int32_t s_rateClock[MAXPLAYERS], s_rateEnd[MAXPLAYERS]; // master: zombie-rate monitor
+                                                // (fill deadline + interruption HUD; drops key on
+                                                // real-progress silence, not on this)
 static int32_t s_peerDownMask;                  // mid-game transport peer-downs, folded into drops
 
 static int32_t s_sessionStartClock;  // stamped at every barrier (warm-up window)
+
+// ── Canonical stream + barrier-free join state ──────────────────────────────
+input_t g_netSendRing[MOVEFIFOSIZ];  // slave: local samples staged for the wire + predictor
+int32_t g_netSampleHead;             // slave: absolute tic of the next local sample
+int32_t g_netFillTics;               // master: synthesized tics (deadline/join fill)
+int32_t g_netJoinCatchup;            // joiner: applied the snapshot, streaming to live
+
+// Join boundary table, the exact mirror of s_goneTic: >= 0 names the first tic
+// WITH this player. Persists for the session (record membership for tics below
+// it stays "absent" forever); -1 = no boundary (present since tic 0). Same
+// zero-init trap as s_goneTic -> initialized alongside it below.
+static int32_t s_joinTic[MAXPLAYERS];
+static int32_t s_joinAnnounceUntil[MAXPLAYERS]; // master: directory-announce window
+static int32_t s_joinAwaitReal;      // master: slots seated but no real S2M record yet (fill at once)
+static int32_t s_fillActive;         // master: columns being synthesized right now -- once the
+                                     // deadline tripped, fill free-runs at full speed until a real
+                                     // record lands (else the match would crawl at one tic per
+                                     // deadline while the laggard is out)
+static int32_t s_lastRealRecvClock[MAXPLAYERS]; // master: last REAL wire progress per slave --
+                                                // with fill running, movefifoend grows on its own
+                                                // and can no longer feed the health axes
+// Host join-flow state machine (one joiner in flight; others stay queued in
+// g_netLateJoinMask until the slot clears).
+static int     s_joinFlowSlot = -1;  // slot being streamed a snapshot, -1 idle
+static int32_t s_joinFlowClock;      // when the current snapshot was sent (re-send pacing)
+static int     s_joinFlowTries;      // re-snapshot attempts for the current joiner
+static int32_t s_joinFlowBase;       // movefifoplc at snapshot save: the joiner's acks must
+                                     // ADVANCE PAST this before the seat may stamp (the ack
+                                     // cursor is initialized AT the base, so a bare gap<=8
+                                     // check passed instantly and seated a still-loading peer)
+// Joiner-side snapshot metadata (set by Net_SnapshotReady from the transport).
+static int32_t  s_snapshotPlc;       // host movefifoplc at snapshot save
+static int      s_snapshotIsJoin;    // 1 = barrier-free join/catchup, 0 = legacy resync broadcast
+
+static struct JoinTicInit { JoinTicInit() { for (auto &t : s_joinTic) t = -1; } } s_joinTicInit;
 
 static void Net_ResetProtocolState(void)
 {
@@ -433,13 +476,23 @@ static void Net_ResetProtocolState(void)
     s_peerDownMask   = 0;
     g_netStallSince = g_netStallMask = 0;
     s_sessionStartClock = (int32_t)totalclock;
+    g_netSampleHead = 0;
+    Bmemset(g_netSendRing, 0, sizeof(g_netSendRing));
+    g_netJoinCatchup = 0;
+    s_joinAwaitReal  = 0;
+    s_fillActive     = 0;
+    s_joinFlowSlot   = -1;
+    s_joinFlowClock  = 0;
+    s_joinFlowTries  = 0;
     for (int i = 0; i < MAXPLAYERS; i++)
     {
         s_slaveAck[i] = s_lastSendClock[i] = 0;
         s_goneTic[i]  = -1;
         s_goneAnnounceUntil[i] = 0;
+        s_joinTic[i]  = -1;
+        s_joinAnnounceUntil[i] = 0;
         s_stallSince[i] = 0;
-        s_rateClock[i] = s_rateEnd[i] = 0;
+        s_lastRealRecvClock[i] = 0;
     }
 }
 
@@ -526,8 +579,34 @@ static void Net_ScheduleDropFromWire(int slot, int32_t tic)
 #endif
 }
 
-// Master health monitor: fold transport peer-downs, continuous stalls, and
-// zombie delivery rates (background-throttled tabs) into deterministic drops.
+// A join boundary landed (stamped locally on the master, or read from the M2S
+// directory on every other peer): player `slot` exists from `tic` on. Fresh
+// occupancy of the slot clears any stale drop boundary and primes the record
+// cursor at the join base so the M2S apply raises it from there. Idempotent.
+static void Net_ScheduleJoin(int slot, int32_t tic)
+{
+    if ((unsigned)slot >= MAXPLAYERS || g_player[slot].connected || s_joinTic[slot] == tic)
+        return;
+    s_joinTic[slot] = tic;
+    s_goneTic[slot] = -1;
+    s_stallSince[slot] = 0;
+    s_lastRealRecvClock[slot] = (int32_t)totalclock;
+    g_player[slot].movefifoend = tic;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('[eng] joinScheduled p=' + $0 + ' tic=' + $1 + ' plc=' + $2); }, slot, tic, movefifoplc);
+#else
+    initprintf("net: join boundary for slot %d at tic %d\n", slot, tic);
+#endif
+}
+
+// Master health monitor: fold transport peer-downs and real-progress silence
+// into deterministic drops. With deadline-fill running, movefifoend advances on
+// its own for a stalled peer, so the old stall/zombie-rate axes (keyed on that
+// cursor) would never fire again -- the only honest death signal left is "the
+// wire has delivered NOTHING REAL from this peer for a long time". The old
+// warm-up special cases are gone with the barrier: a loading joiner is not in
+// the chain at all (nobody waits on it), and by the time it seats it has
+// already proven a live catchup stream.
 static void Net_CheckPeerHealth(void)
 {
     if (myconnectindex != connecthead || g_player[myconnectindex].ps == NULL
@@ -535,6 +614,8 @@ static void Net_CheckPeerHealth(void)
         return;
 
     int32_t const now = (int32_t)totalclock;
+    if (s_sessionStartClock > now)   // totalclock reset (level transition)
+        s_sessionStartClock = now;
     int i;
     TRAVERSE_CONNECT(i)
     {
@@ -543,42 +624,34 @@ static void Net_CheckPeerHealth(void)
 
         if (s_peerDownMask & (1 << i)) { Net_ScheduleDrop(i, "connection lost"); continue; }
 
-        // totalclock resets (level transitions) restart the monitors
-        if (s_stallSince[i] > now) s_stallSince[i] = 0;
-        if (s_rateClock[i] > now)  s_rateClock[i] = 0;
-
-        // A peer still WARMING UP -- loading or in its first hitchy seconds of
-        // play right after a barrier -- is not dead: it gets the long limit,
-        // and the zombie-rate monitor stays off until it has proven itself.
-        if (s_sessionStartClock > now)   // totalclock reset
-            s_sessionStartClock = now;
-        bool const warming = (g_player[i].movefifoend < NET_WARM_TICS)
-                             && (now - s_sessionStartClock < NET_JOIN_GRACE);
-        int32_t const stallLimit = warming ? NET_JOIN_GRACE : NET_STALL_DROP;
-
-        if (s_stallSince[i] && now - s_stallSince[i] > stallLimit)
+        if (s_lastRealRecvClock[i] > now)   // totalclock reset
+            s_lastRealRecvClock[i] = now;
+        // A peer that has never delivered this session is presumed loading:
+        // long grace from the barrier. One that was flowing and went quiet is
+        // dead or wedged: short axe from its last real record. (Transport
+        // peer-downs reap true disconnects far sooner in both cases.)
+        bool const neverDelivered = (s_lastRealRecvClock[i] == 0);
+        int32_t const lastAlive = neverDelivered ? s_sessionStartClock : s_lastRealRecvClock[i];
+        int32_t const limit     = neverDelivered ? NET_FIRST_GRACE : NET_STALL_DROP;
+        if (now - lastAlive > limit)
         {
 #ifdef __EMSCRIPTEN__
-            EM_ASM({ console.log('[eng] stalldrop p=' + $0 + ' now=' + $1 + ' since=' + $2 + ' lim=' + $3 + ' end=' + $4); },
-                   i, now, s_stallSince[i], stallLimit, g_player[i].movefifoend);
+            EM_ASM({ console.log('[eng] silencedrop p=' + $0 + ' now=' + $1 + ' lastReal=' + $2 + ' end=' + $3); },
+                   i, now, s_lastRealRecvClock[i], g_player[i].movefifoend);
 #endif
             Net_ScheduleDrop(i, "timed out"); continue;
         }
-
-        if (warming)
-        { s_rateClock[i] = 0; continue; }
-
-        if (s_rateClock[i] == 0)
-        { s_rateClock[i] = now; s_rateEnd[i] = g_player[i].movefifoend; }
-        else if (now - s_rateClock[i] >= NET_RATE_WIN)
-        {
-            if (g_player[i].movefifoend - s_rateEnd[i] < NET_RATE_MIN)
-            { Net_ScheduleDrop(i, "connection too slow"); continue; }
-            s_rateClock[i] = now;
-            s_rateEnd[i]   = g_player[i].movefifoend;
-        }
     }
-    s_peerDownMask = 0;  // folded
+    // Preserve peer-down bits for stamped-but-unseated joiners: they are not in
+    // the chain yet, so the fold above could not see them. Once the seat tic
+    // passes and they join the chain, the kept bit folds into their drop.
+    {
+        int32_t keep = 0;
+        for (int k = 0; k < MAXPLAYERS; k++)
+            if (s_joinTic[k] >= 0 && !g_player[k].connected)
+                keep |= s_peerDownMask & (1 << k);
+        s_peerDownMask = keep;
+    }
 }
 
 // Build one tailored MASTER_TO_SLAVE packet for `dest`: everything from that
@@ -595,24 +668,30 @@ static int Net_BuildMasterPacket(int dest, int32_t start, char const *syncBlk, i
     int const pcountPos = j++;
     B_BUF32(&packbuf[j], g_player[dest].movefifoend); j += 4;  // ack of dest's own inputs
 
-    // Roster directory: the live chain plus recently-dropped players, so their
-    // pre-drop records still decode in repair windows and the drop boundary
-    // itself is redundant across packets.
+    // Roster directory: the live chain, recently-dropped players (their pre-drop
+    // records still decode in repair windows; the drop boundary is redundant
+    // across packets), and announced late joiners (their JOIN boundary must
+    // reach every peer before anyone consumes the seat tic -- it rides every
+    // packet until then).
     int listed[MAXPLAYERS], nlisted = 0;
     int i;
     TRAVERSE_CONNECT(i)
         listed[nlisted++] = i;
     for (i = 0; i < MAXPLAYERS; i++)
-        if (s_goneTic[i] >= 0 && !g_player[i].connected && (int32_t)totalclock < s_goneAnnounceUntil[i])
+        if (!g_player[i].connected
+            && ((s_goneTic[i] >= 0 && (int32_t)totalclock < s_goneAnnounceUntil[i])
+                || (s_joinTic[i] >= 0 && (int32_t)totalclock < s_joinAnnounceUntil[i])))
             listed[nlisted++] = i;
 
     input_t const *bases[MAXPLAYERS];
     for (int k = 0; k < nlisted; k++)
     {
         int const p = listed[k];
-        packbuf[j++] = (char)(p | (s_goneTic[p] >= 0 ? 0x80 : 0));
+        bool const announceJoin = (s_joinTic[p] >= 0 && (int32_t)totalclock < s_joinAnnounceUntil[p]);
+        packbuf[j++] = (char)(p | (s_goneTic[p] >= 0 ? 0x80 : 0) | (announceJoin ? 0x40 : 0));
         packbuf[j++] = (char)min(max(g_player[p].myminlag, -128), 127);
         if (s_goneTic[p] >= 0) { B_BUF32(&packbuf[j], s_goneTic[p]); j += 4; }
+        if (announceJoin)      { B_BUF32(&packbuf[j], s_joinTic[p]); j += 4; }
         bases[p] = &s_zeroInput;
     }
 
@@ -628,6 +707,8 @@ static int Net_BuildMasterPacket(int dest, int32_t start, char const *syncBlk, i
             int const p = listed[k];
             if (s_goneTic[p] >= 0 && t >= s_goneTic[p])
                 continue;   // gone from this tic on: no record
+            if (s_joinTic[p] >= 0 && t < s_joinTic[p])
+                continue;   // not in the match until the join boundary: no record
             input_t const *cur = &inputfifo[t & (MOVEFIFOSIZ - 1)][p];
             j = Net_WriteInputDelta(packbuf, j, bases[p], cur);
             bases[p] = cur;
@@ -671,33 +752,50 @@ void Net_HandleInput(void)
     Net_GetPackets();
 
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
-    (void)osyn;  // used only by the stock one-tic protocol in the #else branch
+    (void)osyn; (void)nsyn;  // used only by the stock one-tic protocol in the #else branch
     // ── Tic-indexed protocol (see the wire-format comment above) ─────────────
     // A capped sampler must STILL send/aggregate: acks and repair windows ride
     // every packet, and stopping them deadlocks a peer that is waiting on a
     // resend (the stock early-return here starved exactly that).
-    bool const capped = (g_player[myconnectindex].movefifoend - movefifoplc >= 100);
+    //
+    // CANONICAL STREAM: the master samples straight into its own fifo column --
+    // its samples ARE the timeline. A slave stages samples in g_netSendRing for
+    // the wire and the predictor, and consumes its own column from the master's
+    // echo exactly like every other player's; that way master-side synthesis
+    // (deadline-fill, joiner zero-fill) reaches every sim identically and lag
+    // can never fork anyone. A joiner mid-catchup samples nothing at all.
+    bool const isSlave = (numplayers > 1 && myconnectindex != connecthead);
+    bool const seated  = g_player[myconnectindex].connected && !g_netJoinCatchup;
+    int32_t const localHead = isSlave ? g_netSampleHead : g_player[myconnectindex].movefifoend;
+    bool const capped = (localHead - movefifoplc >= 100);
 
-    if (!capped)
+    if (!capped && seated)
     {
-        // Put our local input into the FIFO to be processed by P_ProcessInput and such.
-        nsyn  = &inputfifo[g_player[myconnectindex].movefifoend & (MOVEFIFOSIZ - 1)][myconnectindex];
-        *nsyn = netInput;
-        g_player[myconnectindex].movefifoend++;
+        if (isSlave)
+        {
+            g_netSendRing[g_netSampleHead & (MOVEFIFOSIZ - 1)] = netInput;
+            g_netSampleHead++;
+        }
+        else
+        {
+            inputfifo[g_player[myconnectindex].movefifoend & (MOVEFIFOSIZ - 1)][myconnectindex] = netInput;
+            g_player[myconnectindex].movefifoend++;
+        }
     }
 
     if (numplayers < 2)
         return;
 
+    int32_t const localNow = (isSlave ? g_netSampleHead : g_player[myconnectindex].movefifoend) - 1;
     TRAVERSE_CONNECT(i)
     if (i != myconnectindex)
     {
-        int32_t const lag = (g_player[myconnectindex].movefifoend - 1) - g_player[i].movefifoend;
+        int32_t const lag = localNow - g_player[i].movefifoend;
         g_player[i].myminlag = min(g_player[i].myminlag, lag);
         mymaxlag = max(mymaxlag, lag);
     }
 
-    if (!capped && ((g_player[myconnectindex].movefifoend - 1) & (TIMERUPDATESIZ - 1)) == 0)
+    if (!capped && seated && (localNow & (TIMERUPDATESIZ - 1)) == 0)
     {
         i = mymaxlag - bufferjitter;
         mymaxlag = 0;
@@ -742,7 +840,7 @@ void Net_HandleInput(void)
         }
 
         //Fix timers and buffer/jitter value
-        if (!capped && ((g_player[myconnectindex].movefifoend-1)&(TIMERUPDATESIZ-1)) == 0)
+        if (!capped && seated && ((g_netSampleHead-1)&(TIMERUPDATESIZ-1)) == 0)
         {
             // [JM] I wish this wasn't so fucking cryptic.
             i = g_player[connecthead].myminlag - otherminlag;
@@ -777,10 +875,14 @@ void Net_HandleInput(void)
         // endless g_netGapDrops wedge). The byte budget below bounds each
         // packet; successive packets converge any backlog, and the sampler's
         // +100 runahead cap keeps every reachable tic inside the 256-tic ring.
-        int32_t const myEnd = g_player[myconnectindex].movefifoend;
+        // Records come from g_netSendRing (locally sampled); an unseated joiner
+        // has none, and its EMPTY window is a pure ACK carrier -- the ack paces
+        // the master's catchup stream and triggers the seat stamp.
+        int32_t const myEnd = g_netSampleHead;
         int32_t start = s_ackOfMyInput;
         if (start < 0) start = 0;
-        if (start >= myEnd) start = myEnd - 1;
+        if (start > myEnd) start = myEnd;
+        if (start == myEnd && myEnd > 0) start = myEnd - 1;
 
         packbuf[0] = PACKET_TYPE_SLAVE_TO_MASTER;
         packbuf[1] = (char)g_netMoveEpoch;
@@ -793,7 +895,7 @@ void Net_HandleInput(void)
         int32_t built = 0;
         for (int32_t t = start; t < myEnd && built < 255; t++)
         {
-            input_t const *cur = &inputfifo[t & (MOVEFIFOSIZ - 1)][myconnectindex];
+            input_t const *cur = &g_netSendRing[t & (MOVEFIFOSIZ - 1)];
             int const nj = Net_WriteInputDelta(packbuf, j, base, cur);
             if (nj > NET_BYTE_BUDGET)
                 break;
@@ -811,32 +913,73 @@ void Net_HandleInput(void)
     // ── MASTER ──
     Net_CheckPeerHealth();
 
-    // Aggregate: advance over tics every still-required peer has provided.
+    // Aggregate: advance over tics every still-required peer has provided --
+    // synthesizing any column that has been missing past the fill deadline.
+    // The user-facing contract: one peer's ping never holds the match. A
+    // synthesized tic is canonical the moment it is aggregated; the real input
+    // arriving late for it is dup-dropped, and the laggard consumes the
+    // synthesized echo like everyone else, so nobody diverges.
     for (;;)
     {
-        int32_t blockMask = 0;
+        // Required columns for the NEXT aggregation tic: the live chain plus
+        // announced joiners whose boundary the cursor has reached. The cursor
+        // runs AHEAD of the sim, so an announced joiner may not be seated in
+        // the chain yet -- but its records from joinTic on are part of the
+        // canonical stream and MUST be aggregated (zero-filled until its real
+        // inputs land), or those tics would ship with stale ring garbage.
+        int32_t reqMask = 0;
         TRAVERSE_CONNECT(i)
-            if ((s_goneTic[i] < 0 || movefifosendplc < s_goneTic[i])
-                && g_player[i].movefifoend <= movefifosendplc)
+            if (s_goneTic[i] < 0 || movefifosendplc < s_goneTic[i])
+                reqMask |= (1 << i);
+        for (i = 0; i < MAXPLAYERS; i++)
+            if (s_joinTic[i] >= 0 && !g_player[i].connected && s_goneTic[i] < 0
+                && movefifosendplc >= s_joinTic[i])
+                reqMask |= (1 << i);
+
+        int32_t blockMask = 0;
+        for (i = 0; i < MAXPLAYERS; i++)
+            if ((reqMask & (1 << i)) && g_player[i].movefifoend <= movefifosendplc)
                 blockMask |= (1 << i);
 
         if (blockMask)
         {
             int32_t const now = (int32_t)totalclock;
-            TRAVERSE_CONNECT(i)
+            int filled = 0;
+            for (i = 0; i < MAXPLAYERS; i++)
             {
-                if (blockMask & (1 << i))
+                if (!(blockMask & (1 << i)))
+                    continue;
+                if (!s_stallSince[i] || s_stallSince[i] > now)
+                    s_stallSince[i] = now;
+                if (i == myconnectindex)
+                    continue;   // never synthesize the master's own column: it IS the pace source
+
+                bool const joinerNoReal = (s_joinAwaitReal & (1 << i)) != 0;
+                if (joinerNoReal || (s_fillActive & (1 << i))
+                    || now - s_stallSince[i] > NET_FILL_DEADLINE)
                 {
-                    if (!s_stallSince[i] || s_stallSince[i] > now)
-                        s_stallSince[i] = now;
+                    int32_t const end = g_player[i].movefifoend;   // == movefifosendplc when blocking
+                    input_t fillVal = s_zeroInput;
+                    // Hold the last real input (keeps motion continuous over a
+                    // spike); a freshly seated joiner has none -> neutral zero.
+                    if (!joinerNoReal && end > 0 && (s_joinTic[i] < 0 || end > s_joinTic[i]))
+                        fillVal = inputfifo[(end - 1) & (MOVEFIFOSIZ - 1)][i];
+                    // One-shot latches must not repeat under synthesis.
+                    fillVal.bits &= ~(BIT(SK_GAMEQUIT) | BIT(SK_PAUSE) | BIT(SK_MULTIFLAG));
+                    inputfifo[end & (MOVEFIFOSIZ - 1)][i] = fillVal;
+                    g_player[i].movefifoend = end + 1;
+                    s_fillActive |= (1 << i);
+                    g_netFillTics++;
+                    filled++;
                 }
-                else
-                    s_stallSince[i] = 0;
             }
-            break;
+            if (!filled)
+                break;
+            continue;   // re-evaluate the gate over the synthesized columns
         }
-        TRAVERSE_CONNECT(i)
-            s_stallSince[i] = 0;
+        for (i = 0; i < MAXPLAYERS; i++)
+            if (!(s_fillActive & (1 << i)))
+                s_stallSince[i] = 0;
 
         if ((movefifosendplc & (TIMERUPDATESIZ - 1)) == 0)
             TRAVERSE_CONNECT(i)
@@ -845,33 +988,42 @@ void Net_HandleInput(void)
         movefifosendplc++;
     }
 
-    // Capture this tic's sync block ONCE; every tailored packet carries the
-    // same bytes (Net_AddSyncInfoToPacket dedups by lastSyncTick, so calling it
-    // per-packet would starve all slaves but the first).
-    char syncBlk[8 + MAX_SYNC_TYPES];
+    // Capture this pump's sync block ONCE; every tailored packet carries the
+    // same bytes (Net_AddSyncInfoToPacket advances the multi-stamp cursor, so
+    // calling it per-packet would starve all slaves but the first).
+    char syncBlk[16 + 16 * (4 + MAX_SYNC_TYPES)];
     int  syncLen = 0;
     Net_AddSyncInfoToPacket(&syncLen);
     Bmemcpy(syncBlk, packbuf, syncLen);
 
-    TRAVERSE_CONNECT(i)
+    auto sendMasterTo = [&](int dest)
     {
-        if (i == myconnectindex)
-            continue;
         // Window starts at the slave's ack, NEVER clamped forward (see the
         // slave-side comment: a fixed cap wedges any receiver behind by more).
-        int32_t start = s_slaveAck[i];
+        int32_t start = s_slaveAck[dest];
         if (start < 0) start = 0;
 
         int32_t const now = (int32_t)totalclock;
-        if (s_lastSendClock[i] > now)
-            s_lastSendClock[i] = 0;
-        if (start >= movefifosendplc && now - s_lastSendClock[i] < NET_KEEPALIVE)
-            continue;   // nothing new and no keepalive due
-        s_lastSendClock[i] = now;
+        if (s_lastSendClock[dest] > now)
+            s_lastSendClock[dest] = 0;
+        if (start >= movefifosendplc && now - s_lastSendClock[dest] < NET_KEEPALIVE)
+            return;   // nothing new and no keepalive due
+        s_lastSendClock[dest] = now;
 
-        j = Net_BuildMasterPacket(i, start, syncBlk, syncLen);
-        oldnet_sendpacket(i, (unsigned char *)packbuf, j);
+        int const len = Net_BuildMasterPacket(dest, start, syncBlk, syncLen);
+        oldnet_sendpacket(dest, (unsigned char *)packbuf, len);
+    };
+
+    TRAVERSE_CONNECT(i)
+    {
+        if (i != myconnectindex)
+            sendMasterTo(i);
     }
+    // A joiner mid-catchup is not in the chain yet but consumes this stream --
+    // its deep window (from the snapshot tic) converges packet by packet, paced
+    // by the acks its empty S2Ms carry.
+    if (s_joinFlowSlot >= 0 && !g_player[s_joinFlowSlot].connected)
+        sendMasterTo(s_joinFlowSlot);
 
     // Classic master self-quit: exit once our own quit-bit tic has been
     // aggregated (its broadcast + the drop machinery inform every peer).
@@ -1070,6 +1222,14 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     int32_t const myAck = (int32_t)B_UNBUF32(&packbuf[j]); j += 4;
                     if (myAck > s_ackOfMyInput)   // monotonic: reorder-safe
                         s_ackOfMyInput = myAck;
+                    // The master filled past our sample cursor (we were frozen or
+                    // cut off): those tics are canonical without us. Re-base the
+                    // sampler on the first tic the master still wants -- without
+                    // this every post-resume sample lands on an already-filled
+                    // tic and is dup-dropped forever (permanent ghost player).
+                    if (g_player[myconnectindex].connected && !g_netJoinCatchup
+                        && s_ackOfMyInput > g_netSampleHead)
+                        g_netSampleHead = s_ackOfMyInput;
                 }
                 if (pcount > MAXPLAYERS)
                     break;   // malformed
@@ -1080,10 +1240,16 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 for (int32_t k = 0; k < pcount; k++)
                 {
                     uint8_t const sb = (uint8_t)packbuf[j++];
-                    int const slot = sb & 0x7f;
+                    int const slot = sb & 0x3f;
                     int8_t const minlag = (int8_t)packbuf[j++];
                     int32_t gtic = -1;
                     if (sb & 0x80) { gtic = (int32_t)B_UNBUF32(&packbuf[j]); j += 4; }
+                    if (sb & 0x40)
+                    {
+                        int32_t const jtic = (int32_t)B_UNBUF32(&packbuf[j]); j += 4;
+                        if (slot < MAXPLAYERS)
+                            Net_ScheduleJoin(slot, jtic);
+                    }
                     if (slot >= MAXPLAYERS) { bad = true; break; }
                     slots[k] = slot;
                     gone[k]  = gtic;
@@ -1112,11 +1278,21 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     {
                         if (gone[k] >= 0 && t >= gone[k])
                             continue;   // dropped players carry no records past their boundary
+                        // Join boundaries persist past the announce window (the
+                        // persistent table, not the packet flag, decides): tics
+                        // below the boundary never carried a record for the slot.
+                        int32_t const jt = s_joinTic[slots[k]];
+                        if (jt >= 0 && t < jt)
+                            continue;
                         input_t tmp;
                         j = Net_ReadInputDelta(packbuf, j, &recs[k], &tmp);
                         recs[k] = tmp;
-                        // Our own echo is never applied: local sampling owns our column.
-                        if (t >= have && slots[k] != myconnectindex)
+                        // CANONICAL STREAM: apply every column, our own included.
+                        // The master may have synthesized our tics (deadline-fill)
+                        // -- its version is the one every other sim consumed, so
+                        // it must be the one we consume too. Local samples live
+                        // in g_netSendRing for the wire and the predictor.
+                        if (t >= have)
                             inputfifo[t & (MOVEFIFOSIZ - 1)][slots[k]] = tmp;
                     }
                     if (t < have)
@@ -1125,9 +1301,12 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                         continue;
                     }
                     for (int32_t k = 0; k < pcount; k++)
-                        if (slots[k] != myconnectindex && (gone[k] < 0 || t < gone[k])
+                    {
+                        int32_t const jt = s_joinTic[slots[k]];
+                        if ((gone[k] < 0 || t < gone[k]) && (jt < 0 || t >= jt)
                             && g_player[slots[k]].movefifoend <= t)
                             g_player[slots[k]].movefifoend = t + 1;
+                    }
                     movefifosendplc = t + 1;
                 }
 
@@ -1195,6 +1374,13 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     }
                     inputfifo[t & (MOVEFIFOSIZ - 1)][other] = tmp;
                     g_player[other].movefifoend = t + 1;
+                    // Real input landed: stop synthesizing this column, and count
+                    // it as liveness for the silence axe. (Dup records don't count:
+                    // a tab that only replays already-filled tics is not making
+                    // progress; a healthy client produces new records every tic.)
+                    s_fillActive    &= ~(1 << other);
+                    s_joinAwaitReal &= ~(1 << other);
+                    s_lastRealRecvClock[other] = (int32_t)totalclock;
                 }
 
                 Net_GetSyncInfoFromPacket(packbuf, &j, other);
@@ -1744,11 +1930,20 @@ int32_t g_netEpochDrops = 0; // discarded stale-generation move packets (debug s
 // DEBUG bisection switch (desync validation): bit0 = Net_CorrectPrediction
 // runs, bit1 = predicted-view render swap active. Defaults to both ON.
 int32_t g_netPredictMode = 3;
+// Forensic console dumps (MISMATCH/INPDUMP/SPAWNDUMP/RNGDUMP/STATDUMP) --
+// default OFF: comparisons and auto-resync run regardless; the dump bursts
+// correlated with renderer deaths on the bench. Soak enables for hunts.
+int32_t g_netForensics = 0;
 #ifdef __EMSCRIPTEN__
 extern "C" void Web_SetPredictMode(int mode)
 {
     g_netPredictMode = mode;
     EM_ASM({ console.log('[eng] predictMode=' + $0); }, mode);
+}
+extern "C" void Web_SetForensics(int on)
+{
+    g_netForensics = on;
+    EM_ASM({ console.log('[eng] forensics=' + $0); }, on);
 }
 #endif
 
@@ -1785,20 +1980,26 @@ extern "C" void Web_ForceDesync(void)
 
 // Called by the transports (JS via ccall / native directly) when the snapshot
 // file is fully written. Consumed in menus.cpp at a safe frame point.
-extern "C" void Net_SnapshotReady(int seatMask)
+// plc = the sender's movefifoplc at save time (the catchup stream base);
+// isJoin = barrier-free join/catchup (1) vs legacy resync broadcast (0).
+extern "C" void Net_SnapshotReady(int seatMask, int plc, int isJoin)
 {
     g_netSnapshotMask  = (uint32_t)seatMask;
+    s_snapshotPlc      = plc;
+    s_snapshotIsJoin   = isJoin;
     g_netSnapshotReady = 1;
 #ifdef __EMSCRIPTEN__
-    EM_ASM({ console.log('[eng] Net_SnapshotReady mask=' + $0); }, seatMask);
+    EM_ASM({ console.log('[eng] Net_SnapshotReady mask=' + $0 + ' plc=' + $1 + ' join=' + $2); },
+           seatMask, plc, isJoin);
 #endif
 }
 
-// HOST: materialize a late joiner in the running level. Mirrors what level entry
-// does for players 1+ (G_ResetAllPlayers: players are memcpys of a reference ps
-// with identity/position fixups) plus the sprite insert. Only the HOST runs this
-// -- every other peer receives the RESULT inside the snapshot, so a divergence
-// here cannot desync anyone.
+// Materialize a late joiner in the running level. Mirrors what level entry does
+// for players 1+ (G_ResetAllPlayers: players are memcpys of a reference ps with
+// identity/position fixups) plus the sprite insert. Under the barrier-free join
+// EVERY peer runs this at the same consumed tic (Net_ApplyPendingJoins), so it
+// must be bit-deterministic: the template is CONNECTHEAD's ps -- identical
+// lockstep state on every peer -- never myconnectindex's (which differs).
 void Net_InsertLatePlayer(int k)
 {
     if ((unsigned)k >= MAXPLAYERS || g_playerSpawnCnt <= 0)
@@ -1807,7 +2008,7 @@ void Net_InsertLatePlayer(int k)
     G_MaybeAllocPlayer(k);
 
     auto &plr = g_player[k];
-    Bmemcpy(plr.ps, g_player[myconnectindex].ps, sizeof(DukePlayer_t));
+    Bmemcpy(plr.ps, g_player[connecthead].ps, sizeof(DukePlayer_t));
     Bmemset(plr.frags, 0, sizeof(plr.frags));
 
     auto &spawn = g_playerSpawnPoints[k % g_playerSpawnCnt];
@@ -1833,28 +2034,40 @@ void Net_InsertLatePlayer(int k)
     initprintf("net: inserted late player %d at spawn %d\n", k, k % g_playerSpawnCnt);
 }
 
-// RECEIVER (veteran or joiner): seat the mask, load LATEJOIN_SAVE, restore the
-// LOCAL identity (the snapshot was written by the host). 0 on success.
+// RECEIVER: seat the mask, load LATEJOIN_SAVE, restore the LOCAL identity (the
+// snapshot was written by the host). 0 on success. Two modes (s_snapshotIsJoin):
+//   JOIN    -- barrier-free: we are the joiner, NOT in the roster; we adopt the
+//              host's absolute timeline at the snapshot tic, spectate, and let
+//              the M2S catchup stream carry us to live. The seat itself happens
+//              deterministically at the announced joinTic (Net_ApplyPendingJoins).
+//   LEGACY  -- resync broadcast: every veteran reloads and rendezvouses at the
+//              barrier exactly as before.
 int Net_ApplyLateJoinSnapshot(void)
 {
 #ifdef __EMSCRIPTEN__
-    EM_ASM({ console.log('[eng] Apply: seat+load starting'); });
+    EM_ASM({ console.log('[eng] Apply: seat+load starting (join=' + $0 + ' plc=' + $1 + ')'); },
+           s_snapshotIsJoin, s_snapshotPlc);
 #endif
-    int const myIdx = myconnectindex;
+    int const myIdx  = myconnectindex;
     int const myPeek = screenpeek;
+    bool const joinMode = (s_snapshotIsJoin != 0);
 
     // Seat BEFORE loading: G_LoadPlayer rejects h.numplayers != ud.multimode.
     uint32_t const seatBits = g_netSnapshotMask & 0xffffu;
-    // Adopt the sender's move epoch EXACTLY (the host bumped before sending; the
-    // barrier no longer touches it -- nested barrier calls made counting there
-    // hopeless). Adopt-if-newer on the receive path catches any stragglers.
+    // Adopt the sender's move epoch EXACTLY (a resync host bumped before sending;
+    // a join host did NOT -- the joiner slots into the RUNNING generation).
     g_netMoveEpoch = (uint8_t)((g_netSnapshotMask >> 16) & 0xff);
     for (int k = 0; k < MAXPLAYERS && k < 16; k++)
         g_player[k].connected = (seatBits >> k) & 1;
-    g_player[myIdx].connected = 1;
+    if (!joinMode)
+        g_player[myIdx].connected = 1;   // legacy: we are part of the reloading roster
     Net_SeatLateJoiners(); // mask already applied; sets quitflags + rebuilds the chain
     ud.multimode            = numplayers;
     g_mostConcurrentPlayers = ud.multimode;
+
+    if (joinMode)
+        g_netJoinCatchup = 1;   // BEFORE the load: bypasses the interior barrier
+                                // G_LoadPlayer reaches via Net_WaitForServer
 
     savebrief_t sv;
     Bstrcpy(sv.path, LATEJOIN_SAVE);
@@ -1865,21 +2078,54 @@ int Net_ApplyLateJoinSnapshot(void)
     // The snapshot carries the HOST's view of every per-player struct; OUR identity
     // is local state and must survive the load.
     myconnectindex = myIdx;
-    screenpeek     = myPeek;
+    screenpeek     = joinMode ? connecthead : myPeek;   // joiner: spectate while syncing
     Net_SeatLateJoiners(); // re-assert chain + quitflags over whatever the load restored
 
-    // Deterministic barrier slate: the load restored SAVED readyflags (zeros) over
-    // any READY that arrived mid-load. Zero everything; our own flag increments at
-    // barrier entry and the master's echo (PLAYER_READY case) re-raises its flag.
-    for (int k = 0; k < MAXPLAYERS; k++)
-        g_player[k].playerreadyflag = 0;
+    if (joinMode && r == 0)
+    {
+        // Continue the HOST's absolute timeline from the snapshot tic: the
+        // self-contained M2S stream repairs everything from here to live, and
+        // our empty S2Ms ack the progress that paces it.
+        g_netMoveEpoch = (uint8_t)((g_netSnapshotMask >> 16) & 0xff);  // in case the load path reset it
+        movefifoplc = movefifosendplc = s_snapshotPlc;
+        for (int k = 0; k < MAXPLAYERS; k++)
+        {
+            g_player[k].movefifoend  = s_snapshotPlc;
+            g_player[k].lastSyncTick = s_snapshotPlc;
+        }
+        s_ackOfMyInput  = 0;
+        g_netSampleHead = 0;            // nothing staged until the seat tic
+        predictfifoplc  = s_snapshotPlc;
+        {
+            extern int32_t g_worldExecs;   // align the epoch-relative world-step count
+            g_worldExecs = s_snapshotPlc;
+        }
+        // Our slot is NOT in the world yet; input/HUD paths still dereference our
+        // ps. Shadow the host's player until the deterministic seat replaces it.
+        G_MaybeAllocPlayer(myIdx);
+        if (g_player[connecthead].ps != NULL)
+            Bmemcpy(g_player[myIdx].ps, g_player[connecthead].ps, sizeof(DukePlayer_t));
+        g_player[myIdx].ps->gm = MODE_GAME;
+        ready2send = 1;                 // pump ON: the catchup acks must flow
+    }
+    else if (joinMode)
+        g_netJoinCatchup = 0;           // failed load: back out of catchup mode
+    else
+    {
+        // Deterministic barrier slate: the load restored SAVED readyflags (zeros)
+        // over any READY that arrived mid-load. Zero everything; our own flag
+        // increments at barrier entry and the master's echo re-raises its flag.
+        for (int k = 0; k < MAXPLAYERS; k++)
+            g_player[k].playerreadyflag = 0;
+    }
 
     Net_ResetSyncCheck(); // fresh authoritative state -> any recorded divergence is history
 
     if (r == 0)
-        initprintf("net: late-join snapshot applied (%d players, I am %d)\n", numplayers, myconnectindex);
+        initprintf("net: snapshot applied (%d players, I am %d, join=%d, tic=%d)\n",
+                   numplayers, myconnectindex, (int)joinMode, s_snapshotPlc);
     else
-        initprintf("net: late-join snapshot load FAILED (%d)\n", r);
+        initprintf("net: snapshot load FAILED (%d)\n", r);
 
     return r;
 }
@@ -1894,6 +2140,190 @@ void Net_SeatLateJoiners(void)
     g_netLateJoinMask = 0;
     Net_RebuildConnectChain();
 }
+
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+
+// Deterministic seat: every peer -- veterans, host, and the joiner itself --
+// inserts the announced player the moment its sim reaches the joinTic, exactly
+// like Net_ApplyPendingDrops excises at the goneTic. Runs at the top of
+// G_MoveLoop, before the gate and before prediction.
+void Net_ApplyPendingJoins(void)
+{
+    if (numplayers < 1 || g_player[myconnectindex].ps == NULL
+        || !(g_player[myconnectindex].ps->gm & MODE_GAME))
+        return;
+
+    for (int k = 0; k < MAXPLAYERS; k++)
+    {
+        if (s_joinTic[k] < 0 || g_player[k].connected || movefifoplc < s_joinTic[k])
+            continue;
+        // The latest membership event wins: a drop AFTER the seat means the
+        // player is gone -- without this, the excise clears `connected` and the
+        // seat re-applied every tic forever (soak-caught: joinApplied spam +
+        // ghost churn after a dead joiner was silence-dropped).
+        if (s_goneTic[k] >= 0 && s_goneTic[k] >= s_joinTic[k])
+            continue;
+        if (movefifoplc > s_joinTic[k])
+            // The announcement should always land tics ahead (it rides every
+            // M2S until consumed); arriving late means we insert late and our
+            // world diverges for the interim -- the CRC watchdog + resync heal
+            // it, but log the anomaly loudly.
+            initprintf("net: JOIN APPLIED LATE for slot %d (tic %d, plc %d)\n",
+                       k, s_joinTic[k], movefifoplc);
+
+        Net_InsertLatePlayer(k);
+        g_player[k].connected      = 1;
+        g_player[k].playerquitflag = 1;
+        Net_RebuildConnectChain();
+        ud.multimode            = numplayers;
+        g_mostConcurrentPlayers = max(g_mostConcurrentPlayers, numplayers);
+
+        if (k == myconnectindex)
+        {
+            // I am the joiner: leave spectator mode and start staging real
+            // inputs from this very tic.
+            g_netJoinCatchup = 0;
+            screenpeek       = myconnectindex;
+            g_netSampleHead  = movefifoplc;
+            s_ackOfMyInput   = movefifoplc;
+            // The pre-seat sampler never ran, so the lag/jitter bookkeeping
+            // accumulated garbage (localNow was -1): reset it or the first
+            // timer-nudge block would jerk totalclock by a bogus offset.
+            for (int p2 = 0; p2 < MAXPLAYERS; p2++)
+                g_player[p2].myminlag = 0x7fffffff;
+            mymaxlag = otherminlag = 0;
+            Net_InitializePrediction();
+        }
+#ifdef __EMSCRIPTEN__
+        EM_ASM({ console.log('[eng] joinApplied p=' + $0 + ' tic=' + $1 + ' np=' + $2 + ' me=' + $3); },
+               k, movefifoplc, numplayers, (int)(k == myconnectindex));
+#else
+        initprintf("net: player %d seated at tic %d (%d players)\n", k, movefifoplc, numplayers);
+#endif
+    }
+}
+
+// A join in flight (snapshot streaming, catchup, or seat announced but not yet
+// crossed)? The legacy auto-resync broadcast must WAIT for it: its snapshot
+// roster would exclude the half-seated joiner and fork the connect chains.
+int Net_JoinFlowActive(void)
+{
+    if (s_joinFlowSlot >= 0)
+        return 1;
+    for (int k = 0; k < MAXPLAYERS; k++)
+        if (s_joinTic[k] >= 0 && !g_player[k].connected)
+            return 1;
+    return 0;
+}
+
+// HOST: barrier-free join state machine, driven once per frame from the
+// menus.cpp NETMENU consumer. The match NEVER pauses: snapshot -> targeted
+// stream -> watch the joiner's acks -> stamp the seat tic into the directory.
+void netmenu_send_snapshot_to(int seatMask, int slot, int plc, int isJoin);  // menus.cpp
+
+void Net_HostJoinFlow(void)
+{
+    // numplayers >= 2 only: a solo host has no live MP timeline to stream (the
+    // menus.cpp consumer routes that case through the classic barrier join).
+    if (numplayers < 2 || myconnectindex != connecthead || g_player[myconnectindex].ps == NULL
+        || !(g_player[myconnectindex].ps->gm & MODE_GAME))
+        return;
+
+    int32_t const now = (int32_t)totalclock;
+    if (s_joinFlowClock > now)
+        s_joinFlowClock = now;   // totalclock reset
+
+    if (s_joinFlowSlot >= 0)
+    {
+        int const k = s_joinFlowSlot;
+        if (g_player[k].connected)   // insert applied on our own sim: flow done
+        {
+            s_joinFlowSlot = -1;
+            return;
+        }
+        if (s_joinTic[k] >= 0)       // stamped; every sim seats when it crosses the tic
+            return;
+
+        int32_t const gap = movefifosendplc - s_slaveAck[k];
+        if (s_slaveAck[k] > s_joinFlowBase && gap <= 8)
+        {
+            // Caught up FOR REAL (acks advanced past the snapshot base AND
+            // near-live): seat at the aggregation head plus a margin every peer
+            // will cross AFTER the announcement (it rides every M2S packet).
+            int32_t const tic = movefifosendplc + NET_JOIN_MARGIN;
+            Net_ScheduleJoin(k, tic);
+            s_joinAnnounceUntil[k] = now + NET_JOIN_ANNOUNCE;
+            s_joinAwaitReal |= (1 << k);
+            initprintf("net: joiner %d caught up (gap %d) -> seat at tic %d\n", k, gap, tic);
+            return;
+        }
+        if (now - s_joinFlowClock > NET_JOIN_RETRY && gap > NET_JOIN_RING_MAX)
+        {
+            // Too slow for the 256-tic ring (cold art/texture caches). Each
+            // retry re-bases the stream on a FRESH snapshot; the joiner gets
+            // warmer every pass. Persistent failure -> kick.
+            if (++s_joinFlowTries >= NET_JOIN_TRIES)
+            {
+                initprintf("net: joiner %d cannot catch up -> kick\n", k);
+                net_kick(k);
+                s_joinFlowSlot = -1;
+                return;
+            }
+            if (Net_SaveLateJoinSnapshot() == 0)
+            {
+                int seatMask = 0;
+                for (int i = 0; i < MAXPLAYERS && i < 16; i++)
+                    if (g_player[i].connected)
+                        seatMask |= (1 << i);
+                seatMask |= ((int)g_netMoveEpoch) << 16;
+                s_joinFlowClock = now;
+                s_joinFlowBase  = movefifoplc;
+                s_slaveAck[k]   = movefifoplc;
+                netmenu_send_snapshot_to(seatMask, k, movefifoplc, 1);
+                initprintf("net: join retry %d for slot %d (snapshot at tic %d)\n",
+                           s_joinFlowTries, k, movefifoplc);
+            }
+        }
+        return;
+    }
+
+    if (!g_netLateJoinMask)
+        return;
+
+    int k = -1;
+    for (int i = 0; i < MAXPLAYERS; i++)
+        if (g_netLateJoinMask & (1 << i)) { k = i; break; }
+    g_netLateJoinMask &= ~(1 << k);
+    if (g_player[k].connected)
+        return;   // stale queue entry
+
+    if (Net_SaveLateJoinSnapshot() != 0)
+    {
+        initprintf("net: join snapshot save FAILED for slot %d\n", k);
+        return;
+    }
+    int seatMask = 0;
+    for (int i = 0; i < MAXPLAYERS && i < 16; i++)
+        if (g_player[i].connected)
+            seatMask |= (1 << i);
+    // The joiner adopts the CURRENT epoch: no bump, veterans entirely untouched.
+    seatMask |= ((int)g_netMoveEpoch) << 16;
+
+    s_joinFlowSlot  = k;
+    s_joinFlowClock = now;
+    s_joinFlowTries = 0;
+    s_joinTic[k]    = -1;
+    s_joinFlowBase  = movefifoplc;
+    s_slaveAck[k]   = movefifoplc;           // stream base = snapshot tic
+    g_player[k].movefifoend = 0;             // no records until the seat
+    netmenu_send_snapshot_to(seatMask, k, movefifoplc, 1);
+    initprintf("net: barrier-free join started for slot %d (snapshot at tic %d)\n", k, movefifoplc);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('[eng] joinFlow start p=' + $0 + ' plc=' + $1); }, k, movefifoplc);
+#endif
+}
+
+#endif  // transport track
 
 void Net_PeerEvent(int peerToken, int eventType)
 {
@@ -1919,6 +2349,34 @@ void Net_PeerEvent(int peerToken, int eventType)
         g_netHostGone = 1; // guest lost its host -> menus.cpp consumer exits to the main menu
 
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // A joiner died before it was seated (still queued, or mid-flow). Before
+    // the seat is stamped, nobody's world knows the player: cancel silently.
+    // After the stamp, every sim WILL seat the ghost at the joinTic (the
+    // announcement is already in flight and must stay deterministic) -- queue
+    // the peer-down so the fold drops it right after it seats.
+    if (eventType == NET_PEER_DOWN && myconnectindex == connecthead
+        && !g_player[peerToken].connected
+        && ((g_netLateJoinMask & (1 << peerToken)) || peerToken == s_joinFlowSlot))
+    {
+        g_netLateJoinMask &= ~(1 << peerToken);
+        if (peerToken == s_joinFlowSlot)
+        {
+            if (s_joinTic[peerToken] < 0)
+            {
+                initprintf("net: joiner %d left mid-catchup; join cancelled\n", peerToken);
+                s_joinFlowSlot = -1;
+            }
+            else
+            {
+                s_peerDownMask |= (1 << peerToken);
+                initprintf("net: joiner %d left after seat stamp; drop queued behind the seat\n", peerToken);
+            }
+        }
+        else
+            initprintf("net: queued joiner %d left before its flow started\n", peerToken);
+        return;
+    }
+
     // Mid-game SLAVE loss on the MASTER: never resize the session here -- this
     // runs inside net_poll, possibly mid-simulation, and each peer would apply
     // it at a different tic. Record it; Net_CheckPeerHealth folds it into a
@@ -1951,6 +2409,13 @@ void Net_SetLocalIndex(int slot)
     // the advance to the lobby. The joiner ends up staring at the background
     // wallpaper while fully joined on the wire.
     int const prev = myconnectindex;
+    // Slots >= 2 have no ps allocated on a fresh boot: without this, the gm
+    // carry below SILENTLY skipped and every later
+    // g_player[myconnectindex].ps->gm deref read the null page -- the
+    // M_DisplayMenus NETMENU consumers (snapshot apply included) ran on
+    // garbage mode bits and a mid-game joiner's apply starved for minutes
+    // (soak-caught in the 3-player latejoin run).
+    G_MaybeAllocPlayer(slot);
     myconnectindex = screenpeek = slot;
     g_player[slot].connected    = 1;
     if (slot != prev && g_player[slot].ps != NULL && g_player[prev].ps != NULL
@@ -2399,9 +2864,11 @@ void Net_ClearFIFO(void)
 #endif
 
     memset(&syncData, 0, sizeof(syncData));
-    memset(&syncError, 0, sizeof(syncError));
-    memset(&g_szfirstSyncMsg, 0, sizeof(g_szfirstSyncMsg));
-    g_foundSyncError = false;
+    Net_ResetSyncCheck();   // verdict, per-cat flags, and the compared-tic ring
+    {
+        extern int32_t g_worldExecs;   // epoch-relative world-step count (sync cat 20)
+        g_worldExecs = 0;
+    }
 
     bufferjitter = 1;
     mymaxlag = otherminlag = 0;
@@ -2668,6 +3135,15 @@ void Net_WaitForPlayers()
 
     if (numplayers < 2)
         return;
+
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // Barrier-free joiner: G_LoadPlayer's load path reaches this barrier via
+    // Net_WaitForServer, but there IS no rendezvous -- the match is running and
+    // the catchup stream carries us to it. (A ClearFIFO here would also wipe
+    // the absolute-timeline cursors the apply just primed.)
+    if (g_netJoinCatchup)
+        return;
+#endif
 
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
     // A drop pending at a barrier crossing can no longer excise in-band (the
