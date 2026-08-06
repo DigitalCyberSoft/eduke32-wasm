@@ -3085,8 +3085,21 @@ void P_UpdateAngles(int const playerNum, input_t &input)
 
         if (!(movementLocked & IL_NOHORIZ))
         {
-            float horizAngle  = atan2f(pPlayer->q16horiz - F16(100), F16(128)) * (512.f / fPI) + fix16_to_float(input.q16horz);
-            pPlayer->q16horiz = F16(100) + Blrintf(F16(128) * tanf(horizAngle * (fPI / 512.f)));
+#ifdef NETDUKE32
+            // MP: this runs against the PREDICTED copy -- it must use the SAME
+            // math as the authoritative tic path (linear + clamp) or the two
+            // models structurally disagree on every mouselook tic (tangent
+            // space vs linear) and the per-tic correction visibly fights the
+            // view. SP keeps mainline's tangent-space feel.
+            if (numplayers > 1)
+                pPlayer->q16horiz = fix16_clamp(fix16_sadd(pPlayer->q16horiz, input.q16horz),
+                                                F16(HORIZ_MIN), F16(HORIZ_MAX));
+            else
+#endif
+            {
+                float horizAngle  = atan2f(pPlayer->q16horiz - F16(100), F16(128)) * (512.f / fPI) + fix16_to_float(input.q16horz);
+                pPlayer->q16horiz = F16(100) + Blrintf(F16(128) * tanf(horizAngle * (fPI / 512.f)));
+            }
         }
     }
 
@@ -5658,14 +5671,48 @@ void P_ProcessInput(int playerNum)
     // angle: shots hit on the shooter's screen and missed on the victim's
     // (live-reported: "only registering a kill on the client that makes the
     // kill"). Invisible to the sync CRC until its table was initialized.
+    //
+    // The lock gate here must read SIM-PURE state only. P_CheckLockedMovement
+    // mixes in g_player[].horizRecenter -- set by the sim on EVERY peer
+    // (look keys) but cleared only by the OWNER's frame path: after anyone's
+    // first look key, remote sims locked that player's horiz FOREVER while
+    // the owner's applied it -- q16horiz forked on every mouselook tic
+    // (live-reported: "sync issues when turning"). Locks below are ps sim
+    // fields only, identical on every machine.
     if (numplayers > 1)
     {
-        int const angleLocks = P_CheckLockedMovement(playerNum);
+        int angleLocks = 0;
+        if (sprite[pPlayer->i].extra <= 0 || (pPlayer->dead_flag && !ud.god) || pPlayer->fist_incs
+            || pPlayer->transporter_hold > 2 || (pPlayer->hard_landing && !FURY) || pPlayer->access_incs > 0
+            || pPlayer->knee_incs > 0
+            || (PWEAPON(playerNum, pPlayer->curr_weapon, WorksLike) == TRIPBOMB_WEAPON && pPlayer->kickback_pic > 1
+                && pPlayer->kickback_pic < PWEAPON(playerNum, pPlayer->curr_weapon, FireDelay)))
+            angleLocks = IL_NOANGLE | IL_NOHORIZ;
+        else if (pPlayer->on_crane >= 0)
+            angleLocks = IL_NOANGLE;
+        else if (pPlayer->newowner != -1)
+            angleLocks = IL_NOANGLE | IL_NOHORIZ;
+
         if (!(angleLocks & IL_NOANGLE))
             pPlayer->q16ang = fix16_sadd(pPlayer->q16ang, pInput.q16avel) & 0x7FFFFFF;
         if (!(angleLocks & IL_NOHORIZ))
             pPlayer->q16horiz = fix16_clamp(fix16_sadd(pPlayer->q16horiz, pInput.q16horz),
                                             F16(HORIZ_MIN), F16(HORIZ_MAX));
+
+        // Classic sim-side view recentering (GAME.C: horiz += 33-(horiz/3)
+        // while return_to_center counts down). Mainline animates this in the
+        // frame path -- which in MP only ever touches the PREDICTED copy, so
+        // the authoritative horiz stayed tilted after every hard landing /
+        // center-view and the prediction correction visibly fought the view.
+        // return_to_center is set and decremented in the sim on every peer,
+        // so this drift is deterministic.
+        if (pPlayer->return_to_center > 0)
+        {
+            pPlayer->q16horiz = fix16_sadd(pPlayer->q16horiz,
+                fix16_ssub(F16(33), fix16_sdiv(pPlayer->q16horiz, F16(3))));
+            if (pPlayer->q16horiz >= F16(99) && pPlayer->q16horiz <= F16(101))
+                pPlayer->q16horiz = F16(100);
+        }
     }
 #endif
 
