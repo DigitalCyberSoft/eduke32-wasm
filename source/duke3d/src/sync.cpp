@@ -124,18 +124,21 @@ static char Sync_PlayerPos(void)
 {
     unsigned short crc = 0;
 
+    // DESIGN (user): the direction a player is FACING is not part of desync
+    // detection -- q16ang/q16horiz/sprite ang are still simulation state
+    // (applied from inputs identically everywhere, and soft corrections
+    // align them), but drift there must never latch a verdict. Divergence
+    // that matters shows up in what facing CAUSES: positions, RNG draws,
+    // damage -- all still hashed.
     for (int32_t ALL_PLAYERS(i))
     {
         auto pp = g_player[i].ps;
         updatecrc(crc, pp->pos.x);
         updatecrc(crc, pp->pos.y);
         updatecrc(crc, pp->pos.z);
-        updatecrc(crc, pp->q16ang);
-        updatecrc(crc, pp->q16horiz);
         updatecrc(crc, sprite[pp->i].x);
         updatecrc(crc, sprite[pp->i].y);
         updatecrc(crc, sprite[pp->i].z);
-        updatecrc(crc, sprite[pp->i].ang);
     }
 
     return ((char) crc & 255);
@@ -341,11 +344,13 @@ static char Sync_DbgHoriz(void)
 static char Sync_DbgSprite(void)
 {
     unsigned short crc = 0;
+    // Player sprite ang deliberately excluded: facing is not a desync (see
+    // Sync_PlayerPos).
     for (int32_t ALL_PLAYERS(i))
     {
         auto pp = g_player[i].ps;
         updatecrc(crc, sprite[pp->i].x); updatecrc(crc, sprite[pp->i].y);
-        updatecrc(crc, sprite[pp->i].z); updatecrc(crc, sprite[pp->i].ang);
+        updatecrc(crc, sprite[pp->i].z);
     }
     return ((char)crc & 255);
 }
@@ -804,7 +809,10 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
         if (player_sync != head_sync)
         {
             // Cats 0-15 are GAMEPLAY truth (world/players/inputs/spawns/gates)
-            // and feed the verdict. Cats 16-20 are FORENSIC deep-hashes -- they
+            // and feed the verdict -- EXCEPT 8/9 (player q16ang/q16horiz):
+            // facing direction is not a desync (user directive); they log
+            // under forensics for hunts but never latch. Cats 16-20 are
+            // FORENSIC deep-hashes -- they
             // sweep state no gameplay path reads (all-statnum positions include
             // decoration/limbo sprites; krand counts; cumulative counters) and
             // exist to NAME a fork for the hunt, not to prove one matters. A
@@ -814,7 +822,7 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
             // gameplay cats stay clean for minutes). Latching on it produced a
             // 7s reload cure, in a loop, for a cosmetic hiccup. If the laggard
             // ever touches gameplay, cats 1-6/13/14 flag and the heal fires.
-            if (sb <= 15)
+            if (sb <= 15 && sb != 8 && sb != 9)
                 tickMask |= ((uint32_t)1 << sb);
 
 #if defined(__EMSCRIPTEN__)

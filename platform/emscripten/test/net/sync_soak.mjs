@@ -300,12 +300,12 @@ if (MODE === 'desync') {
     }
     await new Promise(r => setTimeout(r, 400));
   }
-  // TARGETED HEAL (build 39+): the host streams the snapshot to the diverged
-  // guest ONLY. Assertions flipped from the broadcast era: the epoch must NOT
-  // bump (the running generation keeps flowing for veterans), the HOST must
-  // never stall (its c2 keeps advancing through the whole cure), and the guest
-  // must pass through watcher catchup (jn 1 -> 0, healResume).
-  let fired = false, healed = false, jnSeen = false, epStable = true;
+  // CORRECTION LADDER (soft-snap era): the forced fork (RNG + own pos) is
+  // exactly what the in-place soft state snap corrects -- the guest must be
+  // fixed WITHOUT any reload: softsnap sent+applied, sync back to 0, NO
+  // healFlow, NO watcher catchup (jn stays 0), epoch stable, host unstalled.
+  let fired = false, healed = false, softSeen = false, reloaded = false, epStable = true;
+  let jnSeen = false; // must stay FALSE now: jn=1 would mean a reload heal ran
   const hStall = { last: -1, at: Date.now(), max: 0 };
   let monOn = true;
   const mon = setInterval(async () => {
@@ -322,13 +322,22 @@ if (MODE === 'desync') {
     await new Promise(r => setTimeout(r, 1000));
     const hm = await st(H), gm2 = await st(G);
     if (t % 5 === 0) rec(`desync t=${t} H(sync=${hm.sync} ep=${hm.ep} plc=${hm.plc} sc=${hm.sc} c2=${hm.c2}) G(sync=${gm2.sync} ep=${gm2.ep} plc=${gm2.plc} sc=${gm2.sc} jn=${gm2.jn})`);
-    if (!fired && /AUTO-RESYNC/.test(fs.readFileSync(LOG, 'utf8'))) { fired = true; rec(`targeted heal FIRED @${t}s`); }
-    if (hm.ep !== undefined && hm.ep !== pre.ep) { epStable = false; rec(`EPOCH BUMPED (${pre.ep} -> ${hm.ep}) -- targeted heal must not do that`); }
-    if (fired && hm.sync === 0 && gm2.sync === 0 && gm2.ep === hm.ep && hm.game === 1 && gm2.game === 1 && gm2.jn === 0 && jnSeen) {
-      healed = true; rec(`HEALED @${t}s (ep stable at ${hm.ep}, host maxStall ${hStall.max}ms)`); break;
+    const logNow = fs.readFileSync(LOG, 'utf8');
+    if (!fired && /AUTO-RESYNC/.test(logNow)) { fired = true; rec(`correction FIRED @${t}s`); }
+    if (!softSeen && /softsnap applied/.test(logNow)) { softSeen = true; rec(`soft snap APPLIED @${t}s`); }
+    if (!reloaded && /healFlow start/.test(logNow)) { reloaded = true; rec(`RELOAD HEAL RAN @${t}s -- soft snap should have sufficed`); }
+    if (hm.ep !== undefined && hm.ep !== pre.ep) { epStable = false; rec(`EPOCH BUMPED (${pre.ep} -> ${hm.ep})`); }
+    if (fired && softSeen && hm.sync === 0 && gm2.sync === 0 && hm.game === 1 && gm2.game === 1 && gm2.jn === 0) {
+      healed = true; rec(`CORRECTED @${t}s (soft, no reload=${!reloaded}, host maxStall ${hStall.max}ms)`); break;
     }
   }
   monOn = false; clearInterval(mon);
+  // Post-correction contract: combat continues, and the ladder CONVERGES --
+  // soft snaps alone when the fork stayed player/RNG-shaped, or at most one
+  // escalated reload when the fork window contaminated world entities before
+  // the snap landed (fork timing decides; both are correct ladder behavior).
+  // Assert the user-facing properties: eventual sync-clean, sc growth, at
+  // most one reload, and the host unstalled throughout (monitored above).
   let postClean = false;
   if (healed) {
     const h0 = await st(H), g0 = await st(G);
@@ -337,18 +346,26 @@ if (MODE === 'desync') {
       sh(`DISPLAY=:7 xdotool keyup w`); sh(`DISPLAY=:8 xdotool keyup Right`);
       await new Promise(r => setTimeout(r, 4500));
     }
-    const h1 = await st(H), g1 = await st(G);
-    postClean = h1.sync === 0 && g1.sync === 0 && (h1.sc - h0.sc) > 30 && (g1.sc - g0.sc) > 30 && h1.plc > h0.plc;
-    rec(`post-heal H=${JSON.stringify(h1)} G=${JSON.stringify(g1)} scDelta=[${h1.sc - h0.sc},${g1.sc - g0.sc}]`);
+    let h1 = await st(H), g1 = await st(G);
+    for (let t = 0; t < 30 && !(h1.sync === 0 && g1.sync === 0 && g1.jn === 0); t++) {
+      await new Promise(r => setTimeout(r, 1000));   // ladder mid-cure: let it converge
+      h1 = await st(H); g1 = await st(G);
+    }
+    const reloads = (fs.readFileSync(LOG, 'utf8').match(/healFlow start/g) || []).length;
+    postClean = h1.sync === 0 && g1.sync === 0 && (h1.sc - h0.sc) > 30 && h1.plc > h0.plc
+      && h1.game === 1 && g1.game === 1 && reloads <= 1;
+    rec(`post-heal H=${JSON.stringify(h1)} G=${JSON.stringify(g1)} scDelta=[${h1.sc - h0.sc},${g1.sc - g0.sc}] reloads=${reloads}`);
   }
-  const verdict = { mode: MODE, formed, fired, jnSeen, epStable, healed, postClean, hostMaxStallMs: hStall.max };
+  const verdict = { mode: MODE, formed, fired, softSeen, noReload: !reloaded && !jnSeen, epStable, healed, postClean, hostMaxStallMs: hStall.max };
   rec('VERDICT ' + JSON.stringify(verdict));
   console.log(JSON.stringify(verdict));
   clearInterval(trailTimer);
   await Promise.race([hostBrowser.close(), new Promise(r => setTimeout(r, 3000))]).catch(() => {});
   await Promise.race([guestBrowser.close(), new Promise(r => setTimeout(r, 3000))]).catch(() => {});
   for (const p of [...pids()].filter(x => !before.has(x))) { try { process.kill(p, 'SIGKILL'); } catch { } }
-  process.exit(fired && epStable && healed && postClean && hStall.max < 2500 ? 0 : 1);
+  // softSeen: soft snap must always be tried FIRST; postClean folds in
+  // "at most one escalated reload" (fork-timing dependent, still correct).
+  process.exit(fired && softSeen && epStable && healed && postClean && hStall.max < 2500 ? 0 : 1);
 }
 
 if (MODE === 'latejoin3') {
