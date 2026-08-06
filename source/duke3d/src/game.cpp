@@ -1378,6 +1378,19 @@ int32_t A_InsertSprite(int16_t whatsect,int32_t s_x,int32_t s_y,int32_t s_z,int1
     g_spriteStat.numins++;
 #endif
 
+#ifdef NETDUKE32
+    // DEBUG (residual-fork hunt): per-tic spawn accounting, CRC'd across peers
+    // (sync.cpp cat 13/14). The picnum ring names the diverging spawner.
+    if (numplayers > 1 && !oldnet_predicting)
+    {
+        extern int32_t g_dbgInsCount; extern int16_t g_dbgInsRing[32], g_dbgInsOwnRing[32]; extern int32_t g_dbgInsRingN;
+        g_dbgInsCount++;
+        g_dbgInsRing[g_dbgInsRingN & 31] = s_pn;
+        g_dbgInsOwnRing[g_dbgInsRingN & 31] = (s_ow < 0 || (unsigned)s_ow >= MAXSPRITES) ? -1 : sprite[s_ow].picnum;
+        g_dbgInsRingN++;
+    }
+#endif
+
     sprite[newSprite] = { s_x, s_y, s_z, 0, s_pn, s_s, 0, 0, 0, s_xr, s_yr, 0, 0, whatsect, s_ss, s_a, s_ow, s_ve, 0, s_zv, 0, 0, 0 };
 
     auto &a = actor[newSprite];

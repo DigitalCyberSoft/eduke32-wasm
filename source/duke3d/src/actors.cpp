@@ -815,6 +815,15 @@ void A_DeleteSprite(int spriteNum)
         return;
     }
 
+#ifdef NETDUKE32
+    // DEBUG (residual-fork hunt): per-tic delete accounting (sync.cpp cat 13).
+    if (numplayers > 1 && !oldnet_predicting)
+    {
+        extern int32_t g_dbgDelCount;
+        g_dbgDelCount++;
+    }
+#endif
+
     if (VM_HaveEvent(EVENT_KILLIT))
     {
         int32_t playerDist;

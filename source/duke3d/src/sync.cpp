@@ -322,6 +322,31 @@ static char Sync_DbgInputHash(int plr)
 static char Sync_DbgInp0(void) { return Sync_DbgInputHash(0); }
 static char Sync_DbgInp1(void) { return Sync_DbgInputHash(1); }
 
+// Per-tic sprite spawn/delete accounting (fed from A_InsertSprite /
+// A_DeleteSprite; reset after each stamp). Numsprites diverges IN-TIC at the
+// residual root fork, so the tic where these counts differ -- and the picnum
+// ring dumped at the mismatch -- names the one-peer-only spawner directly.
+int32_t g_dbgInsCount, g_dbgDelCount;
+int16_t g_dbgInsRing[32], g_dbgInsOwnRing[32];
+int32_t g_dbgInsRingN;
+// [tic & mask][0]=insert count (capped 6), [1]=delete count, [2..7]=picnums,
+// [8..13]=spawner (owner) picnums
+static int16_t g_dbgSpawnHist[MOVEFIFOSIZ][14];
+static char Sync_DbgSpawnCount(void)
+{
+    unsigned short crc = 0;
+    updatecrc(crc, g_dbgInsCount); updatecrc(crc, g_dbgDelCount);
+    return ((char)crc & 255);
+}
+static char Sync_DbgSpawnPicnums(void)
+{
+    unsigned short crc = 0;
+    int const n = min(g_dbgInsRingN, 32);
+    for (int k = 0; k < n; k++)
+    { updatecrc(crc, g_dbgInsRing[k]); updatecrc(crc, (g_dbgInsRing[k] >> 8)); }
+    return ((char)crc & 255);
+}
+
 // This must not exceed MAX_SYNC_TYPES
 static SyncType_t syncType[] = {
     DEFINE_SYNCFUNC(Sync_Engine),
@@ -337,6 +362,8 @@ static SyncType_t syncType[] = {
     DEFINE_SYNCFUNC(Sync_DbgSprite),  // 10
     DEFINE_SYNCFUNC(Sync_DbgInp0),    // 11  consumed input, player 0
     DEFINE_SYNCFUNC(Sync_DbgInp1),    // 12  consumed input, player 1
+    DEFINE_SYNCFUNC(Sync_DbgSpawnCount),   // 13  per-tic insert/delete counts
+    DEFINE_SYNCFUNC(Sync_DbgSpawnPicnums), // 14  per-tic inserted picnums
 #if 0
     DEFINE_SYNCFUNC(Sync_GameSettings),
 #endif
@@ -367,6 +394,22 @@ void Net_GetSyncStat(void)
 
     for (int32_t i = 0; i < NUM_SYNC_TYPES; i++)
         syncData[INPUTFIFO_CURTICK][i] = syncType[i].func();
+
+    // spawn accounting window = one consumed tic (stamped above). Keep a
+    // per-tic history so the mismatch handler (which runs when the compare
+    // packet arrives, tics later) can still dump the FORK tic's picnums.
+    {
+        int32_t const slot = INPUTFIFO_CURTICK;
+        g_dbgSpawnHist[slot][0] = (int16_t)min(g_dbgInsRingN, 6);
+        g_dbgSpawnHist[slot][1] = (int16_t)g_dbgDelCount;
+        for (int k = 0; k < 6; k++)
+        {
+            g_dbgSpawnHist[slot][2 + k] = (k < g_dbgInsRingN && k < 32) ? g_dbgInsRing[k] : -1;
+            g_dbgSpawnHist[slot][8 + k] = (k < g_dbgInsRingN && k < 32) ? g_dbgInsOwnRing[k] : -1;
+        }
+    }
+    g_dbgInsCount = g_dbgDelCount = 0;
+    g_dbgInsRingN = 0;
 
 #if defined(__EMSCRIPTEN__)
     // DEBUG (desync validation): prove the ring is being FILLED, with what, at
@@ -540,6 +583,14 @@ void Net_GetSyncInfoFromPacket(char *packbuf, int *j, int otherconnectindex)
                                    tickNum - 1, plr, in->fvel, in->svel, (int)in->q16avel, (int)in->q16horz,
                                    (int)in->bits, (int)in->extbits);
                         }
+                    // Spawn-count/picnum mismatch: dump the FORK tic's local
+                    // spawn history -- the picnums name the one-peer spawner.
+                    if (sb == 13 || sb == 14)
+                    {
+                        int16_t const *h = g_dbgSpawnHist[tickNum & (MOVEFIFOSIZ - 1)];
+                        EM_ASM({ console.log('[eng] SPAWNDUMP tic=' + $0 + ' ins=' + $1 + ' del=' + $2 + ' pics=[' + $3 + ',' + $4 + ',' + $5 + '] by=[' + $6 + ',' + $7 + ',' + $8 + ']'); },
+                               tickNum, h[0], h[1], h[2], h[3], h[4], h[8], h[9], h[10]);
+                    }
                 }
             }
 #endif
