@@ -560,7 +560,12 @@ static input_t Bot_GetInput(int k)
         // 90s soak, position spread 220 map units) -- nobody ever roams the
         // map to find the humans.
         s_botWasDead[k]  = 0;
-        s_botSpawnRoam[k] = (int16_t)(40 + (Bot_Rnd() % 60));
+        // No post-spawn dispersal: it was built to stop a pistol-era spawn
+        // bloodbath, but it turned the deterministic bot ballet into bots
+        // orbiting an empty map (measured: ~88 discharges and near-zero body
+        // hits in 8 minutes). Respawns now re-enter the fight -- with the
+        // shotgun loadout, continuous spawn-cluster combat IS the arena.
+        s_botSpawnRoam[k] = 0;
         s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
     }
 
