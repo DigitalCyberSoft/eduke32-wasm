@@ -537,6 +537,7 @@ static int32_t s_botLastTDist[MAXPLAYERS];   // pursuit progress: last distance 
 static int32_t s_botNavX[MAXPLAYERS], s_botNavY[MAXPLAYERS];  // first portal midpoint
 static int8_t  s_botNavOn[MAXPLAYERS];
 static int16_t s_botLastSect[MAXPLAYERS];    // re-plan the route on sector crossings
+static int8_t  s_botTurnPref[MAXPLAYERS];    // wall-following handedness (+1/-1)
 
 // Sector-graph navigation: BFS over wall portals from the bot's sector to the
 // target's, return the FIRST portal's midpoint to steer at. Build maps are a
@@ -738,6 +739,8 @@ static input_t Bot_GetInput(int k)
             s_botNavOn[k] = 1;
         if ((Bot_Rnd() & 3) == 0)
             s_botStrafeDir[k] = (Bot_Rnd() & 1) ? 1 : -1;
+        if (s_botTurnPref[k] == 0 || (Bot_Rnd() & 63) == 0)
+            s_botTurnPref[k] = (Bot_Rnd() & 1) ? 1 : -1;
         s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
     }
 
@@ -774,22 +777,22 @@ static input_t Bot_GetInput(int k)
             }
             else
             {
-                // Door try spent and still stuck: bounce away hard. Repeat
-                // trips escalate -- a fixed-length bounce re-traps in concave
-                // corners, so each consecutive episode turns away longer
-                // before re-homing at the target.
+                // Door try spent and still stuck: WALL-FOLLOW, don't dice-roll.
+                // Random bounce angles re-rolled a fresh direction every trip
+                // and bots milled inside their spawn rooms for entire 5-minute
+                // probes (sector telemetry: 3 of 5 players never changed
+                // sector). Rotating a CONSISTENT 90 degrees per trip rounds
+                // furniture and doorframes like a maze-following bug; jumping
+                // on every trip clears the knee-high blockers (theater seats,
+                // rails) that trip the loop in the first place.
                 s_botOpenGrace[k]  = 0;
                 if (s_botStuckEpisodes[k] < 6)
                     s_botStuckEpisodes[k]++;
-                // While a route is plotted, bounce SHORT and re-plan -- the
-                // escalated 5s random walks were overriding the navigator
-                // (steering priority: bounce > nav) and burying its effect.
-                s_botBounceHold[k] = (int16_t)(20 + (Bot_Rnd() & 31)
-                                     + (s_botNavOn[k] ? 0 : 16 * s_botStuckEpisodes[k]));
+                s_botBounceHold[k] = (int16_t)(s_botNavOn[k] ? 15 + (Bot_Rnd() & 15)
+                                     : 20 + (Bot_Rnd() & 31) + 16 * s_botStuckEpisodes[k]);
+                s_botBounceAng[k]  = (int16_t)((fix16_to_int(ps->q16ang) + s_botTurnPref[k] * 512) & 2047);
+                in.bits |= BIT(SK_JUMP);
                 s_botThinkHold[k]  = 1;   // fresh route right after this bounce
-                s_botBounceAng[k]  = (int16_t)((fix16_to_int(ps->q16ang) + 512 + (int)(Bot_Rnd() & 1023)) & 2047);
-                if (Bot_Rnd() & 1)
-                    in.bits |= BIT(SK_JUMP);    // ...unless it is a ledge
             }
         }
     }
@@ -872,6 +875,8 @@ static input_t Bot_GetInput(int k)
     {
         s_botBounceHold[k]--;
         wantAng = s_botBounceAng[k];
+        if (s_botNavOn[k] && (s_botBounceHold[k] & 7) == 0)
+            in.bits |= BIT(SK_JUMP);    // keep hopping the low blocker we round
     }
     else if (tp != NULL)
     {
