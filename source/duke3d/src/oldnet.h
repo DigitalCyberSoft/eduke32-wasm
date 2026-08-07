@@ -195,6 +195,7 @@ int  Net_StartHealFlow(int k);    // host: begin healing seat k (0 = flow starte
 void Net_CheckHealResume(void);   // healing guest: leave watcher mode at the live edge
 void Net_SendStateSnap(int k);    // host: in-place RNG+player correction to one guest
 int  Net_CorrectDivergence(int k);// host: correction ladder (soft snaps -> snapshot heal)
+void Net_ApplyPendingStateSnap(void); // guest: consume stashed snap at its stamped tic
 
 //OLDNET_EXTERN PredictBackup_t predictBackup[MOVEFIFOSIZ];
 

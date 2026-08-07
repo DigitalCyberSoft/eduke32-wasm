@@ -7411,6 +7411,8 @@ int G_DoMoveThings(void)
     // never advances movefifoplc. Demo playback also stays on the index-0 path:
     // it aborts when numplayers>1 (demo.cpp) and feeds inputfifo[0][j], so this
     // reads exactly what it wrote and leaves movefifoplc untouched -- no desync.
+    if (numplayers > 1)
+        Net_ApplyPendingStateSnap();  // tic-aligned soft snap (oldnet.cpp)
     for (bssize_t TRAVERSE_CONNECT(i))
         Bmemcpy(&g_player[i].input, &inputfifo[numplayers > 1 ? (movefifoplc & (MOVEFIFOSIZ - 1)) : 0][i], sizeof(input_t));
     if (numplayers > 1)

@@ -484,6 +484,10 @@ static int      s_healAckFence;      // host: 1 = post-apply acks are flowing
 // Soft-correction ladder bookkeeping (machinery lives further down).
 static int32_t  s_softStrikes[MAXPLAYERS];
 static int32_t  s_softStrikeClock[MAXPLAYERS];
+// Tic-stamped soft snap awaiting its consume tic (guest side).
+static char     s_pendingSnap[600];  // [type][count][tic i32][seed i32][grand i32] + 8*69B
+static int      s_pendingSnapLen;
+static int32_t  s_pendingSnapTic;
 
 static struct JoinTicInit { JoinTicInit() { for (auto &t : s_joinTic) t = -1; } } s_joinTicInit;
 
@@ -508,6 +512,8 @@ static void Net_ResetProtocolState(void)
     s_healAckFence   = 0;
     for (int i = 0; i < MAXPLAYERS; i++)
         s_softStrikes[i] = s_softStrikeClock[i] = 0;
+    s_pendingSnapLen = 0;
+    s_pendingSnapTic = -1;
     for (int i = 0; i < MAXPLAYERS; i++)
     {
         s_slaveAck[i] = s_lastSendClock[i] = 0;
@@ -1561,63 +1567,32 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
             }
             case PACKET_TYPE_STATE_SNAP:
             {
-                // Host pushed an in-place correction: adopt RNG + player state
-                // without touching the level. Watchers skip it (their pending
-                // snapshot supersedes anything corrected here).
+                // Host pushed an in-place correction. TIC-STAMPED: stash it and
+                // apply at EXACTLY the stamped consume count (see
+                // Net_ApplyPendingStateSnap, run at the top of every consumed
+                // tic). Applied at any other tic, the correction itself installs
+                // tics of position/RNG offset -- the ladder then re-latches off
+                // its own snap and the guest "teleports" every few seconds.
+                // Watchers skip: their pending snapshot supersedes this.
                 if (myconnectindex == connecthead || other != connecthead || g_netJoinCatchup)
                     break;
-                int jj = 1;
-                int const cnt = (uint8_t)packbuf[jj++];
-                randomseed     = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                g_globalRandom = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                for (int e = 0; e < cnt; e++)
+                int32_t const snapTic = (int32_t)B_UNBUF32(&packbuf[2]);
+                int const cnt = (uint8_t)packbuf[1];
+                int const len = 14 + cnt * 69;
+                if (snapTic < movefifoplc || len > (int)sizeof(s_pendingSnap))
                 {
-                    int const slot = (uint8_t)packbuf[jj++];
-                    if ((unsigned)slot >= MAXPLAYERS || g_player[slot].ps == NULL)
-                        { jj += 68; continue; }
-                    auto const ps = g_player[slot].ps;
-                    ps->pos.x  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    ps->pos.y  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    ps->pos.z  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    ps->opos.x = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    ps->opos.y = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    ps->opos.z = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    ps->bobpos.x = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    ps->bobpos.y = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    ps->vel.x  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    ps->vel.y  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    ps->vel.z  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    // OWN facing is client-authoritative ("relax lockstep on
-                    // direction"): adopting the host's lagged copy of MY angle
-                    // yanks the view on every heal. Remote players' facing is
-                    // adopted normally (their sprites should face host-truth).
-                    if (slot != myconnectindex)
-                    {
-                        ps->q16ang   = ps->oq16ang   = (fix16_t)B_UNBUF32(&packbuf[jj]);
-                        ps->q16horiz = ps->oq16horiz = (fix16_t)B_UNBUF32(&packbuf[jj + 4]);
-                    }
-                    jj += 8;
-                    vec3_t sp;
-                    sp.x = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    sp.y = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    sp.z = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    int16_t const sprExtra = (int16_t)B_UNBUF16(&packbuf[jj]); jj += 2;
-                    int16_t const cursect  = (int16_t)B_UNBUF16(&packbuf[jj]); jj += 2;
-                    if ((unsigned)ps->i < MAXSPRITES)
-                    {
-                        setsprite(ps->i, &sp);
-                        sprite[ps->i].extra = sprExtra;
-                        actor[ps->i].bpos   = sp;
-                    }
-                    if ((unsigned)cursect < (unsigned)numsectors)
-                        ps->cursectnum = cursect;
-                }
-                Net_InitializePrediction();   // fresh prediction base off corrected state
-                Net_ResetSyncCheck();         // stale verdicts described the pre-snap world
 #ifdef __EMSCRIPTEN__
-                EM_ASM({ console.log('[eng] softsnap applied (' + $0 + ' players)'); }, cnt);
-#else
-                initprintf("net: soft state snap applied (%d players)\n", cnt);
+                    EM_ASM({ console.log('[eng] softsnap DROPPED (tic=' + $0 + ' plc=' + $1 + ' len=' + $2 + ')'); },
+                           snapTic, movefifoplc, len);
+#endif
+                    break;   // stale on arrival (we consumed past it) or malformed
+                }
+                Bmemcpy(s_pendingSnap, packbuf, len);
+                s_pendingSnapLen = len;
+                s_pendingSnapTic = snapTic;
+#ifdef __EMSCRIPTEN__
+                EM_ASM({ console.log('[eng] softsnap stashed for tic ' + $0 + ' (plc=' + $1 + ')'); },
+                       snapTic, movefifoplc);
 #endif
                 break;
             }
@@ -2191,17 +2166,6 @@ int Net_ApplyLateJoinSnapshot(void)
     Bstrcpy(sv.path, LATEJOIN_SAVE);
     sv.isExt = 0;
 
-    // Healing guest: OWN facing is client-authoritative -- carry it across the
-    // authoritative reload (the world resets around us; the view must not yank).
-    fix16_t healAng = 0, healOAng = 0, healHoriz = 0, healOHoriz = 0;
-    if (healMode && g_player[myIdx].ps != NULL)
-    {
-        healAng    = g_player[myIdx].ps->q16ang;
-        healOAng   = g_player[myIdx].ps->oq16ang;
-        healHoriz  = g_player[myIdx].ps->q16horiz;
-        healOHoriz = g_player[myIdx].ps->oq16horiz;
-    }
-
     int const r = G_LoadPlayer(sv);
 
     // The snapshot carries the HOST's view of every per-player struct; OUR identity
@@ -2241,16 +2205,7 @@ int Net_ApplyLateJoinSnapshot(void)
             g_player[myIdx].ps->gm = MODE_GAME;
         }
         else
-        {
             s_healBasePlc = s_snapshotPlc;   // arms the self-resume check
-            if (g_player[myIdx].ps != NULL)
-            {
-                g_player[myIdx].ps->q16ang    = healAng;
-                g_player[myIdx].ps->oq16ang   = healOAng;
-                g_player[myIdx].ps->q16horiz  = healHoriz;
-                g_player[myIdx].ps->oq16horiz = healOHoriz;
-            }
-        }
         ready2send = 1;                 // pump ON: the catchup acks must flow
     }
     else if (joinMode)
@@ -2531,6 +2486,11 @@ void Net_SendStateSnap(int k)
     int j = 0;
     packbuf[j++] = PACKET_TYPE_STATE_SNAP;
     int const countPos = j++;
+    // TIC STAMP: state captured with movefifoplc tics consumed. The receiver
+    // applies at EXACTLY this consume count -- applied at any other tic, the
+    // "correction" itself installs tics of position/RNG offset and the ladder
+    // re-triggers forever (the guest teleports every few seconds).
+    B_BUF32(&packbuf[j], movefifoplc);    j += 4;
     B_BUF32(&packbuf[j], randomseed);     j += 4;
     B_BUF32(&packbuf[j], g_globalRandom); j += 4;
 
@@ -2563,9 +2523,86 @@ void Net_SendStateSnap(int k)
     }
     packbuf[countPos] = (char)n;
     oldnet_sendpacket(k, (unsigned char *)packbuf, j);
-    initprintf("net: soft state snap -> slot %d (%d players, %d bytes)\n", k, n, j);
+    initprintf("net: soft state snap -> slot %d (%d players, %d bytes, tic %d)\n", k, n, j, movefifoplc);
 #ifdef __EMSCRIPTEN__
-    EM_ASM({ console.log('[eng] softsnap sent p=' + $0 + ' bytes=' + $1); }, k, j);
+    EM_ASM({ console.log('[eng] softsnap sent p=' + $0 + ' bytes=' + $1 + ' tic=' + $2); }, k, j, movefifoplc);
+#endif
+}
+
+// Consume a stashed tic-stamped soft snap. Called at the top of EVERY consumed
+// tic (G_DoMoveThings, before the input read): when our consume count equals
+// the stamp, both sims have executed exactly the same tics, so the host's
+// captured state is bit-appropriate NOW -- positions, velocities and RNG land
+// with zero offset and the sims evolve identically from here.
+void Net_ApplyPendingStateSnap(void)
+{
+    if (s_pendingSnapLen == 0 || numplayers < 2)
+        return;
+    if (movefifoplc < s_pendingSnapTic)
+        return;                                  // not at the stamp yet
+    s_pendingSnapLen = 0;
+    if (movefifoplc > s_pendingSnapTic)
+    {
+        // Overshot: shouldn't happen (this runs every tic) -- drop; the ladder
+        // re-sends if the divergence persists.
+#ifdef __EMSCRIPTEN__
+        EM_ASM({ console.log('[eng] softsnap OVERSHOT (tic=' + $0 + ' plc=' + $1 + ')'); },
+               s_pendingSnapTic, movefifoplc);
+#endif
+        return;
+    }
+    char *buf = s_pendingSnap;
+    int jj = 1;
+    int const cnt = (uint8_t)buf[jj++];
+    jj += 4;                                     // tic stamp (already matched)
+    randomseed     = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+    g_globalRandom = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+    for (int e = 0; e < cnt; e++)
+    {
+        int const slot = (uint8_t)buf[jj++];
+        if ((unsigned)slot >= MAXPLAYERS || g_player[slot].ps == NULL)
+            { jj += 68; continue; }
+        auto const ps = g_player[slot].ps;
+        ps->pos.x  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        ps->pos.y  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        ps->pos.z  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        ps->opos.x = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        ps->opos.y = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        ps->opos.z = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        ps->bobpos.x = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        ps->bobpos.y = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        ps->vel.x  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        ps->vel.y  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        ps->vel.z  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        // SIM facing re-anchors to host-truth for EVERYONE, self included: a
+        // forked own-angle means my shots hit on my sim but miss on the host's
+        // -- kills then only propagate via the ladder ("dead sync lags").
+        // The VIEW stays frame-owned (see net_predict.cpp) -- at worst this is
+        // a one-time small view adjustment when a real fork gets corrected.
+        ps->q16ang   = ps->oq16ang   = (fix16_t)B_UNBUF32(&buf[jj]); jj += 4;
+        ps->q16horiz = ps->oq16horiz = (fix16_t)B_UNBUF32(&buf[jj]); jj += 4;
+        vec3_t sp;
+        sp.x = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        sp.y = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        sp.z = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        int16_t const sprExtra = (int16_t)B_UNBUF16(&buf[jj]); jj += 2;
+        int16_t const cursect  = (int16_t)B_UNBUF16(&buf[jj]); jj += 2;
+        if ((unsigned)ps->i < MAXSPRITES)
+        {
+            setsprite(ps->i, &sp);
+            sprite[ps->i].extra = sprExtra;
+            actor[ps->i].bpos   = sp;
+        }
+        if ((unsigned)cursect < (unsigned)numsectors)
+            ps->cursectnum = cursect;
+    }
+    Net_InitializePrediction();   // fresh prediction base off corrected state
+    Net_ResetSyncCheck();         // stale verdicts described the pre-snap world
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('[eng] softsnap applied ALIGNED at tic ' + $0 + ' (' + $1 + ' players)'); },
+           movefifoplc, cnt);
+#else
+    initprintf("net: soft state snap applied at tic %d (%d players)\n", movefifoplc, cnt);
 #endif
 }
 
