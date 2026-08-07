@@ -532,6 +532,8 @@ static int8_t  s_botWasDead[MAXPLAYERS];
 static int16_t s_botSpawnRoam[MAXPLAYERS];   // post-respawn target-blind roam
 static int8_t  s_botBreakFire[MAXPLAYERS];   // tics of blocker-clearing fire
 static int8_t  s_botStuckEpisodes[MAXPLAYERS]; // consecutive traps -> longer bounces
+static int16_t s_botNoHitTics[MAXPLAYERS];   // visible-but-unhittable streak (fence camping)
+static int32_t s_botLastTDist[MAXPLAYERS];   // pursuit progress: last distance to target
 static int8_t  s_botOpenGrace[MAXPLAYERS];   // door-try: keep pushing before bouncing
 static uint8_t s_botBurst[MAXPLAYERS];       // fire cadence phase (24 on / 8 off)
 static int16_t s_botTargetHold[MAXPLAYERS];  // tics on the same target without a kill
@@ -605,7 +607,11 @@ static input_t Bot_GetInput(int k)
         if (best < 0 && avoid >= 0)
             best = avoid;   // nobody else exists: keep the old one
         if (best != s_botTarget[k])
+        {
             s_botTargetHold[k] = 0;
+            s_botNoHitTics[k]  = 0;
+            s_botLastTDist[k]  = INT32_MAX;
+        }
         s_botTarget[k] = (int8_t)best;
         if ((Bot_Rnd() & 3) == 0)
             s_botStrafeDir[k] = (Bot_Rnd() & 1) ? 1 : -1;
@@ -684,6 +690,54 @@ static input_t Bot_GetInput(int k)
                              && cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
                                        tp->pos.x, tp->pos.y, tp->pos.z, tp->cursectnum));
 
+    // "Can SEE" is not "can HIT": cansee() threads through masked walls
+    // (chain-link fences, window bars) that hitscan bullets terminate on. The
+    // dominant idiot-mode measured live: a bot at the rooftop fence, target
+    // visible on the far side at the same height (pitch pinned at 100), hosing
+    // pellets into the mesh forever -- 98% of ALL bot fire ended on walls with
+    // zero frags across two 3-minute probes, and the collateral shot out
+    // lights/screens map-wide. Fire only when the ACTUAL fire solution
+    // (current angle + pitch) lands on a player or near the target.
+    bool canHit = false;
+    if (seesTarget)
+    {
+        int const fireAng   = fix16_to_int(ps->q16ang) & 2047;
+        int const fireHoriz = fix16_to_int(ps->q16horiz);
+        int32_t const vx = sintable[(fireAng + 512) & 2047];
+        int32_t const vy = sintable[fireAng & 2047];
+        hitdata_t ray = {};
+        hitscan(&ps->pos, ps->cursectnum, vx, vy, (100 - fireHoriz) << 5, &ray, CLIPMASK1);
+        int32_t const distT  = klabs(tp->pos.x - ps->pos.x) + klabs(tp->pos.y - ps->pos.y);
+        int32_t const rayLen = klabs(ray.xyz.x - ps->pos.x) + klabs(ray.xyz.y - ps->pos.y);
+        if (ray.sprite >= 0 && sprite[ray.sprite].picnum == APLAYER)
+            canHit = true;
+        else if (rayLen + 1024 < distT)
+            canHit = false;   // ray died strictly SHORT of the target: fence/wall between
+        else
+        {
+            // Ray reaches the target's range (or beyond): decide by how far
+            // the fire line passes from the target laterally. Endpoint
+            // proximity was WRONG here -- a clean near-miss ends on a wall far
+            // BEHIND the target and must still count as hittable (v1 gated on
+            // it and bots stopped firing entirely: 16 discharges in 3 min).
+            int64_t cross = (int64_t)(tp->pos.x - ps->pos.x) * vy
+                          - (int64_t)(tp->pos.y - ps->pos.y) * vx;
+            if (cross < 0) cross = -cross;
+            canHit = (int32_t)(cross >> 14) < 1024;
+        }
+        // Fence-camping breaker, PURSUIT-SAFE: only a bot that is unhittable
+        // AND not closing distance rotates away -- a bot descending toward
+        // its target is unhittable the whole way down and must keep coming.
+        if (canHit || distT + 64 < s_botLastTDist[k])
+            s_botNoHitTics[k] = 0;
+        else if (++s_botNoHitTics[k] > 60)
+        {
+            s_botTargetHold[k] = 1000;
+            s_botNoHitTics[k]  = 0;
+        }
+        s_botLastTDist[k] = distT;
+    }
+
     // Steering priority: wall-bounce > visible chase > blind homing/wander.
     int wantAng;
     if (s_botBounceHold[k] > 0)
@@ -735,7 +789,7 @@ static input_t Bot_GetInput(int k)
         else if (klabs(curHoriz - 100) > 10)
             in.bits |= BIT(SK_CENTER_VIEW);
     }
-    if (seesTarget && dist2d <= 2048)
+    if (canHit && dist2d <= 2048)
     {
         // Knife-fight range: circle-strafe with forward pressure.
         in.svel = (int16_t)(s_botStrafeDir[k] * 48);
@@ -767,7 +821,7 @@ static input_t Bot_GetInput(int k)
     if (dist2d > 8192)  gate >>= 1;
     if (dist2d > 20000) gate >>= 1;
     (void)s_botBurst;
-    if (seesTarget && klabs(diff) < max(gate, 16))
+    if (canHit && klabs(diff) < max(gate, 16))
         in.bits |= BIT(SK_FIRE);
     // Blocker-clearing burst ("if an item is in the way of exiting a room,
     // destroy it"): fires along the facing while stuck, only when no player
