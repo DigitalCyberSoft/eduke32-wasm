@@ -541,6 +541,7 @@ static int8_t  s_botTurnPref[MAXPLAYERS];    // wall-following handedness (+1/-1
 static int16_t s_botTrapTics[MAXPLAYERS];    // zero-net-displacement streak (hard trap)
 static vec2_t  s_botTrapAnchor[MAXPLAYERS];
 static int16_t s_botTrapCool[MAXPLAYERS];    // volley cooldown while trapped
+static int16_t s_botTrapDir[MAXPLAYERS];     // last free-move heading (escape axis)
 
 // Sector-graph navigation: BFS over wall portals from the bot's sector to the
 // target's, return the FIRST portal's midpoint to steer at. Build maps are a
@@ -885,7 +886,13 @@ static input_t Bot_GetInput(int k)
 
     // Steering priority: wall-bounce > visible chase > blind homing/wander.
     int wantAng;
-    if (s_botBounceHold[k] > 0)
+    if (s_botTrapTics[k] > 104)
+    {
+        // Hard-trapped: hold the escape axis (the way we came in is the way
+        // out of a duct) -- outranks bounce, which only knows walls.
+        wantAng = s_botTrapDir[k];
+    }
+    else if (s_botBounceHold[k] > 0)
     {
         s_botBounceHold[k]--;
         wantAng = s_botBounceAng[k];
@@ -985,6 +992,8 @@ static input_t Bot_GetInput(int k)
                                + klabs(ps->pos.y - s_botTrapAnchor[k].y);
         if (trapDisp >= 64)
         {
+            s_botTrapDir[k]    = (int16_t)getangle(ps->pos.x - s_botTrapAnchor[k].x,
+                                                   ps->pos.y - s_botTrapAnchor[k].y);
             s_botTrapTics[k]   = 0;
             s_botTrapAnchor[k] = ps->pos.xy;
         }
@@ -992,7 +1001,12 @@ static input_t Bot_GetInput(int k)
         {
             // Reset only on DISPLACEMENT: pinned bots alternate move/turn
             // tics, and resetting on quiet tics would keep this from ever
-            // tripping.
+            // tripping. Escape kit: CROUCH (crawl-height ducts block standing
+            // movement in every direction -- the E1L1 vent pin), no jumping
+            // (cancels the crouch), volley along the entry axis, and if
+            // nothing opens, walk away.
+            in.bits |= BIT(SK_CROUCH);
+            in.bits &= ~BIT(SK_JUMP);
             if (s_botTrapCool[k] == 0)
             {
                 s_botBreakFire[k] = 8;
