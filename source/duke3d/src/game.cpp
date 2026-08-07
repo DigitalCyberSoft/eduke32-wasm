@@ -7229,6 +7229,10 @@ MAIN_LOOP_RESTART:
                             // latch+send it and advance movefifoend (Net_HandleInput), then
                             // advance the sim only over confirmed ticks (G_MoveLoop).
                             netInput = g_netStagedInput;
+                            // TEST MODE (Web_SetLocalBot): this peer plays itself --
+                            // the bot brain's input rides the full human pipeline.
+                            if (g_netLocalBot)
+                                netInput = Net_BotInput();
                             Net_HandleInput();
                             G_MoveLoop();
                         }
