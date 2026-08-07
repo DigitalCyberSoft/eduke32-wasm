@@ -1525,31 +1525,54 @@ void G_NewGame(int volumeNum, int levelNum, int skillNum)
     VM_OnEvent(EVENT_NEWGAME, g_player[screenpeek].ps->i, screenpeek);
 }
 
+// Spawn rows are trusted ONLY when collected from a pristine board. On a
+// re-entry without a board reload (the MP relaunch flow, menu after the title
+// demo), STAT_PLAYER sprites sit wherever playback/play last MOVED them --
+// stock code canonized those drifted positions as spawn rows, which is how
+// bots launched marooned mid-map (E1L1 rows contained the DEMO's end
+// positions, sect 313/154). engineLoadBoard marks the rows stale.
+int32_t g_spawnRowsStale = 1;
+
 static void G_CollectSpawnPoints(int gameMode)
 {
-    g_playerSpawnCnt = 0;
-    //    circ = 2048/ud.multimode;
+    if (g_spawnRowsStale)
+    {
+        g_playerSpawnCnt = 0;
+        int nexti;
+        for (int SPRITES_OF_STAT_SAFE(STAT_PLAYER, i, nexti))
+        {
+            if (g_playerSpawnCnt == MAXPLAYERS)
+                break;
+            auto &s     = sprite[i];
+            auto &spawn = g_playerSpawnPoints[g_playerSpawnCnt];
+            spawn.xyz  = s.xyz;
+            spawn.ang  = s.ang;
+            spawn.sect = s.sectnum;
+            g_playerSpawnCnt++;
+        }
+        g_spawnRowsStale = 0;
+    }
 
     int pindex = 0;   // visible past the loop: extra seats materialize below
     for (int pal = 9, nexti, SPRITES_OF_STAT_SAFE(STAT_PLAYER, i, nexti))
     {
-        if (g_playerSpawnCnt == MAXPLAYERS)
-            G_GameExit("\nToo many player sprites (max 16.)");
-
-        auto &s     = sprite[i];
-        auto &spawn = g_playerSpawnPoints[g_playerSpawnCnt];
-
-        spawn.xyz  = s.xyz;
-        spawn.ang  = s.ang;
-        spawn.sect = s.sectnum;
-
-        g_playerSpawnCnt++;
+        auto &s = sprite[i];
 
         if (pindex >= MAXPLAYERS)
         {
             A_DeleteSprite(i);
             i = nexti;
             continue;
+        }
+
+        // Entry places every player at a WRAPPED CACHED ROW -- never at the
+        // sprite's live (possibly drifted) position. Pristine loads are
+        // identical to stock; re-entries heal the drift instead of shipping it.
+        if (g_playerSpawnCnt > 0)
+        {
+            auto &row = g_playerSpawnPoints[pindex % g_playerSpawnCnt];
+            s.ang = row.ang;
+            setsprite(i, &row.xyz);
         }
 
         s.clipdist = 64;
@@ -2072,6 +2095,8 @@ int G_EnterLevel(int gameMode)
         LOG_F(ERROR, "Unable to load %s: bad player start point!", G_HaveUserMap() ? boardfilename : m.filename);
         return 1;
     }
+
+    g_spawnRowsStale = 1;   // pristine board: re-collect spawn rows from it
 
     p0.q16ang = fix16_from_int(playerAngle);
 
