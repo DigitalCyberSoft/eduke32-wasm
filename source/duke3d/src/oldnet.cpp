@@ -83,6 +83,14 @@ static int Net_EnterText(int /*x*/, int /*y*/, char * /*t*/, int /*dalen*/, int 
 }
 
 // ---------------------------------------------------------------------------
+// CPU players ("bots"): seats whose inputs the HOST synthesizes into the
+// canonical stream each tic. Guests consume them like any remote player --
+// their machines never know (or need to know) the seat is CPU, so behavior
+// and difficulty are host-decided by construction. Sync-safe: inputs travel,
+// the sim stays identical everywhere.
+int32_t g_netBotMask;        // slots that are CPU seats (host-authoritative)
+int32_t g_netBotSkill = 1;   // 0 easy / 1 medium / 2 hard (host-side only)
+
 // Transport seam. The netcode never talks to enet/UDP/sockets directly; every
 // outgoing packet is classified onto a logical channel + reliability here and
 // handed to the pluggable transport (net_transport.h). Inbound frames arrive
@@ -90,6 +98,8 @@ static int Net_EnterText(int /*x*/, int /*y*/, char * /*t*/, int /*dalen*/, int 
 // ---------------------------------------------------------------------------
 static void oldnet_sendpacket(int other, unsigned char *bufptr, int len)
 {
+    if (g_netBotMask & (1 << other))
+        return;                       // CPU seat: there is no transport peer
     int channel, reliable;
 
     switch (bufptr[0])
@@ -491,6 +501,151 @@ static int32_t  s_pendingSnapTic;
 
 static struct JoinTicInit { JoinTicInit() { for (auto &t : s_joinTic) t = -1; } } s_joinTicInit;
 
+// ── CPU player input synthesis (host only) ──────────────────────────────────
+// LOCAL PRNG -- never krand(): bot decisions run on the host only, and a krand
+// draw here would advance the shared sim RNG stream on one peer alone (the
+// exact desync class this project hunts).
+static uint32_t s_botRng = 0xB07D00Du;
+static inline uint32_t Bot_Rnd(void)
+{
+    s_botRng ^= s_botRng << 13; s_botRng ^= s_botRng >> 17; s_botRng ^= s_botRng << 5;
+    return s_botRng;
+}
+static int8_t  s_botStrafeDir[MAXPLAYERS];
+static int16_t s_botWanderAng[MAXPLAYERS];
+static int16_t s_botThinkHold[MAXPLAYERS];   // reaction: tics until retarget allowed
+static int8_t  s_botTarget[MAXPLAYERS];
+
+static input_t Bot_GetInput(int k)
+{
+    input_t in = {};
+    auto const ps = g_player[k].ps;
+    // The pump can ask for a column BEFORE the level exists (seated at
+    // relaunch, entry still loading): ps->i/cursectnum are garbage then, and
+    // cansee() on a garbage sector walks broken lists and crashes. Neutral
+    // input until the seat is live in a real sector.
+    if (ps == NULL || (unsigned)ps->i >= MAXSPRITES
+        || (unsigned)ps->cursectnum >= (unsigned)numsectors)
+        return in;
+
+    if (sprite[ps->i].extra <= 0 || ps->dead_flag)
+    {
+        if ((Bot_Rnd() & 15) == 0)
+            in.bits |= BIT(SK_FIRE);              // respawn
+        return in;
+    }
+
+    int const skill = clamp(g_netBotSkill, 0, 2);
+    // Skill knobs: turn cap (ang units/tic), fire gate (max aim-off to shoot),
+    // aim wobble amplitude, reaction hold (tics between retarget decisions).
+    static int const turnCap[3]  = { 40, 72, 116 };
+    static int const fireGate[3] = { 56, 96, 160 };
+    static int const wobble[3]   = { 96, 48, 16 };
+    static int const holdMax[3]  = { 30, 16, 6 };
+
+    // Reacquire target only when the hold expires (reaction time).
+    if (--s_botThinkHold[k] <= 0)
+    {
+        s_botThinkHold[k] = (int16_t)(holdMax[skill] + (Bot_Rnd() % holdMax[skill]));
+        int best = -1; int32_t bestd = INT32_MAX; int i;
+        TRAVERSE_CONNECT(i)
+        {
+            if (i == k) continue;
+            auto const tp = g_player[i].ps;
+            if (tp == NULL || (unsigned)tp->i >= MAXSPRITES || sprite[tp->i].extra <= 0 || tp->dead_flag
+                || (unsigned)tp->cursectnum >= (unsigned)numsectors)
+                continue;
+            int32_t const d = klabs(tp->pos.x - ps->pos.x) + klabs(tp->pos.y - ps->pos.y);
+            if (d < bestd) { bestd = d; best = i; }
+        }
+        s_botTarget[k] = (int8_t)best;
+        if ((Bot_Rnd() & 3) == 0)
+            s_botStrafeDir[k] = (Bot_Rnd() & 1) ? 1 : -1;
+        s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
+    }
+
+    int const t = s_botTarget[k];
+    if (t < 0 || !g_player[t].connected || g_player[t].ps == NULL)
+    {
+        // Nobody to fight: wander.
+        int const diff = (((s_botWanderAng[k] - fix16_to_int(ps->q16ang)) + 1024) & 2047) - 1024;
+        in.q16avel = fix16_from_int(clamp(diff, -turnCap[skill], turnCap[skill]));
+        in.fvel    = 64;
+        in.extbits |= BIT(EK_MOVE_FORWARD);
+        return in;
+    }
+
+    auto const tp = g_player[t].ps;
+    int32_t const dx = tp->pos.x - ps->pos.x, dy = tp->pos.y - ps->pos.y;
+    int const wantAng = getangle(dx, dy);
+    int diff = (((wantAng - fix16_to_int(ps->q16ang)) + 1024) & 2047) - 1024;
+    int const aimErr = (int)(Bot_Rnd() % (2 * wobble[skill] + 1)) - wobble[skill];
+    in.q16avel = fix16_from_int(clamp(diff + aimErr, -turnCap[skill], turnCap[skill]));
+
+    int32_t const dist2d = klabs(dx) + klabs(dy);
+    if (dist2d > 2048)
+    {
+        in.fvel = 80;
+        in.extbits |= BIT(EK_MOVE_FORWARD);
+    }
+    else
+    {
+        in.svel = (int16_t)(s_botStrafeDir[k] * 48);
+        in.extbits |= BIT(s_botStrafeDir[k] > 0 ? EK_STRAFE_LEFT : EK_STRAFE_RIGHT);
+    }
+    if ((Bot_Rnd() & 127) < 2)
+        in.bits |= BIT(SK_JUMP);
+
+    if (klabs(diff) < fireGate[skill]
+        && cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
+                  tp->pos.x, tp->pos.y, tp->pos.z, tp->cursectnum))
+        in.bits |= BIT(SK_FIRE);
+
+    return in;
+}
+
+// Seat CPU players (host, pre-launch/relaunch): rebuild the ENTIRE mask each
+// call -- a stale mask bit on a slot later reused by a human would blackhole
+// their packets (oldnet_sendpacket skips bot slots).
+void Net_SeatBots(int count, int skill)
+{
+    g_netBotMask  = 0;
+    g_netBotSkill = clamp(skill, 0, 2);
+    if (myconnectindex != connecthead)
+        return;
+    // At menu time the host's OWN connected flag may still be 0 -- without
+    // these guards the host's slot looks "free", gets seated as a bot, and
+    // the pump then fights the host's sampler over the slot-0 input column
+    // (two writers -> aliased cursors -> garbage inputs -> crash at entry).
+    g_player[myconnectindex].connected = 1;
+    int seated = 0;
+    for (int k = 0; k < MAXPLAYERS && k < 16 && seated < count; k++)
+    {
+        if (k == myconnectindex || g_player[k].connected)
+            continue;
+        G_MaybeAllocPlayer(k);
+        g_player[k].connected = 1;
+        g_netBotMask |= (1 << k);
+        Bsprintf(g_player[k].user_name, "CPU-%d", seated + 1);
+        seated++;
+    }
+    if (seated)
+    {
+        Net_SeatLateJoiners();   // mask 0: rebuilds chain + numplayers from connected[]
+        initprintf("net: seated %d CPU player(s), skill %d (mask %x)\n",
+                   seated, g_netBotSkill, (unsigned)g_netBotMask);
+#ifdef __EMSCRIPTEN__
+        EM_ASM({ console.log('[bot] SeatBots: seated=' + $0 + ' np=' + $1 + ' mask=' + $2); },
+               seated, numplayers, g_netBotMask);
+#endif
+    }
+#ifdef __EMSCRIPTEN__
+    else
+        EM_ASM({ console.log('[bot] SeatBots: seated NOTHING (count=' + $0 + ' me=' + $1 + ' head=' + $2 + ')'); },
+               count, myconnectindex, connecthead);
+#endif
+}
+
 static void Net_ResetProtocolState(void)
 {
     g_netStagedInput = {};
@@ -660,6 +815,8 @@ static void Net_CheckPeerHealth(void)
         // The flow has its own failure handling (retry -> kick); keep its
         // liveness clock fresh so the axe restarts cleanly after the resume.
         if (i == s_joinFlowSlot) { s_lastRealRecvClock[i] = now; continue; }
+        // CPU seats have no transport to be silent on.
+        if (g_netBotMask & (1 << i)) { s_lastRealRecvClock[i] = now; continue; }
 
         if (s_lastRealRecvClock[i] > now)   // totalclock reset
             s_lastRealRecvClock[i] = now;
@@ -961,6 +1118,17 @@ void Net_HandleInput(void)
     // synthesized echo like everyone else, so nobody diverges.
     for (;;)
     {
+        // CPU seats: the master IS their input source. Synthesize their column
+        // for the aggregation tic the moment it is required -- they can never
+        // block, never fill, and their inputs are canonical like anyone's.
+        for (i = 0; i < MAXPLAYERS; i++)
+            if ((g_netBotMask & (1 << i)) && g_player[i].connected
+                && g_player[i].movefifoend <= movefifosendplc)
+            {
+                inputfifo[g_player[i].movefifoend & (MOVEFIFOSIZ - 1)][i] = Bot_GetInput(i);
+                g_player[i].movefifoend++;
+            }
+
         // Required columns for the NEXT aggregation tic: the live chain plus
         // announced joiners whose boundary the cursor has reached. The cursor
         // runs AHEAD of the sim, so an announced joiner may not be seated in
@@ -3287,6 +3455,7 @@ void Net_CheckPlayerQuit(int i)
         return;
 
     g_player[i].connected = 0;
+    g_netBotMask &= ~(1 << i);   // a freed seat must never keep a bot bit
 
     G_CloseDemoWrite();
 
@@ -3495,6 +3664,7 @@ void Net_FlushPendingDrops(void)
         if ((s_goneTic[i] >= 0 || (s_peerDownMask & (1 << i))) && g_player[i].connected)
         {
             g_player[i].connected = 0;
+            g_netBotMask &= ~(1 << i);   // a freed seat must never keep a bot bit
             changed = 1;
             initprintf("net: flushed pending drop of player %d at barrier\n", i);
 
@@ -3555,6 +3725,13 @@ void Net_WaitForPlayers()
     Net_ClearFIFO();
 
     g_player[myconnectindex].playerreadyflag++;
+    // CPU seats are always ready: mirror the master's flag so the barrier's
+    // wait loop and its status display treat them as arrived. (Slaves only
+    // wait for the master, so guests need no bot awareness here at all.)
+    if (myconnectindex == connecthead)
+        for (int bk = 0; bk < MAXPLAYERS; bk++)
+            if (g_netBotMask & (1 << bk))
+                g_player[bk].playerreadyflag = g_player[myconnectindex].playerreadyflag;
     packbuf[0] = PACKET_TYPE_PLAYER_READY;
     if (myconnectindex != connecthead)
         oldnet_sendpacket(connecthead, (unsigned char*)packbuf, 1);

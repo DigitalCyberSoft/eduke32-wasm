@@ -102,7 +102,7 @@ async function enterTo(id, label, secs = 12) {
 if (!(await selTo(2, 'MAIN>Multiplayer')) || !(await enterTo(20001, 'MULTIPLAYER'))) { console.log('FAIL mproot'); process.exit(1); }
 // sel counts HIDDEN rows: index 0 is Change Map (hidden out-of-game) -> HostPub = 1
 if (!(await selTo(1, 'MP>HostPub')) || !(await enterTo(20013, 'HOSTCFG'))) { console.log('FAIL hostcfg'); process.exit(1); }
-if (!(await selTo(6, 'HOSTCFG>Start')) || !(await enterTo(20016, 'LOBBY'))) { console.log('FAIL lobby'); process.exit(1); }
+if (!(await selTo(8, 'HOSTCFG>Start')) || !(await enterTo(20016, 'LOBBY'))) { console.log('FAIL lobby'); process.exit(1); }  // 8: CPU Players + CPU Skill rows sit above Start
 let invite = '';
 for (let i = 0; i < 25 && !invite; i++) { invite = await H.evaluate(() => { try { return window.DukeNet.match.inviteCode() || ''; } catch { return ''; } }).catch(() => ''); if (!invite) await new Promise(r => setTimeout(r, 1000)); }
 if (!invite) { console.log('FAIL invite'); process.exit(1); }

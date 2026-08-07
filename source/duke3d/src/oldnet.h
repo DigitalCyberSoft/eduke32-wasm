@@ -193,6 +193,9 @@ int  Net_JoinFlowActive(void);    // a join is streaming/announced: defer any he
 extern int32_t g_netDesyncReporters; // host: guests whose DESYNC_REPORT named them diverged
 int  Net_StartHealFlow(int k);    // host: begin healing seat k (0 = flow started)
 void Net_CheckHealResume(void);   // healing guest: leave watcher mode at the live edge
+extern int32_t g_netBotMask;      // CPU seats (host synthesizes their inputs)
+extern int32_t g_netBotSkill;     // 0..2, host-side only
+void Net_SeatBots(int count, int skill); // host: (re)seat CPU players pre-launch
 void Net_SendStateSnap(int k);    // host: in-place RNG+player correction to one guest
 int  Net_CorrectDivergence(int k);// host: correction ladder (soft snaps -> snapshot heal)
 void Net_ApplyPendingStateSnap(void); // guest: consume stashed snap at its stamped tic

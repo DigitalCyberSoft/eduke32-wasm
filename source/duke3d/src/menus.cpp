@@ -1799,10 +1799,18 @@ void netmenu_send_snapshot_to(int seatMask, int slot, int plc, int isJoin)
 // ud.monsters_off, game.cpp:3538). No gametype picker yet -> hardcode DM (coop 0,
 // global.cpp:44). Net_SendNewGame also broadcasts the SEAT MASK (oldnet.cpp) so
 // guests learn the authoritative session roster.
+static int32_t s_netBots     = 0;   // host-chosen CPU player count (0..6)
+static int32_t s_netBotSkill = 1;   // host-chosen CPU skill (0..2)
+
 static void netmenu_relaunch(int vol, int lev)
 {
     ud.m_volume_number      = (vol >= 0 && vol < MAXVOLUMES) ? vol : 0;
     ud.m_level_number       = lev;
+    // CPU seats ride the normal roster: seated as connected[] before the
+    // multimode count and the NEW_GAME seat mask are derived, so guests seat
+    // them like any player. Their inputs are host-synthesized (oldnet.cpp).
+    if (myconnectindex == connecthead)
+        Net_SeatBots(s_netBots, s_netBotSkill);
     ud.multimode            = numplayers;
     g_mostConcurrentPlayers = ud.multimode;
     ud.m_coop               = 0;   // gametype 0 = Deathmatch (spawn)
@@ -1850,6 +1858,12 @@ static MenuOption_t MEO_NET_CFG_SHARE = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_Off
 static MenuEntry_t ME_NET_CFG_SHARE = MAKE_MENUENTRY( "GRP Sharing", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_SHARE, Option );
 static MenuOption_t MEO_NET_CFG_LOCALONLY = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_OffOn, &s_netLocalOnly );
 static MenuEntry_t ME_NET_CFG_LOCALONLY = MAKE_MENUENTRY( "Local Only", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_LOCALONLY, Option );
+static MenuRangeInt32_t MEO_NET_CFG_BOTS = MAKE_MENURANGE( &s_netBots, &MF_Bluefont, 0, 6, 0, 7, DisplayTypeInteger|EnforceIntervals );
+static MenuEntry_t ME_NET_CFG_BOTS = MAKE_MENUENTRY( "CPU Players", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_BOTS, RangeInt32 );
+static char const *MEOSN_NET_BOTSKILL[] = { "Easy", "Medium", "Hard", };
+static MenuOptionSet_t MEOS_NET_BOTSKILL = MAKE_MENUOPTIONSET( MEOSN_NET_BOTSKILL, NULL, 0x7 );
+static MenuOption_t MEO_NET_CFG_BOTSKILL = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_NET_BOTSKILL, &s_netBotSkill );
+static MenuEntry_t ME_NET_CFG_BOTSKILL = MAKE_MENUENTRY( "CPU Skill", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_BOTSKILL, Option );
 // Episode selector: shares the init-populated episode name/value arrays but NOT the
 // stock optionset -- MEOS_NET_CFG_EPISODE.numOptions is set at init WITHOUT the
 // trailing "User Map" row (no map-file transfer between peers). Bound to NetEpisode,
@@ -1865,7 +1879,7 @@ static MenuEntry_t ME_NET_CFG_LEVEL = MAKE_MENUENTRY( "Level", &MF_Redfont, &MEF
 static MenuLink_t MEO_NET_CFG_START = { MENU_NET_LOBBY, MA_Advance, };
 static MenuEntry_t ME_NET_CFG_START = MAKE_MENUENTRY( "Start", &MF_Redfont, &MEF_VideoSetup_Apply, &MEO_NET_CFG_START, Link );
 static MenuEntry_t *MEL_NET_HOSTCFG[] = {
-    &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_EPISODE, &ME_NET_CFG_LEVEL, &ME_NET_CFG_SHARE, &ME_NET_CFG_LOCALONLY, &ME_NET_CFG_START,
+    &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_EPISODE, &ME_NET_CFG_LEVEL, &ME_NET_CFG_SHARE, &ME_NET_CFG_LOCALONLY, &ME_NET_CFG_BOTS, &ME_NET_CFG_BOTSKILL, &ME_NET_CFG_START,
 };
 
 // CHANGE MAP (host, in-game): same Episode/Level pickers; Warp relaunches every
