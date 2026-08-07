@@ -1803,7 +1803,9 @@ static int32_t s_netMinPlayers = 5; // host-chosen match-size FLOOR (1..8): CPU
                                     // players fill only the seats humans leave
                                     // empty, and yield them as humans join. A
                                     // populated default -- one bot is not a match
-static int32_t s_netBotSkill = 1;   // host-chosen CPU skill (0..2)
+static int32_t s_netBotSkill = 2;   // host-chosen CPU skill (0..2); default Hard --
+                                    // Medium's aim wobble read as "the bots are
+                                    // stupid" (live), and the menu can lower it
 
 static void netmenu_relaunch(int vol, int lev)
 {
