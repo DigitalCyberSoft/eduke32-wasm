@@ -36,6 +36,16 @@ static void Net_ProcessPrediction(void)
     // Clear bits that could cause trouble
     g_player[myconnectindex].input.bits &= ~(BIT(SK_PAUSE) | BIT(SK_MULTIFLAG) | BIT(SK_GAMEQUIT));
 
+    // View direction is FRAME-OWNED: P_GetInput applies avel/horz to the
+    // predicted view at frame rate as the mouse moves. If the predicted tic
+    // pass integrated them again (the open tick's partial input included),
+    // every correction replay re-derived a different angle and the view shook
+    // with mouse speed. The sim's copy of these inputs is untouched -- only
+    // the predicted replica skips angle integration; its position physics run
+    // from the frame-integrated angles it already has.
+    g_player[myconnectindex].input.q16avel = 0;
+    g_player[myconnectindex].input.q16horz = 0;
+
     g_player[myconnectindex].ps = &predictedPlayer;
 
     P_HandleSharedKeys(myconnectindex);
@@ -106,6 +116,16 @@ void Net_CorrectPrediction(void)
     auto orotscrnang  = predictedPlayer.orotscrnang;
     auto olook_ang    = predictedPlayer.olook_ang;
     auto scream_voice = predictedPlayer.scream_voice;
+    // The DIRECTION GROUP is client-authoritative for the view (frame-owned,
+    // see Net_ProcessPrediction): the reset below stomps it with the sim's
+    // tic-quantized copy, so carry the whole group across the reset+replay.
+    // The sim keeps its own direction for aim/movement; both integrate the
+    // same input deltas, so they track without ever yanking the view.
+    auto q16ang       = predictedPlayer.q16ang;
+    auto q16horiz     = predictedPlayer.q16horiz;
+    auto q16horizoff  = predictedPlayer.q16horizoff;
+    auto rotscrnang   = predictedPlayer.rotscrnang;
+    auto look_ang     = predictedPlayer.look_ang;
 
     Net_ResetPredictionData();
     predictfifoplc = movefifoplc;
@@ -121,20 +141,11 @@ void Net_CorrectPrediction(void)
     if (p->opos != p->pos)
         predictedPlayer.opos = opos;
 
-    if (p->oq16ang != p->q16ang)
-        predictedPlayer.oq16ang = oq16ang;
-
-    if (p->oq16horiz != p->q16horiz)
-        predictedPlayer.oq16horiz = oq16horiz;
-
-    if (p->oq16horizoff != p->q16horizoff)
-        predictedPlayer.oq16horizoff = oq16horizoff;
-
-    if (p->orotscrnang != p->rotscrnang)
-        predictedPlayer.orotscrnang = orotscrnang;
-
-    if (p->olook_ang != p->look_ang)
-        predictedPlayer.olook_ang = olook_ang;
+    predictedPlayer.q16ang      = q16ang;       predictedPlayer.oq16ang      = oq16ang;
+    predictedPlayer.q16horiz    = q16horiz;     predictedPlayer.oq16horiz    = oq16horiz;
+    predictedPlayer.q16horizoff = q16horizoff;  predictedPlayer.oq16horizoff = oq16horizoff;
+    predictedPlayer.rotscrnang  = rotscrnang;   predictedPlayer.orotscrnang  = orotscrnang;
+    predictedPlayer.look_ang    = look_ang;     predictedPlayer.olook_ang    = olook_ang;
 }
 
 void Net_InitializeStructPointers(void)

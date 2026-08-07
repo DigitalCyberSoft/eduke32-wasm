@@ -1587,8 +1587,16 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     ps->vel.x  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
                     ps->vel.y  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
                     ps->vel.z  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    ps->q16ang   = ps->oq16ang   = (fix16_t)B_UNBUF32(&packbuf[jj]); jj += 4;
-                    ps->q16horiz = ps->oq16horiz = (fix16_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                    // OWN facing is client-authoritative ("relax lockstep on
+                    // direction"): adopting the host's lagged copy of MY angle
+                    // yanks the view on every heal. Remote players' facing is
+                    // adopted normally (their sprites should face host-truth).
+                    if (slot != myconnectindex)
+                    {
+                        ps->q16ang   = ps->oq16ang   = (fix16_t)B_UNBUF32(&packbuf[jj]);
+                        ps->q16horiz = ps->oq16horiz = (fix16_t)B_UNBUF32(&packbuf[jj + 4]);
+                    }
+                    jj += 8;
                     vec3_t sp;
                     sp.x = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
                     sp.y = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
@@ -2183,6 +2191,17 @@ int Net_ApplyLateJoinSnapshot(void)
     Bstrcpy(sv.path, LATEJOIN_SAVE);
     sv.isExt = 0;
 
+    // Healing guest: OWN facing is client-authoritative -- carry it across the
+    // authoritative reload (the world resets around us; the view must not yank).
+    fix16_t healAng = 0, healOAng = 0, healHoriz = 0, healOHoriz = 0;
+    if (healMode && g_player[myIdx].ps != NULL)
+    {
+        healAng    = g_player[myIdx].ps->q16ang;
+        healOAng   = g_player[myIdx].ps->oq16ang;
+        healHoriz  = g_player[myIdx].ps->q16horiz;
+        healOHoriz = g_player[myIdx].ps->oq16horiz;
+    }
+
     int const r = G_LoadPlayer(sv);
 
     // The snapshot carries the HOST's view of every per-player struct; OUR identity
@@ -2222,7 +2241,16 @@ int Net_ApplyLateJoinSnapshot(void)
             g_player[myIdx].ps->gm = MODE_GAME;
         }
         else
+        {
             s_healBasePlc = s_snapshotPlc;   // arms the self-resume check
+            if (g_player[myIdx].ps != NULL)
+            {
+                g_player[myIdx].ps->q16ang    = healAng;
+                g_player[myIdx].ps->oq16ang   = healOAng;
+                g_player[myIdx].ps->q16horiz  = healHoriz;
+                g_player[myIdx].ps->oq16horiz = healOHoriz;
+            }
+        }
         ready2send = 1;                 // pump ON: the catchup acks must flow
     }
     else if (joinMode)
