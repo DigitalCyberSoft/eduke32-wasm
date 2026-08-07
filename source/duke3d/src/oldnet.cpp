@@ -90,6 +90,8 @@ static int Net_EnterText(int /*x*/, int /*y*/, char * /*t*/, int /*dalen*/, int 
 // the sim stays identical everywhere.
 int32_t g_netBotMask;        // slots that are CPU seats (host-authoritative)
 int32_t g_netBotSkill = 1;   // 0 easy / 1 medium / 2 hard (host-side only)
+int32_t g_netMinPlayers = 5; // host's match-size floor: bots fill up to this
+                             // count and yield seats back as humans join
 int32_t g_netLocalBot;       // TEST MODE: this peer's OWN input comes from the
                              // bot brain through the full human pipeline --
                              // sampling, staging, S2M, prediction. On the wire
@@ -705,13 +707,17 @@ input_t Net_BotInput(void)
     return Bot_GetInput(myconnectindex);
 }
 
-// Seat CPU players (host, pre-launch/relaunch): rebuild the ENTIRE mask each
-// call -- a stale mask bit on a slot later reused by a human would blackhole
-// their packets (oldnet_sendpacket skips bot slots).
-void Net_SeatBots(int count, int skill)
+// Seat CPU players (host, pre-launch/relaunch). `minPlayers` is the host's
+// MATCH-SIZE FLOOR: bots only fill the seats humans leave empty below it, so
+// a lobby with enough humans launches with no bots at all, and a mid-game
+// joiner displaces one (the yield lives at the join-flow seat point). The
+// mask is rebuilt WHOLE each call -- a stale bit on a slot later reused by a
+// human would blackhole their packets (oldnet_sendpacket skips bot slots).
+void Net_SeatBots(int minPlayers, int skill)
 {
-    g_netBotMask  = 0;
-    g_netBotSkill = clamp(skill, 0, 2);
+    g_netBotMask    = 0;
+    g_netBotSkill   = clamp(skill, 0, 2);
+    g_netMinPlayers = clamp(minPlayers, 1, 8);
     if (myconnectindex != connecthead)
         return;
     // At menu time the host's OWN connected flag may still be 0 -- without
@@ -719,8 +725,13 @@ void Net_SeatBots(int count, int skill)
     // the pump then fights the host's sampler over the slot-0 input column
     // (two writers -> aliased cursors -> garbage inputs -> crash at entry).
     g_player[myconnectindex].connected = 1;
+    int humans = 0;
+    for (int k = 0; k < MAXPLAYERS && k < 16; k++)
+        if (g_player[k].connected)
+            humans++;
+    int const want = g_netMinPlayers - humans;
     int seated = 0;
-    for (int k = 0; k < MAXPLAYERS && k < 16 && seated < count; k++)
+    for (int k = 0; k < MAXPLAYERS && k < 16 && seated < want; k++)
     {
         if (k == myconnectindex || g_player[k].connected)
             continue;
@@ -742,8 +753,8 @@ void Net_SeatBots(int count, int skill)
     }
 #ifdef __EMSCRIPTEN__
     else
-        EM_ASM({ console.log('[bot] SeatBots: seated NOTHING (count=' + $0 + ' me=' + $1 + ' head=' + $2 + ')'); },
-               count, myconnectindex, connecthead);
+        EM_ASM({ console.log('[bot] SeatBots: seated NOTHING (min=' + $0 + ' me=' + $1 + ' head=' + $2 + ')'); },
+               g_netMinPlayers, myconnectindex, connecthead);
 #endif
 }
 
@@ -2303,6 +2314,57 @@ extern "C" void Web_SetLocalBot(int on)
     g_netLocalBot = on;
     EM_ASM({ console.log('[eng] localBot=' + $0); }, on);
 }
+// The transport's slot allocator must NOT hand a joiner a CPU-held seat: the
+// join driver discards seat requests for occupied slots ("stale queue entry"),
+// which strands the guest in the lobby forever (live-reported via ?join=).
+extern "C" int Net_GetBotMask(void)
+{
+    return g_netBotMask;
+}
+// The late-join snapshot is a savegame and carries NO premap spawn table. A
+// fresh-process joiner never ran premap, so g_playerSpawnCnt was 0 there and
+// Net_InsertLatePlayer silently refused to materialize the joiner ON ITS OWN
+// SIM ONLY (veterans inserted it fine): an instant, permanent fork, plus the
+// prediction replica initializing on the shadowed HOST player (live-reported
+// as every ?join= freezing seconds after the seat). The transport ships the
+// host's table alongside the snapshot; identical level data on every peer.
+extern "C" const char *Net_GetSpawnTable(void)
+{
+    static char buf[MAXPLAYERS * 48 + 8];
+    int n = 0;
+    for (int i = 0; i < g_playerSpawnCnt && i < MAXPLAYERS; i++)
+        n += Bsnprintf(buf + n, sizeof(buf) - n, "%d,%d,%d,%d,%d;",
+                       g_playerSpawnPoints[i].x, g_playerSpawnPoints[i].y,
+                       g_playerSpawnPoints[i].z, (int)g_playerSpawnPoints[i].sect,
+                       (int)g_playerSpawnPoints[i].ang);
+    return buf;
+}
+extern "C" void Net_SetSpawnTable(const char *s)
+{
+    if (!s || !*s)
+        return;
+    int cnt = 0;
+    while (*s && cnt < MAXPLAYERS)
+    {
+        int x, y, z, sect, ang;
+        if (sscanf(s, "%d,%d,%d,%d,%d", &x, &y, &z, &sect, &ang) != 5)
+            break;
+        auto &sp = g_playerSpawnPoints[cnt];
+        sp.x    = x;
+        sp.y    = y;
+        sp.z    = z;
+        sp.sect = (int16_t)sect;
+        sp.ang  = (int16_t)ang;
+        cnt++;
+        const char *semi = strchr(s, ';');
+        if (!semi)
+            break;
+        s = semi + 1;
+    }
+    if (cnt)
+        g_playerSpawnCnt = cnt;
+    initprintf("net: spawn table received (%d points)\n", cnt);
+}
 #endif
 
 #ifdef __EMSCRIPTEN__
@@ -2442,6 +2504,10 @@ int Net_ApplyLateJoinSnapshot(void)
 
     int const r = G_LoadPlayer(sv);
 
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('[eng] Apply: load r=' + $0 + ' np=' + $1 + ' nsect=' + $2); }, r, numplayers, numsectors);
+#endif
+
     // The snapshot carries the HOST's view of every per-player struct; OUR identity
     // is local state and must survive the load.
     myconnectindex = myIdx;
@@ -2554,6 +2620,11 @@ void Net_ApplyPendingJoins(void)
 
         if (k == myconnectindex)
         {
+#ifdef __EMSCRIPTEN__
+            // Wedge forensics: dump the next clipshape initindex inputs (the
+            // post-seat hitscan clip walk hard-looped; see clip.cpp).
+            { extern int32_t g_clipLogBudget; g_clipLogBudget = 40; }
+#endif
             // I am the joiner: leave spectator mode and start staging real
             // inputs from this very tic.
             g_netJoinCatchup = 0;
@@ -2658,6 +2729,25 @@ void Net_HostJoinFlow(void)
             s_joinAnnounceUntil[k] = now + NET_JOIN_ANNOUNCE;
             s_joinAwaitReal |= (1 << k);
             initprintf("net: joiner %d caught up (gap %d) -> seat at tic %d\n", k, gap, tic);
+            // MIN-PLAYERS yield: a human raised the head count over the host's
+            // floor -> the newest CPU seat gives way, through the SAME drop
+            // boundary a quitting human rides (announced on every M2S packet;
+            // every sim, this joiner included, unseats it at the same tic).
+            if (g_netBotMask)
+            {
+                int total = 1;   // the joiner, connected once it crosses `tic`
+                for (int i = 0; i < MAXPLAYERS && i < 16; i++)
+                    if (g_player[i].connected)
+                        total++;
+                if (total > g_netMinPlayers)
+                    for (int i = 15; i >= 0; i--)
+                        if ((g_netBotMask & (1 << i)) && g_player[i].connected)
+                        {
+                            initprintf("net: CPU seat %d yields to the joining player\n", i);
+                            Net_ScheduleDrop(i, "seat yielded to a joining player");
+                            break;
+                        }
+            }
             return;
         }
         if (now - s_joinFlowClock > NET_JOIN_RETRY && gap > NET_JOIN_RING_MAX)
@@ -3639,6 +3729,8 @@ void Net_ExcisePlayer(int i)
 
     g_player[i].connected      = 0;
     g_player[i].playerquitflag = 0;
+    g_netBotMask &= ~(1 << i);   // a freed seat must never keep a bot bit
+                                 // (bot yields ride this same excise path)
 
     G_CloseDemoWrite();
 

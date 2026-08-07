@@ -3,6 +3,9 @@
 #include "duke3d.h"
 #include "oldnet.h"
 #include "net_predict.h"
+#ifdef __EMSCRIPTEN__
+# include <emscripten.h>
+#endif
 
 // Without initializing value as done here, menu sounds might be missing.
 int32_t oldnet_predictcontext = NOT_PREDICTABLE;
@@ -19,6 +22,15 @@ int32_t  backupSeed;
 
 static void Net_ProcessPrediction(void)
 {
+#ifdef __EMSCRIPTEN__
+    // Wedge forensics: the joiner's first predicted tics hard-looped getzrange
+    // (paused stack, live-reported joins). Log the state each early replica
+    // tick enters P_ProcessInput with; only the first few MP ticks ever print.
+    { static int s_pn; if (s_pn < 8) { s_pn++;
+        EM_ASM({ console.log('[pred] tick plc=' + $0 + ' sect=' + $1 + ' spr=' + $2 + ' x=' + $3 + ' y=' + $4 + ' z=' + $5); },
+               predictfifoplc, predictedPlayer.cursectnum, predictedPlayer.i,
+               predictedPlayer.pos.x, predictedPlayer.pos.y, predictedPlayer.pos.z); } }
+#endif
     input_t backupInput = g_player[myconnectindex].input;
 
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
@@ -193,6 +205,18 @@ void        Net_InitializePrediction(void)
     Net_InitializeGameVarPointers();
     Net_UseOriginalPointers();
     Net_ResetPredictionData();
+    // The replica starts AT the consume cursor -- exactly like every
+    // Net_CorrectPrediction rebase. Without this, a late joiner's first
+    // prediction pass replayed from the SNAPSHOT tic: dozens of phantom tics
+    // of a player that was not in the world yet, whose physics spiraled until
+    // getzrange hard-looped the main thread (live-reported: every ?join= into
+    // a running match froze seconds after the seat).
+    predictfifoplc = movefifoplc;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('[pred] init me=' + $0 + ' sect=' + $1 + ' spr=' + $2 + ' x=' + $3 + ' y=' + $4 + ' z=' + $5 + ' ns=' + $6); },
+           myconnectindex, predictedPlayer.cursectnum, predictedPlayer.i,
+           predictedPlayer.pos.x, predictedPlayer.pos.y, predictedPlayer.pos.z, predicted_Numsprites);
+#endif
 }
 
 void Net_UsePredictedPointers(void)

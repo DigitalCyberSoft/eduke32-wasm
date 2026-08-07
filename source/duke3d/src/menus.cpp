@@ -1799,7 +1799,9 @@ void netmenu_send_snapshot_to(int seatMask, int slot, int plc, int isJoin)
 // ud.monsters_off, game.cpp:3538). No gametype picker yet -> hardcode DM (coop 0,
 // global.cpp:44). Net_SendNewGame also broadcasts the SEAT MASK (oldnet.cpp) so
 // guests learn the authoritative session roster.
-static int32_t s_netBots     = 4;   // host-chosen CPU player count (0..6); a
+static int32_t s_netMinPlayers = 5; // host-chosen match-size FLOOR (1..8): CPU
+                                    // players fill only the seats humans leave
+                                    // empty, and yield them as humans join. A
                                     // populated default -- one bot is not a match
 static int32_t s_netBotSkill = 1;   // host-chosen CPU skill (0..2)
 
@@ -1811,7 +1813,7 @@ static void netmenu_relaunch(int vol, int lev)
     // multimode count and the NEW_GAME seat mask are derived, so guests seat
     // them like any player. Their inputs are host-synthesized (oldnet.cpp).
     if (myconnectindex == connecthead)
-        Net_SeatBots(s_netBots, s_netBotSkill);
+        Net_SeatBots(s_netMinPlayers, s_netBotSkill);
     ud.multimode            = numplayers;
     g_mostConcurrentPlayers = ud.multimode;
     ud.m_coop               = 0;   // gametype 0 = Deathmatch (spawn)
@@ -1859,8 +1861,8 @@ static MenuOption_t MEO_NET_CFG_SHARE = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_Off
 static MenuEntry_t ME_NET_CFG_SHARE = MAKE_MENUENTRY( "GRP Sharing", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_SHARE, Option );
 static MenuOption_t MEO_NET_CFG_LOCALONLY = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_OffOn, &s_netLocalOnly );
 static MenuEntry_t ME_NET_CFG_LOCALONLY = MAKE_MENUENTRY( "Local Only", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_LOCALONLY, Option );
-static MenuRangeInt32_t MEO_NET_CFG_BOTS = MAKE_MENURANGE( &s_netBots, &MF_Bluefont, 0, 6, 0, 7, DisplayTypeInteger|EnforceIntervals );
-static MenuEntry_t ME_NET_CFG_BOTS = MAKE_MENUENTRY( "CPU Players", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_BOTS, RangeInt32 );
+static MenuRangeInt32_t MEO_NET_CFG_BOTS = MAKE_MENURANGE( &s_netMinPlayers, &MF_Bluefont, 1, 8, 0, 8, DisplayTypeInteger|EnforceIntervals );
+static MenuEntry_t ME_NET_CFG_BOTS = MAKE_MENUENTRY( "Min Players", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_BOTS, RangeInt32 );
 static char const *MEOSN_NET_BOTSKILL[] = { "Easy", "Medium", "Hard", };
 static MenuOptionSet_t MEOS_NET_BOTSKILL = MAKE_MENUOPTIONSET( MEOSN_NET_BOTSKILL, NULL, 0x7 );
 static MenuOption_t MEO_NET_CFG_BOTSKILL = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_NET_BOTSKILL, &s_netBotSkill );

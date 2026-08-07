@@ -56,7 +56,7 @@ type Ctl =
   | { t: "grp_begin"; offer: GrpOffer }
   | { t: "grp_end" }
   | { t: "grp_deny"; reason: "paid" | "optout" | "notplaying" | "mismatch" }
-  | { t: "sav_begin"; size: number; mask: number; plc?: number; join?: number }
+  | { t: "sav_begin"; size: number; mask: number; plc?: number; join?: number; spawns?: string }
   | { t: "sav_chunk"; d: string }
   | { t: "sav_end" }
   | { t: "rtt_ping"; id: number }
@@ -119,6 +119,7 @@ class DukeNet {
   private savMask = 0;
   private savPlc = 0; // sender's movefifoplc at save (catchup stream base)
   private savJoin = 0; // 1 = barrier-free join apply, 0 = legacy resync apply
+  private savSpawns = ""; // host's premap spawn table (see Net_SetSpawnTable)
 
   // GRP receive state (guest side).
   private grpRecv: GrpReceiver | null = null;
@@ -301,8 +302,16 @@ class DukeNet {
     console.log(
       `[dnet] -> snapshot ${bytes.length} bytes to ${targets.length} peer(s), mask 0x${seatMask.toString(16)}, slot ${targetSlot}, plc ${plc}, join ${isJoin}`,
     );
+    // Premap's spawn table rides along: the snapshot is a savegame and does not
+    // carry it, and a fresh-process joiner has none (its Net_InsertLatePlayer
+    // would silently skip -- a permanent fork; see Net_SetSpawnTable).
+    let spawns = "";
+    try {
+      const mod = (globalThis as unknown as { Module?: { ccall?: (...a: unknown[]) => unknown } }).Module;
+      spawns = (mod?.ccall?.("Net_GetSpawnTable", "string", [], []) as string) || "";
+    } catch { spawns = ""; }
     for (const peerId of targets) {
-      m.peers.sendControl(peerId, { t: "sav_begin", size: bytes.length, mask: seatMask, plc, join: isJoin } as Ctl);
+      m.peers.sendControl(peerId, { t: "sav_begin", size: bytes.length, mask: seatMask, plc, join: isJoin, spawns } as Ctl);
       for (let off = 0; off < bytes.length; off += CHUNK) {
         const slice = bytes.subarray(off, Math.min(off + CHUNK, bytes.length));
         let bin = "";
@@ -525,6 +534,7 @@ class DukeNet {
           this.savMask = msg.mask | 0;
           this.savPlc = (msg.plc ?? 0) | 0;
           this.savJoin = (msg.join ?? 0) | 0;
+          this.savSpawns = typeof msg.spawns === "string" ? msg.spawns : "";
           console.log(
             `[dnet] <- snapshot begin (${msg.size} bytes, mask 0x${(msg.mask | 0).toString(16)}, plc ${this.savPlc}, join ${this.savJoin})`,
           );
@@ -554,6 +564,8 @@ class DukeNet {
           const FS = (globalThis as unknown as { Module?: { FS?: { writeFile: (p: string, d: Uint8Array) => void } } }).Module?.FS;
           FS?.writeFile("/latejoin.esv", bytes);
           const mod = (globalThis as unknown as { Module?: { ccall?: (...a: unknown[]) => unknown } }).Module;
+          if (this.savSpawns)
+            mod?.ccall?.("Net_SetSpawnTable", null, ["string"], [this.savSpawns]);
           mod?.ccall?.("Net_SnapshotReady", null, ["number", "number", "number"], [this.savMask, this.savPlc, this.savJoin]);
           console.log(`[dnet] snapshot ready (${total} bytes, plc ${this.savPlc}, join ${this.savJoin}) -> engine notified`);
         } catch (e) {
@@ -814,8 +826,18 @@ class DukeNet {
   // ── Host slot allocation ─────────────────────────────────────────────────
 
   private _allocSlot(): number {
+    // The engine seats CPU players on slots the transport never sees. Handing a
+    // joiner one of those strands them: the C join driver discards seat requests
+    // for occupied slots, so the guest waits in the lobby forever (live-reported
+    // via ?join= into a bot match). Ask the engine which seats bots hold and skip
+    // them; the engine yields a bot seat separately once the human is in.
+    let botMask = 0;
+    if (typeof window !== "undefined") {
+      const mod = (window as unknown as { Module?: { ccall?: (...a: unknown[]) => unknown } }).Module;
+      try { botMask = ((mod?.ccall?.("Net_GetBotMask", "number", [], []) as number) ?? 0) | 0; } catch { botMask = 0; }
+    }
     const used = new Set(this.slots.values());
-    for (let s = 1; s < 64; s++) if (!used.has(s)) return s;
+    for (let s = 1; s < 64; s++) if (!used.has(s) && !(botMask & (1 << s))) return s;
     return this.slots.size + 1;
   }
 
@@ -958,6 +980,14 @@ function wireInEngineMenu(): void {
     }
   };
   const setStatus = (s: string): void => call("NetMenu_SetStatus", ["string"], [s]);
+  // Mirror every status to the page (index.html's ?join= banner listens): the
+  // in-menu status line is invisible from the main menu, which made every join
+  // failure look like "the link does nothing".
+  const emitPageStatus = (s: string): void => {
+    try {
+      if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("duke-net-status", { detail: s }));
+    } catch { /* page without CustomEvent: nothing to show */ }
+  };
   const fail = (e: unknown, what: string): void => setStatus("!" + ((e as Error)?.message || what));
 
   // Fingerprint the loaded GRP the first time we host/join/browse. Nothing else
@@ -988,8 +1018,8 @@ function wireInEngineMenu(): void {
 
   let lastRows: LobbyRow[] = [];
   dukeNet.on({
-    onStatus: (s) => setStatus(s),
-    onError: (s) => setStatus("!" + s),
+    onStatus: (s) => { setStatus(s); emitPageStatus(s); },
+    onError: (s) => { setStatus("!" + s); emitPageStatus("!" + s); },
     onLobby: (rows) => {
       lastRows = rows;
       call("NetMenu_SetLobby", ["string"], [JSON.stringify(rows.map(rowForMenu))]);

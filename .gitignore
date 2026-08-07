@@ -99,3 +99,4 @@ project.xcworkspace/
 
 # Local test harness pages
 /boot-menu.html
+.claude/

@@ -300,14 +300,43 @@
     var isBot = qs.get('bot') === '1';
     if (!code && !isBot) return;
     var name = qs.get('name') || ('Link' + Math.floor(Math.random() * 900 + 100));
+    // The join takes seconds (relay lookup + WebRTC dial) and used to give NO
+    // feedback -- a failure looked like "the link does nothing" (live-reported
+    // twice). Reuse the boot loader as a status banner: every net-layer status
+    // lands on it, errors stay visible, and lookup errors retry a few times.
+    var banner = function (text) {
+      statusEl.textContent = text;
+      hidden = false; loaderEl.style.display = ''; loaderEl.classList.remove('hidden');
+    };
+    var joinTries = 0;
+    var joined = false;
+    window.addEventListener('duke-net-status', function (ev) {
+      if (!code || joined) return;
+      var s = String(ev.detail || '');
+      if (/^Joined|^In game/i.test(s)) { joined = true; hideLoader(); return; }
+      if (s.charAt(0) === '!') {
+        console.error('[join] ' + s);
+        if (++joinTries <= 3) {
+          banner('Join failed (' + s.slice(1) + ') — retrying ' + joinTries + '/3…');
+          setTimeout(function () { try { window.NetMenu.joinCode(code, name); } catch (e) { banner('Join error: ' + e); } }, 4000);
+        } else {
+          banner('Could not join ' + code + ': ' + s.slice(1));
+        }
+        return;
+      }
+      banner(s);
+    });
     var tries = 0;
     var t = setInterval(function () {
-      if (++tries > 240) return clearInterval(t);
+      if (++tries > 240) { clearInterval(t); if (code) banner('Join never started: the net layer did not come up (hard-refresh?)'); return; }
       if (!started) return;
       if (code && !(window.NetMenu && window.NetMenu.joinCode)) return;
       clearInterval(t);
-      if (isBot) { try { Module.ccall('Web_SetLocalBot', null, ['number'], [1]); } catch (e) {} }
-      if (code) { try { window.NetMenu.joinCode(code, name); } catch (e) {} }
+      if (isBot) { try { Module.ccall('Web_SetLocalBot', null, ['number'], [1]); } catch (e) { console.error('[join] bot arm failed', e); } }
+      if (code) {
+        banner('Joining match ' + code + '…');
+        try { window.NetMenu.joinCode(code, name); } catch (e) { console.error('[join]', e); banner('Join error: ' + e); }
+      }
     }, 500);
   })();
   new MutationObserver(fitCanvas).observe(document.getElementById('canvas'),

@@ -12,6 +12,12 @@
 #include "clip.h"
 #include "engine_priv.h"
 #include "microprofile.h"
+#ifdef __EMSCRIPTEN__
+# include <emscripten.h>
+// Late-join wedge forensics: armed (set to a small budget) by the netcode at a
+// joiner's seat; clipsprite_initindex dumps its inputs until it runs out.
+int32_t g_clipLogBudget;
+#endif
 
 static int16_t clipnum;
 static linetype clipit[MAXCLIPNUM];
@@ -546,6 +552,12 @@ int32_t engineLoadClipMaps(void)
 
 int clipshape_idx_for_sprite(uspriteptr_t const curspr, int curidx)
 {
+     // Corrupt slot (possible in a divergent netgame world): out-of-range
+     // picnum would read past pictoidx[] and fabricate clip data; treating it
+     // as "no clip shape" makes every walker skip it cleanly.
+     if ((unsigned)curspr->picnum >= MAXTILES)
+         return -1;
+
      // per-sprite init
      curidx = (curidx < 0) ? pictoidx[curspr->picnum] : clipinfo[curidx].next;
 
@@ -631,6 +643,22 @@ static inline void addclipsect(int const sectnum)
 #ifdef HAVE_CLIPSHAPE_FEATURE
 int32_t clipsprite_try(uspriteptr_t const spr, int32_t xmin, int32_t ymin, int32_t xmax, int32_t ymax)
 {
+    // A corrupt sprite (stray slot in a divergent netgame world) must never
+    // become a clip candidate: pictoidx[] is sized MAXTILES, and indexing it
+    // with a garbage picnum reads past the table and fabricates clip data
+    // (live-reported: late joiner hard-looped the clip walker on pic 31073).
+    if ((unsigned)spr->picnum >= MAXTILES || (unsigned)spr->sectnum >= MAXSECTORS)
+    {
+#ifdef __EMSCRIPTEN__
+        if (g_clipLogBudget > 0)
+        {
+            g_clipLogBudget--;
+            EM_ASM({ console.log('[clip] GARBAGE sprite slot=' + $0 + ' pic=' + $1 + ' sect=' + $2 + ' stat=' + $3 + ' owner=' + $4); },
+                   (int32_t)(spr - (uspritetype *)sprite), spr->picnum, spr->sectnum, spr->statnum, spr->owner);
+        }
+#endif
+        return 0;
+    }
     // try and see whether this sprite's picnum has sector-like clipping data
     int32_t i = pictoidx[spr->picnum];
     // handle sector-like floor sprites separately
@@ -683,6 +711,16 @@ int32_t clipsprite_initindex(int32_t curidx, uspriteptr_t const curspr, int32_t 
 
     const int32_t rotang = (curspr->ang - sector[j].CM_ANG)&2047;
     const int32_t dorot = !CM_NOROTS(j);
+
+#ifdef __EMSCRIPTEN__
+    if (g_clipLogBudget > 0)
+    {
+        g_clipLogBudget--;
+        EM_ASM({ console.log('[clip] idx=' + $0 + ' pic=' + $1 + ' rep=' + $2 + 'x' + $3 + ' spr@=' + $4 + ' cmrep=' + $5 + 'x' + $6 + ' q=' + $7 + '..' + $8 + ' j=' + $9); },
+               curidx, curspr->picnum, curspr->xrepeat, curspr->yrepeat, curspr->sectnum,
+               tempint1, tempint2, clipinfo[curidx].qbeg, clipinfo[curidx].qend, j);
+    }
+#endif
 
     if ((curspr->cstat&CSTAT_SPRITE_ALIGNMENT)!=CSTAT_SPRITE_ALIGNMENT_FLOOR)  // face/wall sprite
     {
@@ -1551,6 +1589,17 @@ int32_t clipmove(vec3_t * const pos, int16_t * const sectnum, int32_t xvect, int
             }
 
             clipsprite_initindex(clipshapeidx, curspr, &clipsectcnt, pos);
+
+            if (clipsectnum == 0)
+            {
+                // Degenerate proxy: no clip sector contains the query point,
+                // so there is nothing to clip against. Without this skip the
+                // walker re-inits the SAME sprite forever -- the sector queue
+                // it just zeroed stays empty (live-reported main-thread hang
+                // on late joiners whose world carried a stray clip candidate).
+                clipspritecnt++;
+                continue;
+            }
         }
 #endif
 
@@ -2075,6 +2124,14 @@ restart_grand:
             }
 
             clipsprite_initindex(curidx, curspr, &clipsectcnt, pos);
+
+            if (clipsectnum == 0)
+            {
+                // Degenerate proxy adds no sectors: skip it or loop forever
+                // (see the identical guard in clipmove's walker).
+                clipspritecnt++;
+                continue;
+            }
 
             for (bssize_t i=0; i<clipsectnum; i++)
             {
@@ -2672,6 +2729,20 @@ static void hitscan_sprite(const vec3_t *sv, int16_t spriteClipSector, int32_t v
                 continue;
 
 #ifdef HAVE_CLIPSHAPE_FEATURE
+        // Corrupt slot: neither a clip candidate (OOB pictoidx read would
+        // fabricate one) nor hit-testable -- skip it entirely.
+        if ((unsigned)spr->picnum >= MAXTILES || (unsigned)spr->sectnum >= MAXSECTORS)
+        {
+#ifdef __EMSCRIPTEN__
+            if (g_clipLogBudget > 0)
+            {
+                g_clipLogBudget--;
+                EM_ASM({ console.log('[clip] GARBAGE2 slot=' + $0 + ' pic=' + $1 + ' sect=' + $2 + ' stat=' + $3); },
+                       z, spr->picnum, spr->sectnum, spr->statnum);
+            }
+#endif
+            continue;
+        }
         // try and see whether this sprite's picnum has sector-like clipping data
         i = pictoidx[spr->picnum];
         // handle sector-like floor sprites separately
@@ -2895,6 +2966,14 @@ int32_t hitscan(const vec3_t *sv, int16_t sectnum, int32_t vx, int32_t vy, int32
             clipsprite_initindex(curidx, curspr, &i, sv);  // &i is dummy
             tempshortnum = (int16_t)clipsectnum;
             tempshortcnt = 0;
+
+            if (tempshortnum == 0)
+            {
+                // Degenerate proxy adds no sectors: skip it or loop forever
+                // (see the identical guard in clipmove's walker).
+                clipspritecnt++;
+                continue;
+            }
         }
 #endif
         dasector = clipsectorlist[tempshortcnt];

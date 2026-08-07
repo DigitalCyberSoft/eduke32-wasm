@@ -304,6 +304,12 @@ export class Match {
         if (r.createdAt > bestAt) { best = info; bestAt = r.createdAt; }
       }
       if (best && best.status === "closed") return null;   // host said goodbye
+      // Freshness gate: a live host republishes the ticket every refresh
+      // interval, so the code stays valid EXACTLY as long as the match lives
+      // (lobby, in-game, late join -- all of it). A ticket nobody refreshed
+      // for minutes means the host died without saying goodbye; fail the
+      // lookup fast instead of stranding the joiner against a ghost room.
+      if (best && bestAt > 0 && Math.floor(Date.now() / 1000) - bestAt > 90) return null;
       return best;
     } catch {
       return null;

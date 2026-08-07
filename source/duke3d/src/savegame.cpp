@@ -25,6 +25,12 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "prlights.h"
 #include "md4.h"
 #include "savegame.h"
+#ifdef NETDUKE32
+# include "oldnet.h"   // g_netJoinCatchup: cold-process late-join level entry
+#endif
+#ifdef __EMSCRIPTEN__
+# include <emscripten.h>
+#endif
 
 #include "vfs.h"
 
@@ -693,11 +699,27 @@ int32_t G_LoadPlayer(savebrief_t & sv)
     savehead_t h;
     int status = sv_loadheader(fil, 0, &h);
 
-    if (status < 0 || h.numplayers != ud.multimode)
+    // LATE-JOIN/HEAL: the header pins the SESSION size (ud.multimode never
+    // shrinks mid-match), while the receiver derived its multimode from the
+    // LIVE seat mask -- legitimately smaller after a mid-game drop (a CPU
+    // seat yielding to a joiner, a quit). Membership truth rides the stream's
+    // seat/gone machinery, so the count gate must not refuse the stream's own
+    // snapshot. (Live-caught: refused load -> joiner seated into a world that
+    // was never loaded -> garbage sprites, hard-looped clip walkers.)
+    int playersMismatch = (h.numplayers != ud.multimode);
+#ifdef NETDUKE32
+    if (g_netJoinCatchup && status >= 0)
+        playersMismatch = 0;
+#endif
+    if (status < 0 || playersMismatch)
     {
+#ifdef __EMSCRIPTEN__
+        EM_ASM({ console.log('[eng] LOAD REFUSED status=' + $0 + ' h.np=' + $1 + ' multimode=' + $2); },
+               status, h.numplayers, ud.multimode);
+#endif
         if (status == -4 || status == -3 || status == 1)
             P_DoQuote(QUOTE_SAVE_BAD_VERSION, g_player[myconnectindex].ps);
-        else if (h.numplayers != ud.multimode)
+        else if (playersMismatch)
             P_DoQuote(QUOTE_SAVE_BAD_PLAYERS, g_player[myconnectindex].ps);
 
         kclose(fil);
@@ -754,12 +776,37 @@ int32_t G_LoadPlayer(savebrief_t & sv)
 
     if (status == 2)
         G_NewGame_EnterLevel();
-    else if ((status = sv_loadsnapshot(fil, 0, &h)))  // read the rest...
+    else
     {
-        // in theory, we could load into an initial dump first and trivially
-        // recover if things go wrong...
-        Bsprintf(tempbuf, "Unable to load %s: fatal error %d.", sv.path, status);
-        G_GameExit(tempbuf);
+#ifdef NETDUKE32
+        // LATE-JOIN, COLD PROCESS: the classic snapshot stream assumes the
+        // level is RESIDENT (warm veterans, heal targets -- the proven legs).
+        // A joiner that booted straight into ?join= has never entered a map:
+        // parsing over the un-entered world misaligned the stream and poured
+        // savegame text into sprite[] (live-caught: garbage clip candidates,
+        // hard-looped clip walkers). Enter the level normally first -- the
+        // catchup flag already bypasses every barrier on this path -- and let
+        // the snapshot then overwrite the fresh world like any reload.
+        if (g_netJoinCatchup
+            && (g_player[myconnectindex].ps == NULL || !(g_player[myconnectindex].ps->gm & MODE_GAME)))
+        {
+            // MODE_GAME, not numsectors: an attract demo may have loaded a map
+            // into this process without it ever ENTERING a level -- that world
+            // is just as unparseable-over as a truly empty one.
+            initprintf("net: cold-process join: entering the level first\n");
+#ifdef __EMSCRIPTEN__
+            EM_ASM({ console.log('[eng] cold-process join: entering level before snapshot'); });
+#endif
+            G_NewGame_EnterLevel();
+        }
+#endif
+        if ((status = sv_loadsnapshot(fil, 0, &h)))  // read the rest...
+        {
+            // in theory, we could load into an initial dump first and trivially
+            // recover if things go wrong...
+            Bsprintf(tempbuf, "Unable to load %s: fatal error %d.", sv.path, status);
+            G_GameExit(tempbuf);
+        }
     }
 
     sv_postudload();  // ud.m_XXX = ud.XXX

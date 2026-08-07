@@ -41,6 +41,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #else
 # include "network.h"
 #endif
+#ifdef __EMSCRIPTEN__
+# include <emscripten.h>
+#endif
 #include "osdcmds.h"
 #include "osdfuncs.h"
 #include "palette.h"
@@ -7202,13 +7205,30 @@ MAIN_LOOP_RESTART:
 
         extern int32_t g_netGateC1, g_netGateC2, g_mainLoopIter;
         g_mainLoopIter++;
+#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+        // Wedge forensics (live late-join hang): a per-2s heartbeat with the
+        // clock pair + stream cursors, and one-shot spin flags in each loop
+        // that can starve the browser. Console lines still ship while the
+        // main thread spins, so the LAST line names the runaway loop.
+        if (numplayers > 1 && (g_mainLoopIter & 127) == 0)
+            EM_ASM({ console.log('[alive] tc=' + $0 + ' otc=' + $1 + ' plc=' + $2 + ' end=' + $3 + ' sh=' + $4 + ' bj=' + $5); },
+                   (int32_t)totalclock, (int32_t)ototalclock, movefifoplc,
+                   g_player[myconnectindex].movefifoend, g_netSampleHead, bufferjitter);
+#endif
         if (((g_netClient || g_netServer) || (myplayer.gm & (MODE_MENU|MODE_DEMO)) == 0) && (int32_t)(totalclock - ototalclock) >= TICSPERFRAME)
         {
+            int spinN = 0;
+            (void)spinN;
             do
             {
                 do
                 {
                     g_netGateC1++;
+#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+                    if (++spinN == 400)
+                        EM_ASM({ console.log('[spin] mainloop tc=' + $0 + ' otc=' + $1 + ' plc=' + $2 + ' r2s=' + $3); },
+                               (int32_t)totalclock, (int32_t)ototalclock, movefifoplc, ready2send);
+#endif
                     if (g_frameJustDrawn && g_networkMode != NET_DEDICATED_SERVER && (myplayer.gm & (MODE_MENU | MODE_DEMO)) == 0)
                         dukeFillInputForTic();
 
@@ -7575,8 +7595,15 @@ int G_MoveLoop(void)
     else
         bufferjitter = 0;
 
+    int mlSpin = 0;
+    (void)mlSpin;
     while ((g_player[myconnectindex].movefifoend - movefifoplc) > bufferjitter)
     {
+#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+        if (++mlSpin == 400)
+            EM_ASM({ console.log('[spin] moveloop myend=' + $0 + ' plc=' + $1 + ' bj=' + $2); },
+                   g_player[myconnectindex].movefifoend, movefifoplc, bufferjitter);
+#endif
         if (numplayers > 1)
         {
             // Don't process a tic until every peer has sent their input for it.
