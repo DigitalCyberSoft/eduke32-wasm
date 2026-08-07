@@ -1383,6 +1383,14 @@ int A_IncurDamage(int const spriteNum)
 #endif
         pSprite->extra -= pActor->htextra;
 
+#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+        // Bot-combat forensics: the REAL player-damage application (bullet
+        // damage lands here, not via P_IncurDamage/extra_extra8).
+        if (numplayers > 1)
+            EM_ASM({ console.log('[pdmg] victim=' + $0 + ' dmg=' + $1 + ' hp=' + $2 + ' srcpic=' + $3); },
+                   playerNum, pActor->htextra, pSprite->extra, pActor->htpicnum);
+#endif
+
         if (pActor->htowner >= 0 && pSprite->extra <= 0 && STANDALONE_EVAL(true, pActor->htpicnum != FREEZEBLAST))
         {
             int const damageOwner = pActor->htowner;

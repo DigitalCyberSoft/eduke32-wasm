@@ -2412,6 +2412,32 @@ extern "C" int Net_GetBotMask(void)
 // prediction replica initializing on the shadowed HOST player (live-reported
 // as every ?join= freezing seconds after the seat). The transport ships the
 // host's table alongside the snapshot; identical level data on every peer.
+// TEST HOOKS (aim harness): nudge the local VIEW exactly like a mouse frame
+// would, and read the view-vs-sim direction gap. The closed-loop staging must
+// drive the sim onto the view within a couple of tics; the probe asserts it.
+extern "C" void Web_TestAim(int davel, int dhorz)
+{
+    fix16_t a = fix16_sadd(predictedPlayer.q16ang, fix16_from_int(davel));
+    while (a < 0)          a = fix16_sadd(a, F16(2048));
+    while (a >= F16(2048)) a = fix16_ssub(a, F16(2048));
+    predictedPlayer.q16ang   = a;
+    predictedPlayer.q16horiz = fix16_clamp(fix16_sadd(predictedPlayer.q16horiz, fix16_from_int(dhorz)),
+                                           F16(HORIZ_MIN), F16(HORIZ_MAX));
+}
+extern "C" int Web_AimGapAng(void)
+{
+    if (g_player[myconnectindex].ps == NULL) return 0;
+    fix16_t d = fix16_ssub(predictedPlayer.q16ang, g_player[myconnectindex].ps->q16ang);
+    while (d > F16(1024))  d = fix16_ssub(d, F16(2048));
+    while (d < -F16(1024)) d = fix16_sadd(d, F16(2048));
+    return fix16_to_int(d);
+}
+extern "C" int Web_AimGapHoriz(void)
+{
+    if (g_player[myconnectindex].ps == NULL) return 0;
+    return fix16_to_int(fix16_ssub(predictedPlayer.q16horiz, g_player[myconnectindex].ps->q16horiz));
+}
+
 extern "C" const char *Net_GetSpawnTable(void)
 {
     static char buf[MAXPLAYERS * 48 + 8];
