@@ -899,6 +899,20 @@ void P_ResetWeapons(int playerNum)
 
     p.ammo_amount[PISTOL_WEAPON] = min<int16_t>(p.max_ammo_amount[PISTOL_WEAPON], 48);
 
+#ifdef NETDUKE32
+    // ARENA LOADOUT: multiplayer spawns carry a shotgun. Pistol-only DM was
+    // measured unplayable (a kill needs ~17 pistol hits; bots managed 2 body
+    // hits in 10 minutes -- and humans fared little better). Deterministic:
+    // every sim runs this same reset for every spawn.
+    if (numplayers > 1)
+    {
+        p.gotweapon |= (1 << SHOTGUN_WEAPON);
+        p.ammo_amount[SHOTGUN_WEAPON] = min<int16_t>(p.max_ammo_amount[SHOTGUN_WEAPON], 20);
+        p.curr_weapon = SHOTGUN_WEAPON;
+        p.kickback_pic = PWEAPON(playerNum, p.curr_weapon, TotalTime);
+    }
+#endif
+
     VM_OnEvent(EVENT_RESETWEAPONS, p.i, playerNum);
 }
 

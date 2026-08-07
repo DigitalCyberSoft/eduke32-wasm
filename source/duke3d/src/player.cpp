@@ -5161,6 +5161,8 @@ void P_ProcessInput(int playerNum)
     // every sim -- pure function of replicated state, no divergence.
     if (numplayers > 1 && pPlayer->ammo_amount[PISTOL_WEAPON] < 12)
         pPlayer->ammo_amount[PISTOL_WEAPON] = 12;
+    if (numplayers > 1 && pPlayer->ammo_amount[SHOTGUN_WEAPON] < 6)
+        pPlayer->ammo_amount[SHOTGUN_WEAPON] = 6;
 #endif
 
     ++pPlayer->player_par;

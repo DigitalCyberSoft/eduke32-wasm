@@ -1034,7 +1034,7 @@ ifeq ($(RENDERTYPE),SDL)
         LINKERFLAGS += -sEXPORTED_RUNTIME_METHODS=FS,callMain,ccall,cwrap
         ifeq (1,$(NETDUKE32))
             LINKERFLAGS += --js-library platform/emscripten/net/seam_library.js
-            LINKERFLAGS += -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_Net_ReceiveFrame,_Net_PeerEvent,_Net_SetLocalIndex,_NetMenu_SetStatus,_NetMenu_SetLobby,_NetMenu_SetRoster,_NetMenu_SetGrpList,_NetMenu_SetProgress,_NetMenu_OnJoined,_Web_SetMute,_Net_SnapshotReady,_Web_ForceDesync,_Web_SetPredictMode,_Web_SetForensics,_Web_SetLocalBot,_Net_GetBotMask,_Net_GetSpawnTable,_Net_SetSpawnTable,_Web_TestAim,_Web_AimGapAng,_Web_AimGapHoriz
+            LINKERFLAGS += -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_Net_ReceiveFrame,_Net_PeerEvent,_Net_SetLocalIndex,_NetMenu_SetStatus,_NetMenu_SetLobby,_NetMenu_SetRoster,_NetMenu_SetGrpList,_NetMenu_SetProgress,_NetMenu_OnJoined,_Web_SetMute,_Net_SnapshotReady,_Web_ForceDesync,_Web_SetPredictMode,_Web_SetForensics,_Web_SetLocalBot,_Net_GetBotMask,_Net_GetSpawnTable,_Net_SetSpawnTable,_Web_TestAim,_Web_AimGapAng,_Web_AimGapHoriz,_Web_AimAtNearestPic,_Web_TestFire,_Web_PicAlive
             LINKERFLAGS += --profiling-funcs
         endif
         ifneq (0,$(EM_SINGLE_FILE))

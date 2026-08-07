@@ -560,7 +560,7 @@ static input_t Bot_GetInput(int k)
         // 90s soak, position spread 220 map units) -- nobody ever roams the
         // map to find the humans.
         s_botWasDead[k]  = 0;
-        s_botSpawnRoam[k] = (int16_t)(90 + (Bot_Rnd() % 120));
+        s_botSpawnRoam[k] = (int16_t)(40 + (Bot_Rnd() % 60));
         s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
     }
 
@@ -673,7 +673,7 @@ static input_t Bot_GetInput(int k)
         // handles every wall it meets on the way.
         wantAng = getangle(tp->pos.x - ps->pos.x, tp->pos.y - ps->pos.y);
         if (!seesTarget)
-            wantAng = (wantAng + (int)(Bot_Rnd() % 257) - 128) & 2047;
+            wantAng = (wantAng + (int)(Bot_Rnd() % 129) - 64) & 2047;
     }
     else
         wantAng = s_botWanderAng[k];
@@ -1162,6 +1162,11 @@ void Net_HandleInput(void)
                 staged.q16avel = fix16_clamp(da, -F16(512), F16(512));
                 staged.q16horz = fix16_clamp(fix16_ssub(predictedPlayer.q16horiz, wh),
                                              -F16(127), F16(127));
+            }
+            {
+                extern int32_t g_testFire;   // hit-registration harness trigger
+                if (g_testFire)
+                    staged.bits |= BIT(SK_FIRE);
             }
             g_netSendRing[g_netSampleHead & (MOVEFIFOSIZ - 1)] = staged;
             g_netSampleHead++;
@@ -2436,6 +2441,42 @@ extern "C" int Web_AimGapHoriz(void)
 {
     if (g_player[myconnectindex].ps == NULL) return 0;
     return fix16_to_int(fix16_ssub(predictedPlayer.q16horiz, g_player[myconnectindex].ps->q16horiz));
+}
+// TEST HOOKS (hit-registration harness): point the VIEW at the nearest sprite
+// of a picnum, hold the trigger through the real input pipeline, and check
+// the victim's fate in the consumed sim. With closed-loop aim staged, the
+// shot every peer computes comes from this view -- a dead prop here plus a
+// clean sync verdict IS cross-peer registration.
+int32_t g_testFire;
+extern "C" int Web_AimAtNearestPic(int pic)
+{
+    auto const ps = g_player[myconnectindex].ps;
+    if (ps == NULL || (unsigned)ps->cursectnum >= (unsigned)numsectors) return -1;
+    int best = -1; int32_t bestd = INT32_MAX;
+    for (int i = 0; i < MAXSPRITES; i++)
+    {
+        if (sprite[i].picnum != pic || sprite[i].statnum >= MAXSTATUS || sprite[i].xrepeat == 0)
+            continue;
+        if ((unsigned)sprite[i].sectnum >= (unsigned)numsectors)
+            continue;
+        int32_t const d = klabs(sprite[i].x - ps->pos.x) + klabs(sprite[i].y - ps->pos.y);
+        if (d < bestd && cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
+                                sprite[i].x, sprite[i].y, sprite[i].z - 2048, sprite[i].sectnum))
+            { bestd = d; best = i; }
+    }
+    if (best < 0) return -1;
+    int32_t const dist = max(bestd, 64);
+    predictedPlayer.q16ang   = fix16_from_int(getangle(sprite[best].x - ps->pos.x, sprite[best].y - ps->pos.y));
+    int32_t const dz = (sprite[best].z - 2048) - ps->pos.z;
+    predictedPlayer.q16horiz = fix16_clamp(fix16_from_int(100 - (int)(((int64_t)dz * 16) / dist)),
+                                           F16(HORIZ_MIN), F16(HORIZ_MAX));
+    return best;
+}
+extern "C" void Web_TestFire(int on) { g_testFire = on; }
+extern "C" int Web_PicAlive(int idx, int pic)
+{
+    if ((unsigned)idx >= MAXSPRITES) return 0;
+    return (sprite[idx].picnum == pic && sprite[idx].xrepeat > 0 && sprite[idx].statnum < MAXSTATUS) ? 1 : 0;
 }
 
 extern "C" const char *Net_GetSpawnTable(void)
