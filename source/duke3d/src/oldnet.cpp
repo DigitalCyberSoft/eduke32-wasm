@@ -542,6 +542,7 @@ static int16_t s_botTrapTics[MAXPLAYERS];    // zero-net-displacement streak (ha
 static vec2_t  s_botTrapAnchor[MAXPLAYERS];
 static int16_t s_botTrapCool[MAXPLAYERS];    // volley cooldown while trapped
 static int16_t s_botTrapDir[MAXPLAYERS];     // last free-move heading (escape axis)
+static int8_t  s_botTrapRounds[MAXPLAYERS];  // completed escape ladders; 3+ = dormant
 
 // Sector-graph navigation: BFS over wall portals from the bot's sector to the
 // target's, return the FIRST portal's midpoint to steer at. Build maps are a
@@ -996,6 +997,8 @@ static input_t Bot_GetInput(int k)
                                                    ps->pos.y - s_botTrapAnchor[k].y);
             s_botTrapTics[k]   = 0;
             s_botTrapAnchor[k] = ps->pos.xy;
+            if (trapDisp >= 512)
+                s_botTrapRounds[k] = 0;   // genuinely free again
         }
         else if ((in.fvel || in.svel) && ++s_botTrapTics[k] > 104)
         {
@@ -1007,7 +1010,11 @@ static input_t Bot_GetInput(int k)
             // nothing opens, walk away.
             in.bits |= BIT(SK_CROUCH);
             in.bits &= ~BIT(SK_JUMP);
-            if (s_botTrapCool[k] == 0)
+            // After 3 full escape ladders with no displacement the trap is
+            // hopeless (the vent pocket defeats walk/jump/crouch/volleys):
+            // go DORMANT -- no more periodic gunfire from the duct all match.
+            // The bot still counts as trapped for the join-yield preference.
+            if (s_botTrapRounds[k] < 3 && s_botTrapCool[k] == 0)
             {
                 s_botBreakFire[k] = 8;
                 s_botTrapCool[k]  = 52;
@@ -1015,6 +1022,8 @@ static input_t Bot_GetInput(int k)
             }
             if (s_botTrapTics[k] > 390)
             {
+                if (s_botTrapRounds[k] < 3)
+                    s_botTrapRounds[k]++;
                 s_botTargetHold[k] = 1000;
                 s_botSpawnRoam[k]  = 300;
                 s_botTrapTics[k]   = 0;
@@ -3231,13 +3240,28 @@ void Net_HostJoinFlow(void)
                     if (g_player[i].connected)
                         total++;
                 if (total > g_netMinPlayers)
+                {
+                    // Prefer sacrificing a HARD-TRAPPED bot (the E1L1 vent
+                    // spawn pins one deterministically): the joining human
+                    // inherits the functional roster, not the ghost.
+                    int pick = -1;
                     for (int i = 15; i >= 0; i--)
                         if ((g_netBotMask & (1 << i)) && g_player[i].connected)
                         {
-                            initprintf("net: CPU seat %d yields to the joining player\n", i);
-                            Net_ScheduleDrop(i, "seat yielded to a joining player");
-                            break;
+                            if (pick < 0)
+                                pick = i;
+                            if (s_botTrapTics[i] > 104 || s_botTrapRounds[i] > 0)
+                            {
+                                pick = i;
+                                break;
+                            }
                         }
+                    if (pick >= 0)
+                    {
+                        initprintf("net: CPU seat %d yields to the joining player\n", pick);
+                        Net_ScheduleDrop(pick, "seat yielded to a joining player");
+                    }
+                }
             }
             return;
         }
