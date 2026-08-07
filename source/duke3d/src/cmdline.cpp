@@ -524,6 +524,20 @@ void G_CheckCommandLine(int32_t argc, char const * const * argv)
                     i++;
                     continue;
                 }
+                if (!Bstrcasecmp(c+1, "join"))
+                {
+                    // -join CODE: auto-join a multiplayer match on boot (short
+                    // 12-char relay code or a full invite blob). Implies -nologo.
+                    if (argc > i+1)
+                    {
+                        extern char g_netAutoJoin[1024];
+                        Bstrncpyz(g_netAutoJoin, argv[i+1], sizeof(g_netAutoJoin));
+                        g_noLogo = 1;
+                        i++;
+                    }
+                    i++;
+                    continue;
+                }
                 if (!Bstrcasecmp(c+1, "rotatesprite-no-widescreen"))
                 {
                     g_rotatespriteNoWidescreen = 1;

@@ -372,7 +372,17 @@ class DukeNet {
 
   async join(target: MatchInfo | string): Promise<void> {
     if (!this.localGrp) throw new Error("join: set the local GRP fingerprint first");
-    const info = typeof target === "string" ? Match.parseInvite(extractInviteCode(target)) : target;
+    let info: MatchInfo | null;
+    if (typeof target === "string") {
+      const code = extractInviteCode(target);
+      info = Match.parseInvite(code);            // legacy full-record blob
+      if (!info && Match.looksLikeShortCode(code)) {
+        this.events.onStatus?.("Looking up match…");
+        info = await Match.resolveShortCode(code); // 12-char relay ticket
+      }
+    } else {
+      info = target;
+    }
     if (!info) {
       this.events.onError?.("Invalid invite code");
       return;

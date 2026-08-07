@@ -94,6 +94,7 @@ int32_t g_netLocalBot;       // TEST MODE: this peer's OWN input comes from the
                              // bot brain through the full human pipeline --
                              // sampling, staging, S2M, prediction. On the wire
                              // it is indistinguishable from a human player.
+char    g_netAutoJoin[1024]; // -join CODE: fired once by the menu frame loop
 
 // Transport seam. The netcode never talks to enet/UDP/sockets directly; every
 // outgoing packet is classified onto a logical channel + reliability here and

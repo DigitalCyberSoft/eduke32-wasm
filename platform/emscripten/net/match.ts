@@ -22,7 +22,7 @@ import {
   PROTOCOL_VERSION,
 } from "./netconfig";
 import { DEVICE_ID, uid } from "./identity";
-import { ensureRelays, generateRoomKey, publishReplaceable, subscribeReplaceable } from "./nostr";
+import { ensureRelays, generateRoomKey, publishReplaceable, queryReplaceable, subscribeReplaceable } from "./nostr";
 import { subscribeSignaling, sendPresence } from "./signaling";
 import { PeerManager, type ConnState } from "./peer";
 import type { GrpFingerprint } from "./grp";
@@ -115,6 +115,10 @@ export class Match {
   private _unsubSignaling: (() => void) | null = null;
   private _status: MatchStatus = "open";
   private _announceScheduled = false;
+  /** Short invite code (host only): the ONLY thing a joiner needs. The full
+   *  MatchInfo travels as an encrypted relay ticket keyed by this code. */
+  shortCode: string | null = null;
+  private _ticketTimer: ReturnType<typeof setInterval> | null = null;
 
   private constructor(init: MatchInit) {
     this.role = init.role;
@@ -151,6 +155,7 @@ export class Match {
       relays,
     });
     await m._open();
+    await m.startTicket();
     return m;
   }
 
@@ -170,6 +175,7 @@ export class Match {
       relays,
     });
     await m._open();
+    await m.startTicket();
     await m._announce();
     m._announceTimer = setInterval(() => void m._announce(), ANNOUNCE_INTERVAL_MS);
     return m;
@@ -215,7 +221,15 @@ export class Match {
     };
   }
 
+  /** SHORT invite code (12 chars). The full record rides the relays as an
+   *  encrypted ticket only someone holding the code can locate and decrypt. */
   inviteCode(): string {
+    return this.shortCode ?? this.inviteBlob();
+  }
+
+  /** Legacy full-record invite (base64url MatchInfo). Kept as a fallback and
+   *  for offline/relayless flows; parseInvite still accepts it. */
+  inviteBlob(): string {
     return btoa(JSON.stringify(this.info())).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
 
@@ -225,6 +239,72 @@ export class Match {
       const info = JSON.parse(json) as MatchInfo;
       if (!info.roomKey || !info.matchId || !info.hostId || !info.grp) return null;
       return info;
+    } catch {
+      return null;
+    }
+  }
+
+  // ── Short-code join tickets ────────────────────────────────────────────────
+  // The 12-char code is the secret: everything derives from it. The ticket is
+  // a replaceable relay event whose AUTHOR keypair and AES key both come from
+  // SHA-256("djoin:"+code), so only a code-holder can find or read it. Same
+  // relay infrastructure as the public list -- nothing new to run.
+
+  static readonly SHORT_CODE_LEN = 12;
+
+  static normalizeShortCode(s: string): string {
+    return String(s).trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+  }
+
+  static looksLikeShortCode(s: string): boolean {
+    const n = Match.normalizeShortCode(s);
+    return n.length >= 8 && n.length <= 16 && !s.trim().startsWith("{");
+  }
+
+  private static _newShortCode(): string {
+    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+    const raw = crypto.getRandomValues(new Uint8Array(Match.SHORT_CODE_LEN));
+    let out = "";
+    for (const b of raw) out += alphabet[b % alphabet.length];
+    return out;
+  }
+
+  private static async _ticketKey(code: string): Promise<string> {
+    const digest = await crypto.subtle.digest(
+      "SHA-256", new TextEncoder().encode("djoin:" + Match.normalizeShortCode(code)));
+    return btoa(String.fromCharCode(...new Uint8Array(digest)));
+  }
+
+  private async _publishTicket(info?: MatchInfo): Promise<void> {
+    if (!this.shortCode) return;
+    try {
+      await publishReplaceable(LOBBY_KIND, await Match._ticketKey(this.shortCode), "djoin",
+                               info ?? this.info(), this.relays);
+    } catch { /* relays flaky: the next interval retries */ }
+  }
+
+  /** Host: mint the code and keep the ticket fresh while the room lives. */
+  async startTicket(): Promise<void> {
+    if (this.role !== "host" || this.shortCode) return;
+    this.shortCode = Match._newShortCode();
+    await this._publishTicket();
+    this._ticketTimer = setInterval(() => void this._publishTicket(), ANNOUNCE_INTERVAL_MS);
+  }
+
+  /** Joiner: turn a short code back into the full MatchInfo via the relays. */
+  static async resolveShortCode(code: string, relays = activeRelays()): Promise<MatchInfo | null> {
+    try {
+      const recs = await queryReplaceable<MatchInfo>(LOBBY_KIND, await Match._ticketKey(code), relays);
+      let best: MatchInfo | null = null;
+      let bestAt = -1;
+      for (const r of recs) {
+        if (r.dTag !== "djoin" || !r.data) continue;
+        const info = r.data;
+        if (!info.roomKey || !info.matchId || !info.hostId || !info.grp) continue;
+        if (r.createdAt > bestAt) { best = info; bestAt = r.createdAt; }
+      }
+      if (best && best.status === "closed") return null;   // host said goodbye
+      return best;
     } catch {
       return null;
     }
@@ -399,12 +479,15 @@ export class Match {
     if (this._presenceTimer) clearInterval(this._presenceTimer);
     if (this._announceTimer) clearInterval(this._announceTimer);
     if (this._pruneTimer) clearInterval(this._pruneTimer);
+    if (this._ticketTimer) clearInterval(this._ticketTimer);
     this._unsubSignaling?.();
     this.peers.closeAll();
     if (this.isPublic) {
       this._status = "closed"; // dead room -> dropped from the public list NOW
       void this._announce();    // publish the final closed record instead of waiting the 60s TTL
     }
+    if (this.shortCode)
+      void this._publishTicket({ ...this.info(), status: "closed" }); // joiners get "gone", not a hang
   }
 }
 

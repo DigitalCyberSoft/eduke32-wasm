@@ -8968,6 +8968,22 @@ void M_DisplayMenus(void)
 
     Net_GetPackets();
 #ifdef NETMENU
+    // -join CODE (cmdline): fire the same path the Join-by-Code menu entry
+    // uses, once, as soon as the menu system is alive. Works with the 12-char
+    // relay codes and full invite blobs on both transports.
+    {
+        extern char g_netAutoJoin[1024];
+        static int s_autoJoinFired;
+        if (g_netAutoJoin[0] && !s_autoJoinFired && (int32_t)totalclock > 120 && numplayers <= 1)
+        {
+            s_autoJoinFired = 1;
+            Bstrncpyz(s_netJoinCode, g_netAutoJoin, sizeof(s_netJoinCode));
+            initprintf("net: -join firing (code %d chars)\n", (int)Bstrlen(s_netJoinCode));
+            netmenu_join_code();
+        }
+    }
+#endif
+#ifdef NETMENU
     // Match entry MUST live here, not in app_main's main loop: at the menu the engine
     // runs the attract-mode loop (G_PlaybackDemo), which calls M_DisplayMenus but never
     // reaches app_main's do-loop. So the native host launch AND the guest's deferred
