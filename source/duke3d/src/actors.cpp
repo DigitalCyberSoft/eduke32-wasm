@@ -1387,7 +1387,8 @@ int A_IncurDamage(int const spriteNum)
 #if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
         // Bot-combat forensics: the REAL player-damage application (bullet
         // damage lands here, not via P_IncurDamage/extra_extra8).
-        if (numplayers > 1)
+        extern int32_t g_netForensics;
+        if (g_netForensics && numplayers > 1)
             EM_ASM({ console.log('[pdmg] victim=' + $0 + ' dmg=' + $1 + ' hp=' + $2 + ' srcpic=' + $3); },
                    playerNum, pActor->htextra, pSprite->extra, pActor->htpicnum);
 #endif
@@ -4693,7 +4694,8 @@ ACTOR_STATIC void G_MoveActors(void)
             // (cats 13/14 flagged its EXPLOSION2 phase; every other category
             // stayed clean). Log the phase directly for the first ~2s so a
             // cross-peer diff names the tic the drift is born on.
-            if (numplayers > 1 && pData[0] <= 60 && (pData[0] & 7) == 1)
+            extern int32_t g_netForensics;
+            if (g_netForensics && numplayers > 1 && pData[0] <= 60 && (pData[0] & 7) == 1)
                 EM_ASM({ console.log('[eng] CAR pd=' + $0 + ' plc=' + $1 + ' pic=' + $2); },
                        pData[0], movefifoplc, pSprite->picnum);
 #endif

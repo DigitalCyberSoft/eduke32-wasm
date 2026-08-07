@@ -92,7 +92,8 @@ static void P_IncurDamage(DukePlayer_t * const pPlayer)
 
 #if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
     // Bot-combat forensics: prove hits land on players.
-    if (numplayers > 1 && (pPlayer->extra_extra8 >> 8) > 0)
+    extern int32_t g_netForensics;
+    if (g_netForensics && numplayers > 1 && (pPlayer->extra_extra8 >> 8) > 0)
         EM_ASM({ console.log('[hit] victim=' + $0 + ' dmg=' + $1 + ' hp=' + $2); },
                P_Get(pPlayer->i), pPlayer->extra_extra8 >> 8, sprite[pPlayer->i].extra);
 #endif
@@ -1226,7 +1227,8 @@ static int32_t A_ShootHardcoded(int spriteNum, int projecTile, int shootAng, vec
             // (wall / sprite+picnum / bare sector). 384 bot shots produced zero
             // player-damage events; this decides between "aim off" and
             // "players not hittable".
-            if (numplayers > 1)
+            extern int32_t g_netForensics;
+            if (g_netForensics && numplayers > 1)
             {
                 static int s_impN;
                 // Sprite hits are the rare decisive events: log them ALL
@@ -2095,7 +2097,8 @@ static void P_FireWeapon(int playerNum)
     }
 #if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
     // Bot-combat forensics: prove shots actually discharge (throttled).
-    if (numplayers > 1)
+    extern int32_t g_netForensics;
+    if (g_netForensics && numplayers > 1)
     {
         static int s_shotN;
         if ((++s_shotN & 7) == 0)
@@ -4170,7 +4173,8 @@ void P_FragPlayer(int playerNum)
 #if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
     // Kill telemetry: the bot-combat harness measures frag RATE from these
     // lines ("the bots can't kill each other" must be a number, not a vibe).
-    if (numplayers > 1)
+    extern int32_t g_netForensics;
+    if (g_netForensics && numplayers > 1)
         EM_ASM({ console.log('[frag] victim=' + $0 + ' killer=' + $1 + ' tic=' + $2); },
                playerNum, pPlayer->frag_ps, movefifoplc);
 #endif

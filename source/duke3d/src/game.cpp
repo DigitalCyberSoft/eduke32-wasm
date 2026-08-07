@@ -7210,7 +7210,8 @@ MAIN_LOOP_RESTART:
         // clock pair + stream cursors, and one-shot spin flags in each loop
         // that can starve the browser. Console lines still ship while the
         // main thread spins, so the LAST line names the runaway loop.
-        if (numplayers > 1 && (g_mainLoopIter & 127) == 0)
+        extern int32_t g_netForensics;
+        if (g_netForensics && numplayers > 1 && (g_mainLoopIter & 127) == 0)
             EM_ASM({ console.log('[alive] tc=' + $0 + ' otc=' + $1 + ' plc=' + $2 + ' end=' + $3 + ' sh=' + $4 + ' bj=' + $5); },
                    (int32_t)totalclock, (int32_t)ototalclock, movefifoplc,
                    g_player[myconnectindex].movefifoend, g_netSampleHead, bufferjitter);
