@@ -30,6 +30,10 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 #include "vfs.h"
 
+#ifdef __EMSCRIPTEN__
+# include <emscripten.h>   // [spawn] placement-flow forensics
+#endif
+
 static uint8_t precachehightile[2][bitmap_size(MAXTILES)];
 static int32_t g_precacheCount;
 
@@ -652,6 +656,14 @@ void P_MoveToRandomSpawnPoint(int playerNum)
         }
     }
 
+#ifdef __EMSCRIPTEN__
+    {
+        extern int32_t g_netForensics;
+        if (g_netForensics)
+            EM_ASM({ console.log('[spawn] random p=' + $0 + ' row=' + $1 + ' sect=' + $2 + ' cnt=' + $3); },
+                   playerNum, i, (int)g_playerSpawnPoints[i].sect, g_playerSpawnCnt);
+    }
+#endif
     p.opos = p.pos = g_playerSpawnPoints[i].xyz;
 
     p.bobpos     = p.pos.xy;
@@ -1535,7 +1547,10 @@ int32_t g_spawnRowsStale = 1;
 
 static void G_CollectSpawnPoints(int gameMode)
 {
-    if (g_spawnRowsStale)
+    int const wasStale = g_spawnRowsStale;
+    // Fallback only: rows normally locked at board load (G_EnterLevel). This
+    // path fires just for entries that never went through engineLoadBoard.
+    if (g_spawnRowsStale || g_playerSpawnCnt <= 0)
     {
         g_playerSpawnCnt = 0;
         int nexti;
@@ -1552,6 +1567,20 @@ static void G_CollectSpawnPoints(int gameMode)
         }
         g_spawnRowsStale = 0;
     }
+#ifdef __EMSCRIPTEN__
+    {
+        extern int32_t g_netForensics;
+        if (g_netForensics)
+            EM_ASM({ console.log('[spawn] collect stale=' + $0 + ' cnt=' + $1
+                     + ' rows=' + $2 + ',' + $3 + ',' + $4 + ',' + $5 + ',' + $6); },
+                   wasStale, g_playerSpawnCnt,
+                   g_playerSpawnCnt > 0 ? g_playerSpawnPoints[0].sect : -1,
+                   g_playerSpawnCnt > 1 ? g_playerSpawnPoints[1].sect : -1,
+                   g_playerSpawnCnt > 2 ? g_playerSpawnPoints[2].sect : -1,
+                   g_playerSpawnCnt > 3 ? g_playerSpawnPoints[3].sect : -1,
+                   g_playerSpawnCnt > 4 ? g_playerSpawnPoints[4].sect : -1);
+    }
+#endif
 
     int pindex = 0;   // visible past the loop: extra seats materialize below
     for (int pal = 9, nexti, SPRITES_OF_STAT_SAFE(STAT_PLAYER, i, nexti))
@@ -1643,6 +1672,14 @@ static void G_CollectSpawnPoints(int gameMode)
 
         p.cursectnum = s.sectnum;
 
+#ifdef __EMSCRIPTEN__
+        {
+            extern int32_t g_netForensics;
+            if (g_netForensics)
+                EM_ASM({ console.log('[spawn] pair p=' + $0 + ' sect=' + $1 + ' x=' + $2 + ' y=' + $3); },
+                       pindex, s.sectnum, s.x, s.y);
+        }
+#endif
         pindex++;
 
         i = nexti;
@@ -1679,6 +1716,14 @@ static void G_CollectSpawnPoints(int gameMode)
             p.bobpos     = p.pos.xy;
             p.oq16ang = p.q16ang = fix16_from_int(spawn.ang);
             p.cursectnum = spawn.sect;
+#ifdef __EMSCRIPTEN__
+            {
+                extern int32_t g_netForensics;
+                if (g_netForensics)
+                    EM_ASM({ console.log('[spawn] extra p=' + $0 + ' row=' + $1 + ' sect=' + $2); },
+                           j, j % g_playerSpawnCnt, spawn.sect);
+            }
+#endif
         }
 }
 
@@ -2096,7 +2141,29 @@ int G_EnterLevel(int gameMode)
         return 1;
     }
 
-    g_spawnRowsStale = 1;   // pristine board: re-collect spawn rows from it
+    // Collect spawn rows from the PRISTINE board content: the start position
+    // plus the map's actual APLAYER sprites -- and lock them for this board.
+    // Collecting later (G_CollectSpawnPoints) reads STAT_PLAYER *after* the
+    // entry path re-inserts every CONNECTED player's sprite at its stale
+    // pre-launch ps position, canonizing lobby-era wander coordinates as
+    // spawn rows ([spawn] trace: cnt=7 rows on a 2-spawn map; bots launched
+    // marooned at positions that exist nowhere in the map file).
+    g_playerSpawnCnt = 0;
+    g_playerSpawnPoints[0].xyz  = p0.pos;
+    g_playerSpawnPoints[0].ang  = playerAngle;
+    g_playerSpawnPoints[0].sect = p0.cursectnum;
+    g_playerSpawnCnt = 1;
+    for (bssize_t i = 0; i < MAXSPRITES && g_playerSpawnCnt < MAXPLAYERS; i++)
+    {
+        if (sprite[i].statnum >= MAXSTATUS || sprite[i].picnum != APLAYER)
+            continue;
+        auto &spawn = g_playerSpawnPoints[g_playerSpawnCnt];
+        spawn.xyz  = sprite[i].xyz;
+        spawn.ang  = sprite[i].ang;
+        spawn.sect = sprite[i].sectnum;
+        g_playerSpawnCnt++;
+    }
+    g_spawnRowsStale = 0;   // rows locked: entry pairing places bodies AT them
 
     p0.q16ang = fix16_from_int(playerAngle);
 
