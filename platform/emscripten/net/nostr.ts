@@ -18,8 +18,14 @@ let _pool: SimplePool | null = null;
 const _connected = new Set<string>();
 
 export function initPool(relays: readonly string[] = activeRelays()): SimplePool {
-  if (_pool) return _pool;
-  _pool = new SimplePool();
+  if (!_pool) _pool = new SimplePool();
+  // Re-ensure EVERY call: a relay whose socket dropped was pruned from
+  // _connected by its onclose, and nothing else ever re-dialed it -- so a
+  // long-lived host published its match ticket into dead sockets forever
+  // (measured live: ticket 298s stale with two hosts up and 15s refreshes;
+  // the user's invite code "expired" while the match was running). Every
+  // publish/subscribe path funnels through here, so this heals them all;
+  // ensureRelays skips relays that are still healthy.
   ensureRelays(relays);
   return _pool;
 }
