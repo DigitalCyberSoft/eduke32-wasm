@@ -754,7 +754,18 @@ static input_t Bot_GetInput(int k)
         if (++s_botStuckTics[k] > 10)
         {
             s_botStuckTics[k] = 0;
-            if (s_botOpenGrace[k] == 0 && s_botBounceHold[k] == 0)
+            if (s_botBounceHold[k] > 0)
+            {
+                // A bounce is already steering: do NOT re-arm it. Stuck trips
+                // recur every ~10 tics while bounces hold 15-50, so re-arming
+                // on every trip locked bots in PERMANENT bounce mode -- the
+                // navigator never steered again (bot 1's trace: pinned at one
+                // xy for a full 3 minutes, bounce never expiring). Keep
+                // hopping and let the rotation finish; if still stuck after
+                // it expires, the door/bounce ladder below runs fresh.
+                in.bits |= BIT(SK_JUMP);
+            }
+            else if (s_botOpenGrace[k] == 0)
             {
                 // First response to a blockage: it is probably a DOOR. Press
                 // open and KEEP PUSHING -- doors take tics to swing; turning
@@ -938,7 +949,7 @@ static input_t Bot_GetInput(int k)
         in.extbits |= BIT(s_botStrafeDir[k] > 0 ? EK_STRAFE_LEFT : EK_STRAFE_RIGHT);
         in.extbits |= BIT(EK_MOVE_FORWARD);
     }
-    else if (s_botBounceHold[k] > 0 && klabs(diff) > 300)
+    else if (s_botBounceHold[k] > 0 && klabs(diff) > 150)
     {
         // Mid-bounce with the nose still in the wall: rotate first, walk
         // after -- driving forward through the turn re-trips stuck instantly.
@@ -972,6 +983,21 @@ static input_t Bot_GetInput(int k)
     {
         s_botBreakFire[k]--;
         in.bits |= BIT(SK_FIRE);
+    }
+
+    // Single-bot decision trace (forensics only): the room-escape failure has
+    // survived four steering rewrites while the LOCALBOT-piloted seat crosses
+    // rooms fine -- read the actual loop instead of guessing a fifth time.
+    {
+        extern int32_t g_netForensics;
+        if (g_netForensics && k == 1 && (movefifoplc % 26) == 0)
+            EM_ASM({ console.log('[bot1] plc=' + $0 + ' x=' + $1 + ' y=' + $2 + ' sect=' + $3
+                     + ' tgt=' + $4 + ' nav=' + $5 + ' nx=' + $6 + ' ny=' + $7
+                     + ' stuck=' + $8 + ' bounce=' + $9 + ' grace=' + $10 + ' sees=' + $11 + ' hit=' + $12); },
+                   movefifoplc, ps->pos.x, ps->pos.y, ps->cursectnum,
+                   s_botTarget[k], s_botNavOn[k], s_botNavX[k], s_botNavY[k],
+                   s_botStuckTics[k], s_botBounceHold[k], s_botOpenGrace[k],
+                   (int)seesTarget, (int)canHit);
     }
 
     return in;
