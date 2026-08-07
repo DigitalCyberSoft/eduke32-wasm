@@ -1567,6 +1567,9 @@ static const dataspec_t svgm_secwsp[] =
 // projectiles
     { 0, &SpriteProjectile[0], sizeof(projectile_t), MAXSPRITES },
     { 0, &everyothertime, sizeof(everyothertime), 1 },
+    // lasttransport debounce stamps are phased to this counter; a join/heal
+    // snapshot must carry it so inherited stamps stay meaningful on the guest
+    { 0, &g_moveThingsCount, sizeof(g_moveThingsCount), 1 },
     { DS_END, 0, 0, 0 }
 };
 

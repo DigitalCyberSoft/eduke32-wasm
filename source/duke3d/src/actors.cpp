@@ -497,13 +497,15 @@ void A_RadiusDamage(int const spriteNum, int const blastRadius, int const dmg1, 
 // <fromunderp>: below->above change?
 static int32_t Proj_MaybeDoTransport(int32_t spriteNum, uspriteptr_t const pSEffector, int32_t fromunderp, int32_t daz)
 {
-    if (((int32_t) totalclock & UINT8_MAX) == actor[spriteNum].lasttransport)
+    // keyed to the SIM tic counter, not totalclock: wall clock differs across
+    // net peers, so a totalclock-keyed debounce makes divergent decisions
+    if ((g_moveThingsCount & UINT8_MAX) == actor[spriteNum].lasttransport)
         return 0;
 
     auto const pSprite = &sprite[spriteNum];
     auto const otherse = (uspriteptr_t)&sprite[pSEffector->owner];
 
-    actor[spriteNum].lasttransport = ((int32_t) totalclock & UINT8_MAX);
+    actor[spriteNum].lasttransport = (g_moveThingsCount & UINT8_MAX);
 
     pSprite->x += (otherse->x - pSEffector->x);
     pSprite->y += (otherse->y - pSEffector->y);
@@ -4258,7 +4260,7 @@ ACTOR_STATIC void G_MoveTransports(void)
                 case STAT_FALLER:
                 case STAT_DUMMYPLAYER:
                 {
-                    if (((int32_t) totalclock & UINT8_MAX) != actor[sectSprite].lasttransport)
+                    if ((g_moveThingsCount & UINT8_MAX) != actor[sectSprite].lasttransport)
                     {
                         int const zvel    = sprite[sectSprite].zvel;
                         int const absZvel = klabs(zvel);
@@ -4341,7 +4343,7 @@ ACTOR_STATIC void G_MoveTransports(void)
                                             }
                                         }
 #endif
-                                        actor[sectSprite].lasttransport = ((int32_t) totalclock & UINT8_MAX);
+                                        actor[sectSprite].lasttransport = (g_moveThingsCount & UINT8_MAX);
 
                                         sprite[sectSprite].x += sprite[OW(spriteNum)].x - SX(spriteNum);
                                         sprite[sectSprite].y += sprite[OW(spriteNum)].y - SY(spriteNum);

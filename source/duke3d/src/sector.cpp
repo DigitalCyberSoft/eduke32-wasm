@@ -1275,10 +1275,11 @@ int P_ActivateSwitch(int playerNum, int wallOrSprite, int switchType)
 
     if (switchType == SWITCH_SPRITE) // A wall sprite
     {
-        if (actor[wallOrSprite].lasttransport == ((int32_t) totalclock & UINT8_MAX))
+        // sim-tic key, not totalclock: peers disagree on wall clock (net desync)
+        if (actor[wallOrSprite].lasttransport == (g_moveThingsCount & UINT8_MAX))
             return 0;
 
-        actor[wallOrSprite].lasttransport = ((int32_t) totalclock & UINT8_MAX);
+        actor[wallOrSprite].lasttransport = (g_moveThingsCount & UINT8_MAX);
 
         if (sprite[wallOrSprite].lotag == 0)
             return 0;
