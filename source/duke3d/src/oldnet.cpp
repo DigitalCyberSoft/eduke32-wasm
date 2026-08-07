@@ -3191,6 +3191,19 @@ int Net_CorrectDivergence(int k)
     s_softStrikeClock[k] = now;
 
     g_netDesyncReporters &= ~(1 << k);
+    // FRESH JOINER: skip the soft rung entirely. A join transient forks the
+    // RNG-coupled PHASE state scattered through the world (animwall tags,
+    // drip timers, every krand-absorbed actor field) -- an unbounded class no
+    // in-place packet can carry, so the softs are doomed by construction
+    // (measured: seed+tag snaps re-forked within a tic, 5s cadence, until the
+    // 5th dispatch finally healed). One targeted heal right away turns ~20s
+    // of rubber-banding into a single clean catch-up seconds after joining.
+    if (s_joinTic[k] >= 0 && movefifoplc - s_joinTic[k] < 1800)   // ~60s post-seat
+    {
+        initprintf("net: fresh joiner %d diverged -> straight to heal\n", k);
+        s_softStrikes[k] = 0;
+        return Net_StartHealFlow(k);
+    }
     if (++s_softStrikes[k] <= NET_SOFT_STRIKES)
     {
         Net_SendStateSnap(k);
