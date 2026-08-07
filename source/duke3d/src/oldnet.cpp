@@ -542,6 +542,34 @@ static input_t Bot_GetInput(int k)
 {
     input_t in = {};
     auto const ps = g_player[k].ps;
+
+    // Separation telemetry (forensics only): min pairwise player distance
+    // every ~20s names the remaining bottleneck -- travel (never close) vs
+    // conversion (close but missing).
+    {
+        extern int32_t g_netForensics;
+        static int32_t s_sepPlc = -1;
+        if (g_netForensics && (movefifoplc & 511) == 0 && movefifoplc != s_sepPlc)
+        {
+            s_sepPlc = movefifoplc;
+            int32_t minSep = INT32_MAX; int a, b;
+            TRAVERSE_CONNECT(a)
+            {
+                auto const pa = g_player[a].ps;
+                if (pa == NULL || pa->dead_flag) continue;
+                TRAVERSE_CONNECT(b)
+                {
+                    if (b <= a) continue;
+                    auto const pb = g_player[b].ps;
+                    if (pb == NULL || pb->dead_flag) continue;
+                    int32_t const s = klabs(pa->pos.x - pb->pos.x) + klabs(pa->pos.y - pb->pos.y)
+                                      + (klabs(pa->pos.z - pb->pos.z) >> 4);
+                    if (s < minSep) minSep = s;
+                }
+            }
+            EM_ASM({ console.log('[botsep] plc=' + $0 + ' minsep=' + $1); }, movefifoplc, minSep);
+        }
+    }
     // The pump can ask for a column BEFORE the level exists (seated at
     // relaunch, entry still loading): ps->i/cursectnum are garbage then, and
     // cansee() on a garbage sector walks broken lists and crashes. Neutral
@@ -590,6 +618,16 @@ static input_t Bot_GetInput(int k)
         // the rooftop-spawn host, pistols eating the ledge wall forever while
         // ground-level enemies walked past each other). Rotate off it.
         int const avoid = (s_botTargetHold[k] > 300) ? s_botTarget[k] : -1;
+        // Revenge bias: whoever just shot this bot counts as 4x closer.
+        // Damaged pairs CONVERGE -- the measured failure of every prior config
+        // was bots orbiting the map without ever committing to one fight.
+        int revenge = -1;
+        {
+            int const wa = ps->wackedbyactor;
+            if ((unsigned)wa < MAXSPRITES && sprite[wa].picnum == APLAYER
+                && (unsigned)sprite[wa].yvel < MAXPLAYERS)
+                revenge = sprite[wa].yvel;
+        }
         int best = -1; int32_t bestd = INT32_MAX; int i;
         TRAVERSE_CONNECT(i)
         {
@@ -598,10 +636,14 @@ static input_t Bot_GetInput(int k)
             if (tp == NULL || (unsigned)tp->i >= MAXSPRITES || sprite[tp->i].extra <= 0 || tp->dead_flag
                 || (unsigned)tp->cursectnum >= (unsigned)numsectors)
                 continue;
-            // Height counts triple: a target a floor away is a target a long
-            // detour away, and pistols cannot argue with a ledge.
-            int32_t const d = klabs(tp->pos.x - ps->pos.x) + klabs(tp->pos.y - ps->pos.y)
-                              + (klabs(tp->pos.z - ps->pos.z) >> 2) * 3;
+            // Height penalty x1 (was x3): the x3 pinned every bot to its own
+            // floor -- rooftop pairs never dropped down to fight, encounter
+            // rate ~0 (5-minute probe: 2 sprite hits, 0 frags). Falling is
+            // free in Duke; a floor apart is CLOSE.
+            int32_t d = klabs(tp->pos.x - ps->pos.x) + klabs(tp->pos.y - ps->pos.y)
+                        + (klabs(tp->pos.z - ps->pos.z) >> 2);
+            if (i == revenge)
+                d >>= 2;
             if (d < bestd) { bestd = d; best = i; }
         }
         if (best < 0 && avoid >= 0)
@@ -761,7 +803,10 @@ static input_t Bot_GetInput(int k)
     // Tracking: SMALL wobble while the target is visible (the old +-48 at
     // default skill was +-8 degrees of permanent miss -- "the bots can't aim",
     // live-reported), and double the turn rate when far off so they snap on.
-    static int const trackWobble[3] = { 20, 8, 3 };
+    // Medium wobble halved 8->4: 48 honest canHit discharges converted only 2
+    // sprite terminations in 5 minutes -- +-8 ang units is +-1.4 degrees of
+    // permanent miss at range even with the shotgun cone.
+    static int const trackWobble[3] = { 20, 4, 3 };
     int const aimErr = seesTarget ? (int)(Bot_Rnd() % (2 * trackWobble[skill] + 1)) - trackWobble[skill]
                                   : (int)(Bot_Rnd() % (2 * wobble[skill] + 1)) - wobble[skill];
     int const cap = (seesTarget && klabs(diff) > turnCap[skill]) ? turnCap[skill] * 2 : turnCap[skill];
