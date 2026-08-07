@@ -21,10 +21,15 @@ uint32_t wrandomseed = 1;
 int32_t g_krandCalls;
 #if defined(NETDUKE32) && !KRANDDEBUG
 const char *g_krandSiteRing[8];
+int16_t g_krandSiteSpr[8];
+int32_t g_krandSpriteCtx = -1;   // sprite the actor movers are processing
 int32_t krand_traced(const char *site)
 {
     if (g_krandCalls < 8)
+    {
         g_krandSiteRing[g_krandCalls] = site;
+        g_krandSiteSpr[g_krandCalls]  = (int16_t)g_krandSpriteCtx;
+    }
     g_krandCalls++;
     randomseed = (randomseed * 1664525ul) + 221297ul;
     return ((uint32_t)randomseed) >> 16;
@@ -40,6 +45,8 @@ extern uint32_t wrandomseed;
 extern int32_t g_krandCalls;
 #if defined(NETDUKE32) && !KRANDDEBUG
 extern const char *g_krandSiteRing[8];   // this tic's first call sites
+extern int16_t g_krandSiteSpr[8];        // ...and the sprite each was processing
+extern int32_t g_krandSpriteCtx;         // set by the actor movers per sprite
 #endif
 #endif
 

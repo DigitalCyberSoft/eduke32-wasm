@@ -520,6 +520,7 @@ static void Sync_DumpStatHashes(int32_t tickNum)
 // RNG TRACE ring history (krand_traced lives in engine.cpp via random.h's
 // engine_c_ block; g_krandSiteRing holds the CURRENT tic's first sites).
 static const char *s_krandSiteHist[MOVEFIFOSIZ][6];
+static int16_t     s_krandSprHist[MOVEFIFOSIZ][6];   // sprite per recorded site
 
 // This must not exceed MAX_SYNC_TYPES
 static SyncType_t syncType[] = {
@@ -591,7 +592,10 @@ void Net_GetSyncStat(void)
         for (int k = 0; k < 3; k++)
             g_dbgSpawnHist[slot][14 + k] = (k < g_dbgDelRingN && k < 32) ? g_dbgDelRing[k] : -1;
         for (int k = 0; k < 6; k++)
+        {
             s_krandSiteHist[slot][k] = (k < g_krandCalls && k < 8) ? g_krandSiteRing[k] : NULL;
+            s_krandSprHist[slot][k]  = (k < g_krandCalls && k < 8) ? g_krandSiteSpr[k] : -1;
+        }
     }
     g_dbgInsCount = g_dbgDelCount = 0;
     g_dbgInsRingN = g_dbgDelRingN = 0;
@@ -616,8 +620,9 @@ void Net_GetSyncStat(void)
             Sync_DumpStatHashes(movefifoplc);
             int const slot = INPUTFIFO_CURTICK;
             char buf[512]; int n = 0;
-            for (int kk = 0; kk < 6 && s_krandSiteHist[slot][kk] != NULL && n < 480; kk++)
-                n += Bsnprintf(buf + n, sizeof(buf) - n, "%s%s", kk ? "," : "", s_krandSiteHist[slot][kk]);
+            for (int kk = 0; kk < 6 && s_krandSiteHist[slot][kk] != NULL && n < 440; kk++)
+                n += Bsnprintf(buf + n, sizeof(buf) - n, "%s%s#%d", kk ? "," : "",
+                               s_krandSiteHist[slot][kk], (int)s_krandSprHist[slot][kk]);
             buf[n] = 0;
             EM_ASM({ console.log('[eng] RNGCAD tic=' + $0 + ' sites=' + UTF8ToString($1)); },
                    movefifoplc, buf);

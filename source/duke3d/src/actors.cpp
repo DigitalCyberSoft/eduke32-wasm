@@ -1196,6 +1196,7 @@ ACTOR_STATIC void G_MoveZombieActors(void)
     while (spriteNum >= 0)
     {
         int const  nextSprite = nextspritestat[spriteNum];
+        g_krandSpriteCtx = spriteNum;   // RNG-trace context (forensics)
         int32_t    playerDist;
         auto const pSprite   = &sprite[spriteNum];
         int const  playerNum = A_FindPlayer(pSprite, &playerDist);
@@ -1683,6 +1684,7 @@ ACTOR_STATIC void G_MovePlayers(void)
     while (spriteNum >= 0)
     {
         int const  nextSprite = nextspritestat[spriteNum];
+        g_krandSpriteCtx = spriteNum;   // RNG-trace context (forensics)
         auto const pSprite    = &sprite[spriteNum];
         int const  playerNum  = P_GetP(pSprite);
         auto &     thisPlayer = g_player[playerNum];
@@ -1886,6 +1888,7 @@ ACTOR_STATIC void G_MoveFX(void)
     {
         auto const pSprite    = &sprite[spriteNum];
         int const  nextSprite = nextspritestat[spriteNum];
+        g_krandSpriteCtx = spriteNum;   // RNG-trace context (forensics)
 
         switch (tileGetMapping(pSprite->picnum))
         {
@@ -2040,6 +2043,7 @@ ACTOR_STATIC void G_MoveFallers(void)
     while (spriteNum >= 0)
     {
         int const  nextSprite = nextspritestat[spriteNum];
+        g_krandSpriteCtx = spriteNum;   // RNG-trace context (forensics)
         auto const pSprite    = &sprite[spriteNum];
         int const  sectNum    = pSprite->sectnum;
 
@@ -2137,6 +2141,7 @@ ACTOR_STATIC void G_MoveStandables(void)
     while (spriteNum >= 0)
     {
         int const  nextSprite = nextspritestat[spriteNum];
+        g_krandSpriteCtx = spriteNum;   // RNG-trace context (forensics)
         auto const pData      = &actor[spriteNum].t_data[0];
         auto const pSprite    = &sprite[spriteNum];
         int const  sectNum    = pSprite->sectnum;
@@ -3651,6 +3656,7 @@ ACTOR_STATIC void G_MoveWeapons(void)
     while (spriteNum >= 0)
     {
         int const  nextSprite = nextspritestat[spriteNum];
+        g_krandSpriteCtx = spriteNum;   // RNG-trace context (forensics)
         auto const pSprite    = &sprite[spriteNum];
 
         if ((unsigned)pSprite->sectnum >= MAXSECTORS)
@@ -4454,6 +4460,7 @@ ACTOR_STATIC void G_MoveActors(void)
     while (spriteNum >= 0)
     {
         int const  nextSprite = nextspritestat[spriteNum];
+        g_krandSpriteCtx = spriteNum;   // RNG-trace context (forensics)
         auto const pSprite    = &sprite[spriteNum];
         int const  sectNum    = pSprite->sectnum;
         auto const pData      = actor[spriteNum].t_data;
@@ -5870,6 +5877,7 @@ ACTOR_STATIC void G_MoveMisc(void)  // STATNUM 5
     while (spriteNum >= 0)
     {
         int const  nextSprite = nextspritestat[spriteNum];
+        g_krandSpriteCtx = spriteNum;   // RNG-trace context (forensics)
         int32_t    playerDist;
         auto const pData   = actor[spriteNum].t_data;
         auto const pSprite = &sprite[spriteNum];
@@ -6660,6 +6668,7 @@ ACTOR_STATIC void G_MoveEffectors(void)   //STATNUM 3
     while (spriteNum >= 0)
     {
         int const  nextSprite = nextspritestat[spriteNum];
+        g_krandSpriteCtx = spriteNum;   // RNG-trace context (forensics)
         auto const pSprite    = &sprite[spriteNum];
         int32_t    playerDist;
         int        playerNum = A_FindPlayer(pSprite, &playerDist);
