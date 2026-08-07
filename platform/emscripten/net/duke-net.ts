@@ -393,7 +393,7 @@ class DukeNet {
       info = target;
     }
     if (!info) {
-      this.events.onError?.("Invalid invite code");
+      this.events.onError?.("Match not found — the code may have expired with its host");
       return;
     }
     if (this.match) this.leave();
