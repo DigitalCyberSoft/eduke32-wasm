@@ -534,6 +534,59 @@ static int8_t  s_botBreakFire[MAXPLAYERS];   // tics of blocker-clearing fire
 static int8_t  s_botStuckEpisodes[MAXPLAYERS]; // consecutive traps -> longer bounces
 static int16_t s_botNoHitTics[MAXPLAYERS];   // visible-but-unhittable streak (fence camping)
 static int32_t s_botLastTDist[MAXPLAYERS];   // pursuit progress: last distance to target
+static int32_t s_botNavX[MAXPLAYERS], s_botNavY[MAXPLAYERS];  // first portal midpoint
+static int8_t  s_botNavOn[MAXPLAYERS];
+static int16_t s_botLastSect[MAXPLAYERS];    // re-plan the route on sector crossings
+
+// Sector-graph navigation: BFS over wall portals from the bot's sector to the
+// target's, return the FIRST portal's midpoint to steer at. Build maps are a
+// sector graph, and Duke's vertical routes (the E1L1 roof hole, stairwells)
+// are ordinary portal chains -- measured without this, min pairwise bot
+// distance sat pinned at ~6500 units for five straight minutes (fence-ringed
+// roof, no route found by blind homing): bots literally never met. Elevators/
+// teleports are unmodeled; the stuck->bounce machinery remains the backstop.
+static int Bot_NavFirstHop(int fromSect, int toSect, int32_t *px, int32_t *py)
+{
+    if (fromSect == toSect || (unsigned)fromSect >= (unsigned)numsectors
+        || (unsigned)toSect >= (unsigned)numsectors)
+        return 0;
+    static int16_t  parentSect[MAXSECTORS];
+    static int16_t  parentWall[MAXSECTORS];
+    static uint16_t seenGen[MAXSECTORS];
+    static uint16_t gen;
+    static int16_t  queue[MAXSECTORS];
+    if (++gen == 0) { Bmemset(seenGen, 0, sizeof(seenGen)); gen = 1; }
+    int qh = 0, qt = 0;
+    queue[qt++] = (int16_t)fromSect;
+    seenGen[fromSect]   = gen;
+    parentSect[fromSect] = -1;
+    int found = 0;
+    while (qh < qt)
+    {
+        int const s = queue[qh++];
+        if (s == toSect) { found = 1; break; }
+        int const wend = sector[s].wallptr + sector[s].wallnum;
+        for (int w = sector[s].wallptr; w < wend; w++)
+        {
+            int const ns = wall[w].nextsector;
+            if (ns < 0 || (unsigned)ns >= (unsigned)numsectors || seenGen[ns] == gen)
+                continue;
+            seenGen[ns]    = gen;
+            parentSect[ns] = (int16_t)s;
+            parentWall[ns] = (int16_t)w;
+            if (qt < MAXSECTORS) queue[qt++] = (int16_t)ns;
+        }
+    }
+    if (!found)
+        return 0;
+    int s = toSect;
+    while (parentSect[s] != fromSect && parentSect[s] >= 0)
+        s = parentSect[s];
+    int const w = parentWall[s];    // wall in fromSect crossing to the first hop
+    *px = (wall[w].x + wall[wall[w].point2].x) >> 1;
+    *py = (wall[w].y + wall[wall[w].point2].y) >> 1;
+    return 1;
+}
 static int8_t  s_botOpenGrace[MAXPLAYERS];   // door-try: keep pushing before bouncing
 static uint8_t s_botBurst[MAXPLAYERS];       // fire cadence phase (24 on / 8 off)
 static int16_t s_botTargetHold[MAXPLAYERS];  // tics on the same target without a kill
@@ -609,6 +662,13 @@ static input_t Bot_GetInput(int k)
     static int const wobble[3]   = { 96, 48, 16 };
     static int const holdMax[3]  = { 30, 16, 6 };
 
+    // Crossing into a new sector invalidates the plotted portal: re-plan now.
+    if (ps->cursectnum != s_botLastSect[k])
+    {
+        s_botLastSect[k]  = ps->cursectnum;
+        s_botThinkHold[k] = 0;
+    }
+
     // Reacquire target only when the hold expires (reaction time).
     if (--s_botThinkHold[k] <= 0)
     {
@@ -655,6 +715,13 @@ static input_t Bot_GetInput(int k)
             s_botLastTDist[k]  = INT32_MAX;
         }
         s_botTarget[k] = (int8_t)best;
+        // Plot the route: first portal toward the target, recomputed each
+        // think (and forced on every sector crossing below).
+        s_botNavOn[k] = 0;
+        if (best >= 0 && g_player[best].ps != NULL
+            && Bot_NavFirstHop(ps->cursectnum, g_player[best].ps->cursectnum,
+                               &s_botNavX[k], &s_botNavY[k]))
+            s_botNavOn[k] = 1;
         if ((Bot_Rnd() & 3) == 0)
             s_botStrafeDir[k] = (Bot_Rnd() & 1) ? 1 : -1;
         s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
@@ -789,12 +856,17 @@ static input_t Bot_GetInput(int k)
     }
     else if (tp != NULL)
     {
-        // Toward the target: exact when visible, loosely (big wobble) when
-        // not -- blind homing walks the map toward players, and the bounce
-        // handles every wall it meets on the way.
-        wantAng = getangle(tp->pos.x - ps->pos.x, tp->pos.y - ps->pos.y);
-        if (!seesTarget)
-            wantAng = (wantAng + (int)(Bot_Rnd() % 129) - 64) & 2047;
+        // Toward the target when the shot can land; along the ROUTE (first
+        // portal midpoint) when it cannot -- homing at an unhittable target
+        // grinds fences forever, the measured no-encounter equilibrium.
+        if (!canHit && s_botNavOn[k])
+            wantAng = getangle(s_botNavX[k] - ps->pos.x, s_botNavY[k] - ps->pos.y);
+        else
+        {
+            wantAng = getangle(tp->pos.x - ps->pos.x, tp->pos.y - ps->pos.y);
+            if (!seesTarget)
+                wantAng = (wantAng + (int)(Bot_Rnd() % 129) - 64) & 2047;
+        }
     }
     else
         wantAng = s_botWanderAng[k];
