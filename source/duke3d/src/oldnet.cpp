@@ -531,6 +531,7 @@ static int16_t s_botBounceAng[MAXPLAYERS];
 static int8_t  s_botWasDead[MAXPLAYERS];
 static int16_t s_botSpawnRoam[MAXPLAYERS];   // post-respawn target-blind roam
 static int8_t  s_botBreakFire[MAXPLAYERS];   // tics of blocker-clearing fire
+static int8_t  s_botStuckEpisodes[MAXPLAYERS]; // consecutive traps -> longer bounces
 static int8_t  s_botOpenGrace[MAXPLAYERS];   // door-try: keep pushing before bouncing
 static uint8_t s_botBurst[MAXPLAYERS];       // fire cadence phase (24 on / 8 off)
 static int16_t s_botTargetHold[MAXPLAYERS];  // tics on the same target without a kill
@@ -626,16 +627,32 @@ static input_t Bot_GetInput(int k)
                 // First response to a blockage: it is probably a DOOR. Press
                 // open and KEEP PUSHING -- doors take tics to swing; turning
                 // away instantly (the old behavior) wasted every door press.
-                // Also burst-fire in case it is a destructible prop.
                 s_botOpenGrace[k]  = 26;
                 in.bits |= BIT(SK_OPEN);
-                s_botBreakFire[k]  = 8;
+                // Blocker-clearing fire ONLY when a sprite is actually in the
+                // way. The old unconditional burst re-armed on every stuck
+                // trip: a cornered bot hosed the same wall for minutes, and
+                // collateral broke lights/screens map-wide ("some things are
+                // blacked out" + "the bots are absolute retards", live).
+                hitdata_t hit = {};
+                int const a = fix16_to_int(ps->q16ang) & 2047;
+                hitscan(&ps->pos, ps->cursectnum, sintable[(a + 512) & 2047],
+                        sintable[a & 2047], 0, &hit, CLIPMASK1);
+                if (hit.sprite >= 0
+                    && klabs(sprite[hit.sprite].x - ps->pos.x)
+                       + klabs(sprite[hit.sprite].y - ps->pos.y) < 2048)
+                    s_botBreakFire[k] = 8;
             }
             else
             {
-                // Door try spent and still stuck: bounce away hard.
+                // Door try spent and still stuck: bounce away hard. Repeat
+                // trips escalate -- a fixed-length bounce re-traps in concave
+                // corners, so each consecutive episode turns away longer
+                // before re-homing at the target.
                 s_botOpenGrace[k]  = 0;
-                s_botBounceHold[k] = (int16_t)(20 + (Bot_Rnd() & 31));
+                if (s_botStuckEpisodes[k] < 6)
+                    s_botStuckEpisodes[k]++;
+                s_botBounceHold[k] = (int16_t)(20 + (Bot_Rnd() & 31) + 16 * s_botStuckEpisodes[k]);
                 s_botBounceAng[k]  = (int16_t)((fix16_to_int(ps->q16ang) + 512 + (int)(Bot_Rnd() & 1023)) & 2047);
                 if (Bot_Rnd() & 1)
                     in.bits |= BIT(SK_JUMP);    // ...unless it is a ledge
@@ -644,6 +661,8 @@ static input_t Bot_GetInput(int k)
     }
     else if (s_botStuckTics[k] > 0)
         s_botStuckTics[k]--;
+    else if (s_botStuckEpisodes[k] > 0 && (Bot_Rnd() & 63) == 0)
+        s_botStuckEpisodes[k]--;    // moving freely again: forget old traps
     if (s_botOpenGrace[k] > 0)
     {
         s_botOpenGrace[k]--;
@@ -723,6 +742,11 @@ static input_t Bot_GetInput(int k)
         in.fvel = 24;
         in.extbits |= BIT(s_botStrafeDir[k] > 0 ? EK_STRAFE_LEFT : EK_STRAFE_RIGHT);
         in.extbits |= BIT(EK_MOVE_FORWARD);
+    }
+    else if (s_botBounceHold[k] > 0 && klabs(diff) > 300)
+    {
+        // Mid-bounce with the nose still in the wall: rotate first, walk
+        // after -- driving forward through the turn re-trips stuck instantly.
     }
     else
     {
