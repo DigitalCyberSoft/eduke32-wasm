@@ -538,6 +538,9 @@ static int32_t s_botNavX[MAXPLAYERS], s_botNavY[MAXPLAYERS];  // first portal mi
 static int8_t  s_botNavOn[MAXPLAYERS];
 static int16_t s_botLastSect[MAXPLAYERS];    // re-plan the route on sector crossings
 static int8_t  s_botTurnPref[MAXPLAYERS];    // wall-following handedness (+1/-1)
+static int16_t s_botTrapTics[MAXPLAYERS];    // zero-net-displacement streak (hard trap)
+static vec2_t  s_botTrapAnchor[MAXPLAYERS];
+static int16_t s_botTrapCool[MAXPLAYERS];    // volley cooldown while trapped
 
 // Sector-graph navigation: BFS over wall portals from the bot's sector to the
 // target's, return the FIRST portal's midpoint to steer at. Build maps are a
@@ -969,6 +972,44 @@ static input_t Bot_GetInput(int k)
     // NO burst cadence: a 24-on/8-off trigger starved every slow weapon cycle
     // (shotgun ~30 tics; measured 11 discharges in 8 minutes) -- the aim gate
     // already modulates fire naturally as the wobble swings.
+    // Hard-trap detector: an external push (the E1L1 vent conveyor) can pin a
+    // bot with ZERO net displacement while the whole stuck->door->bounce
+    // ladder cycles forever -- measured: pinned at one xy for entire probes,
+    // rotation free, NO sprite blocker in reach. The canonical trap is a
+    // conveyor pressing the bot into a SEALED breakable grate (a WALL, which
+    // the sprite-gated break-fire refuses). Escalation: bounded wall-break
+    // volleys every ~2s; if ~15s of that opens nothing, give up on this
+    // target and roam away -- no return of the map-wide wall-hosing.
+    {
+        int32_t const trapDisp = klabs(ps->pos.x - s_botTrapAnchor[k].x)
+                               + klabs(ps->pos.y - s_botTrapAnchor[k].y);
+        if (trapDisp >= 64)
+        {
+            s_botTrapTics[k]   = 0;
+            s_botTrapAnchor[k] = ps->pos.xy;
+        }
+        else if ((in.fvel || in.svel) && ++s_botTrapTics[k] > 104)
+        {
+            // Reset only on DISPLACEMENT: pinned bots alternate move/turn
+            // tics, and resetting on quiet tics would keep this from ever
+            // tripping.
+            if (s_botTrapCool[k] == 0)
+            {
+                s_botBreakFire[k] = 8;
+                s_botTrapCool[k]  = 52;
+                in.bits |= BIT(SK_OPEN);
+            }
+            if (s_botTrapTics[k] > 390)
+            {
+                s_botTargetHold[k] = 1000;
+                s_botSpawnRoam[k]  = 300;
+                s_botTrapTics[k]   = 0;
+            }
+        }
+        if (s_botTrapCool[k] > 0)
+            s_botTrapCool[k]--;
+    }
+
     int gate = fireGate[skill];
     if (dist2d > 8192)  gate >>= 1;
     if (dist2d > 20000) gate >>= 1;
@@ -991,13 +1032,26 @@ static input_t Bot_GetInput(int k)
     {
         extern int32_t g_netForensics;
         if (g_netForensics && k == 1 && (movefifoplc % 26) == 0)
+        {
+            // Name the wedge: nearest BLOCKING sprite within reach. The bot
+            // faces open space with fvel=80 and moves ZERO units -- something
+            // invisible pins it (suspect: dummy-player ghosts with cstat&1).
+            int bPic = -1, bStat = -1, bDist = -1;
+            for (int bi = 0; bi < MAXSPRITES; bi++)
+            {
+                if (sprite[bi].statnum >= MAXSTATUS || !(sprite[bi].cstat & 1) || bi == ps->i)
+                    continue;
+                int32_t const bd = klabs(sprite[bi].x - ps->pos.x) + klabs(sprite[bi].y - ps->pos.y);
+                if (bd < 1024 && (bDist < 0 || bd < bDist))
+                    { bDist = bd; bPic = sprite[bi].picnum; bStat = sprite[bi].statnum; }
+            }
             EM_ASM({ console.log('[bot1] plc=' + $0 + ' x=' + $1 + ' y=' + $2 + ' sect=' + $3
-                     + ' tgt=' + $4 + ' nav=' + $5 + ' nx=' + $6 + ' ny=' + $7
-                     + ' stuck=' + $8 + ' bounce=' + $9 + ' grace=' + $10 + ' sees=' + $11 + ' hit=' + $12); },
+                     + ' ang=' + $4 + ' fv=' + $5 + ' stuck=' + $6 + ' bounce=' + $7
+                     + ' blkpic=' + $8 + ' blkstat=' + $9 + ' blkd=' + $10); },
                    movefifoplc, ps->pos.x, ps->pos.y, ps->cursectnum,
-                   s_botTarget[k], s_botNavOn[k], s_botNavX[k], s_botNavY[k],
-                   s_botStuckTics[k], s_botBounceHold[k], s_botOpenGrace[k],
-                   (int)seesTarget, (int)canHit);
+                   fix16_to_int(ps->q16ang), (int)in.fvel,
+                   s_botStuckTics[k], s_botBounceHold[k], bPic, bStat, bDist);
+        }
     }
 
     return in;
