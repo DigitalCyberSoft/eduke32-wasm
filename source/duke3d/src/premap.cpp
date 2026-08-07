@@ -1530,7 +1530,8 @@ static void G_CollectSpawnPoints(int gameMode)
     g_playerSpawnCnt = 0;
     //    circ = 2048/ud.multimode;
 
-    for (int pindex = 0, pal = 9, nexti, SPRITES_OF_STAT_SAFE(STAT_PLAYER, i, nexti))
+    int pindex = 0;   // visible past the loop: extra seats materialize below
+    for (int pal = 9, nexti, SPRITES_OF_STAT_SAFE(STAT_PLAYER, i, nexti))
     {
         if (g_playerSpawnCnt == MAXPLAYERS)
             G_GameExit("\nToo many player sprites (max 16.)");
@@ -1623,6 +1624,39 @@ static void G_CollectSpawnPoints(int gameMode)
 
         i = nexti;
     }
+
+    // Players beyond the collected rows used to stay raw memcpys of player 0
+    // -- sharing its SPRITE INDEX and position (shareware E1L1 has two DM
+    // spawns; a 5-seat match left seats without bodies of their own). Give
+    // each connected extra seat its OWN sprite at a wrapped real spawn, the
+    // same materialization the late-join path uses.
+    if (g_playerSpawnCnt > 0)
+        for (int j = pindex; j < MAXPLAYERS; j++)
+        {
+            if (!g_player[j].connected || g_player[j].ps == NULL)
+                continue;
+            auto &spawn = g_playerSpawnPoints[j % g_playerSpawnCnt];
+            int const i = A_InsertSprite(spawn.sect, spawn.x, spawn.y, spawn.z,
+                                         APLAYER, 0, 0, 0, spawn.ang, 0, 0, 0, 10);
+            auto &p = *g_player[j].ps;
+            auto &s = sprite[i];
+            s.yvel     = j;
+            s.owner    = i;
+            s.clipdist = 64;
+            s.xrepeat  = 42;
+            s.yrepeat  = 36;
+            s.extra    = p.max_player_health;
+            s.pal      = p.palookup = g_player[j].pcolor ? g_player[j].pcolor : (9 + (j & 7));
+            g_player[j].pcolor = s.pal;
+            s.cstat    = CSTAT_SPRITE_BLOCK + CSTAT_SPRITE_BLOCK_HITSCAN;
+            p.last_extra = p.max_player_health;
+            p.frag_ps  = j;
+            actor[i].htowner = p.i = i;
+            actor[i].bpos = p.opos = p.pos = spawn.xyz;
+            p.bobpos     = p.pos.xy;
+            p.oq16ang = p.q16ang = fix16_from_int(spawn.ang);
+            p.cursectnum = spawn.sect;
+        }
 }
 
 static void G_ResetAllPlayers(void)
@@ -1630,8 +1664,17 @@ static void G_ResetAllPlayers(void)
     uint8_t aimmode[MAXPLAYERS], autoaim[MAXPLAYERS], wswitch[MAXPLAYERS];
     DukeStatus_t tsbar[MAXPLAYERS];
 
-    if (g_player[0].ps->cursectnum >= 0)  // < 0 may happen if we start a map in void space (e.g. testing it)
+    if (g_player[0].ps->cursectnum >= 0  // < 0 may happen if we start a map in void space (e.g. testing it)
+        && headspritestat[STAT_PLAYER] < 0)
     {
+        // Fallback start sprite ONLY when the board provides no player spawn
+        // at all. The unconditional insert planted a "shadow" APLAYER at
+        // player 0's CURRENT position on every level (re)entry; the MP
+        // relaunch flow re-enters without a board reload, so shadows
+        // accumulated and G_CollectSpawnPoints canonized stale mid-boot/demo
+        // coordinates as spawn rows -- bots then launched marooned off-spawn
+        // (sect 313/154 on E1L1, which has exactly TWO real DM spawns), which
+        // was the "unbeatable trap" and half the missing encounter rate.
         A_InsertSprite(g_player[0].ps->cursectnum,g_player[0].ps->pos.x,g_player[0].ps->pos.y,g_player[0].ps->pos.z,
                        APLAYER,0,0,0,fix16_to_int(g_player[0].ps->q16ang),0,0,0,10);
     }
