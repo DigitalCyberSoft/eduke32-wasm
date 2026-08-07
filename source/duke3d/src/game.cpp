@@ -7436,7 +7436,18 @@ int G_DoMoveThings(void)
     // it aborts when numplayers>1 (demo.cpp) and feeds inputfifo[0][j], so this
     // reads exactly what it wrote and leaves movefifoplc untouched -- no desync.
     if (numplayers > 1)
+    {
         Net_ApplyPendingStateSnap();  // tic-aligned soft snap (oldnet.cpp)
+        // Seats and drops must ALSO bind to the tic being consumed, not the
+        // frame: a catching-up joiner consumes dozens of tics per G_MoveLoop
+        // pass, so its frame-top boundary processing excised the yielded bot
+        // and seated itself tics away from where every veteran did -- a
+        // measured ~2-tic world fork at every seat (spawn counts + krand +
+        // positions), which the ladder then spent seconds correcting. Both
+        // calls no-op unless this exact tic crosses a boundary.
+        Net_ApplyPendingJoins();
+        Net_ApplyPendingDrops();
+    }
     for (bssize_t TRAVERSE_CONNECT(i))
         Bmemcpy(&g_player[i].input, &inputfifo[numplayers > 1 ? (movefifoplc & (MOVEFIFOSIZ - 1)) : 0][i], sizeof(input_t));
     if (numplayers > 1)

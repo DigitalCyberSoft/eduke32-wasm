@@ -729,13 +729,15 @@ static input_t Bot_GetInput(int k)
         in.bits |= BIT(SK_JUMP);
 
     // Fire discipline: the gate uses TRUE aim error (wobble is steering noise,
-    // not trigger noise), halves with distance so long shots need real aim,
-    // and runs a 24-on/8-off burst cadence instead of a held trigger.
+    // not trigger noise) and halves with distance so long shots need real aim.
+    // NO burst cadence: a 24-on/8-off trigger starved every slow weapon cycle
+    // (shotgun ~30 tics; measured 11 discharges in 8 minutes) -- the aim gate
+    // already modulates fire naturally as the wobble swings.
     int gate = fireGate[skill];
     if (dist2d > 8192)  gate >>= 1;
     if (dist2d > 20000) gate >>= 1;
-    s_botBurst[k] = (uint8_t)((s_botBurst[k] + 1) & 31);
-    if (seesTarget && klabs(diff) < max(gate, 16) && s_botBurst[k] < 24)
+    (void)s_botBurst;
+    if (seesTarget && klabs(diff) < max(gate, 16))
         in.bits |= BIT(SK_FIRE);
     // Blocker-clearing burst ("if an item is in the way of exiting a room,
     // destroy it"): fires along the facing while stuck, only when no player
@@ -1164,9 +1166,15 @@ void Net_HandleInput(void)
                                              -F16(127), F16(127));
             }
             {
-                extern int32_t g_testFire;   // hit-registration harness trigger
+                extern int32_t g_testFire, g_testDrive;   // hit-registration harness
                 if (g_testFire)
                     staged.bits |= BIT(SK_FIRE);
+                if (g_testDrive)
+                {
+                    staged.fvel = 96;
+                    staged.bits |= BIT(SK_RUN);
+                    staged.extbits |= BIT(EK_MOVE_FORWARD);
+                }
             }
             g_netSendRing[g_netSampleHead & (MOVEFIFOSIZ - 1)] = staged;
             g_netSampleHead++;
@@ -2452,7 +2460,7 @@ extern "C" int Web_AimAtNearestPic(int pic)
 {
     auto const ps = g_player[myconnectindex].ps;
     if (ps == NULL || (unsigned)ps->cursectnum >= (unsigned)numsectors) return -1;
-    int best = -1; int32_t bestd = INT32_MAX;
+    int best = -1, bestAny = -1; int32_t bestd = INT32_MAX, bestdAny = INT32_MAX;
     for (int i = 0; i < MAXSPRITES; i++)
     {
         if (sprite[i].picnum != pic || sprite[i].statnum >= MAXSTATUS || sprite[i].xrepeat == 0)
@@ -2460,10 +2468,12 @@ extern "C" int Web_AimAtNearestPic(int pic)
         if ((unsigned)sprite[i].sectnum >= (unsigned)numsectors)
             continue;
         int32_t const d = klabs(sprite[i].x - ps->pos.x) + klabs(sprite[i].y - ps->pos.y);
+        if (d < bestdAny) { bestdAny = d; bestAny = i; }
         if (d < bestd && cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
                                 sprite[i].x, sprite[i].y, sprite[i].z - 2048, sprite[i].sectnum))
             { bestd = d; best = i; }
     }
+    if (best < 0) { best = bestAny; bestd = bestdAny; }   // walk toward it (Web_TestDrive)
     if (best < 0) return -1;
     int32_t const dist = max(bestd, 64);
     predictedPlayer.q16ang   = fix16_from_int(getangle(sprite[best].x - ps->pos.x, sprite[best].y - ps->pos.y));
@@ -2473,6 +2483,8 @@ extern "C" int Web_AimAtNearestPic(int pic)
     return best;
 }
 extern "C" void Web_TestFire(int on) { g_testFire = on; }
+int32_t g_testDrive;
+extern "C" void Web_TestDrive(int on) { g_testDrive = on; }
 extern "C" int Web_PicAlive(int idx, int pic)
 {
     if ((unsigned)idx >= MAXSPRITES) return 0;
