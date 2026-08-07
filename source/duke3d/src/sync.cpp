@@ -624,8 +624,8 @@ void Net_GetSyncStat(void)
                 n += Bsnprintf(buf + n, sizeof(buf) - n, "%s%s#%d", kk ? "," : "",
                                s_krandSiteHist[slot][kk], (int)s_krandSprHist[slot][kk]);
             buf[n] = 0;
-            EM_ASM({ console.log('[eng] RNGCAD tic=' + $0 + ' sites=' + UTF8ToString($1)); },
-                   movefifoplc, buf);
+            EM_ASM({ console.log('[eng] RNGCAD tic=' + $0 + ' awc=' + $1 + ' sites=' + UTF8ToString($2)); },
+                   movefifoplc, g_animWallCnt, buf);
         }
     }
 #endif

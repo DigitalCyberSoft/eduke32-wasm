@@ -490,6 +490,7 @@ void G_AnimateWalls(void)
     for (bssize_t animwallNum = g_animWallCnt-1; animwallNum>=0; animwallNum--)
     {
         int const wallNum = animwall[animwallNum].wallnum;
+        g_krandSpriteCtx = wallNum;   // RNG-trace context: names the wall, not a sprite
 
         switch (tileGetMapping(wall[wallNum].picnum))
         {
