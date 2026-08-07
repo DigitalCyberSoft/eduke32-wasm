@@ -19,6 +19,17 @@ P.on('crash', () => { console.log(`${ts()} PAGE CRASHED`); process.exit(3); });
 
 await P.goto(`http://127.0.0.1:7800/?join=${CODE}`, { waitUntil: 'commit', timeout: 60000 });
 console.log(`${ts()} loaded ?join=${CODE}`);
+// Arm forensic CRC dumps (MISMATCH category detail) once the runtime is up.
+(async () => {
+  for (let i = 0; i < 60; i++) {
+    const ok = await P.evaluate(() => {
+      try { if (window.Module?.ccall) { Module.ccall('Web_SetForensics', null, ['number'], [1]); return true; } } catch {}
+      return false;
+    }).catch(() => false);
+    if (ok) { console.log(`${ts()} forensics armed`); return; }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+})();
 
 let last = '';
 let ok = false;

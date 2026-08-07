@@ -44,15 +44,19 @@ console.log(`ARENA JOIN URL: http://127.0.0.1:7800/?join=${encodeURIComponent(in
 // WAIT IN THE LOBBY for a human, then launch: the pre-game join is the proven
 // path (late join into a running match is still being fixed). Bots fill the
 // remaining seats at launch via the min-players floor.
-console.log('ARENA WAITING IN LOBBY: join and the match auto-starts (bots fill in)');
-let joined = false;
-for (let w = 0; w < 750 && !joined; w++) {
-  const m = await st();
-  if ((m.np | 0) >= 2) { joined = true; break; }
-  await new Promise(r => setTimeout(r, 2000));
+if (process.env.WAITFORHUMAN !== '0') {
+  console.log('ARENA WAITING IN LOBBY: join and the match auto-starts (bots fill in)');
+  let joined = false;
+  for (let w = 0; w < 1650 && !joined; w++) {
+    const m = await st();
+    if ((m.np | 0) >= 2) { joined = true; break; }
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  if (!joined) { console.log('ARENA EXPIRED: nobody joined the lobby'); await B.close().catch(() => {}); process.exit(0); }
+  console.log('PLAYER IN LOBBY -> launching');
+} else {
+  console.log('AUTOSTART (WAITFORHUMAN=0): launching now for late-join testing');
 }
-if (!joined) { console.log('ARENA EXPIRED: nobody joined the lobby'); await B.close().catch(() => {}); process.exit(0); }
-console.log('PLAYER IN LOBBY -> launching');
 await selTo(0, 'LOBBY>Launch');
 let inGame = false;
 for (let a = 0; a < 8 && !inGame; a++) { await tap('Return');

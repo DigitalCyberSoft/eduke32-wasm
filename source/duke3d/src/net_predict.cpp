@@ -199,6 +199,16 @@ void        Net_InitializePrediction(void)
 
     if (using_predicted_pointers)
         OSD_Printf("^02Prediction Code Error! Tried to init prediction while currently using predicted pointers!\n");
+    else
+        // Capture the struct pointers HERE, not only in Net_ClearFIFO: a
+        // barrier-free late joiner never passes the tic-0 barrier, so its
+        // original_sprite stayed NULL -- Net_ResetPredictionData then memcpy'd
+        // predicted_sprite from address 0 (the wasm data segment reads fine!),
+        // filling it with the binary's string constants, and the first
+        // prediction pass restored sprite = NULL: the whole sim walked rodata
+        // as sprites until a clip walker hard-looped (live-reported as every
+        // ?join= into a running match freezing seconds after the seat).
+        Net_InitializeStructPointers();
 
     originalPlayer        = g_player[myconnectindex].ps;
     oldnet_predictcontext = NOT_PREDICTABLE;  // Must be initialized to NOT_PREDICTABLE.
