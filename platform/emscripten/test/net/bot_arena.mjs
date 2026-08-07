@@ -12,7 +12,7 @@ const B = await chromium.launch({ headless: true, args: ['--mute-audio', '--auto
 const H = await B.newPage({ viewport: { width: 1024, height: 768 } });
 H.on('crash', () => { console.log('ARENA HOST CRASHED'); process.exit(3); });
 if (process.env.FORENSICS === '1')
-  H.on('console', (m) => { const t = m.text(); if (/MISMATCH|STATDUMP|INPDUMP|syncstat|desync|excise|joinApplied|joinScheduled/.test(t)) console.log(`[host] ${t.slice(0, 190)}`); });
+  H.on('console', (m) => { const t = m.text(); if (/frag|shot|hit|impact|desync|joinApplied/.test(t)) console.log(`[host] ${t.slice(0, 190)}`); });
 await H.goto('http://127.0.0.1:7800/', { waitUntil: 'commit', timeout: 60000 });
 let booted = false;
 for (let i = 0; i < 150 && !booted; i++) {

@@ -531,6 +531,8 @@ static int8_t  s_botWasDead[MAXPLAYERS];
 static int16_t s_botSpawnRoam[MAXPLAYERS];   // post-respawn target-blind roam
 static int8_t  s_botBreakFire[MAXPLAYERS];   // tics of blocker-clearing fire
 static int8_t  s_botOpenGrace[MAXPLAYERS];   // door-try: keep pushing before bouncing
+static uint8_t s_botBurst[MAXPLAYERS];       // fire cadence phase (24 on / 8 off)
+static int16_t s_botTargetHold[MAXPLAYERS];  // tics on the same target without a kill
 
 static input_t Bot_GetInput(int k)
 {
@@ -574,17 +576,29 @@ static input_t Bot_GetInput(int k)
     if (--s_botThinkHold[k] <= 0)
     {
         s_botThinkHold[k] = (int16_t)(holdMax[skill] + (Bot_Rnd() % holdMax[skill]));
+        // Fruitless-fixation breaker: ~10s on one target with no kill means it
+        // is not actually reachable (measured pathology: every bot pinned on
+        // the rooftop-spawn host, pistols eating the ledge wall forever while
+        // ground-level enemies walked past each other). Rotate off it.
+        int const avoid = (s_botTargetHold[k] > 300) ? s_botTarget[k] : -1;
         int best = -1; int32_t bestd = INT32_MAX; int i;
         TRAVERSE_CONNECT(i)
         {
-            if (i == k) continue;
+            if (i == k || i == avoid) continue;
             auto const tp = g_player[i].ps;
             if (tp == NULL || (unsigned)tp->i >= MAXSPRITES || sprite[tp->i].extra <= 0 || tp->dead_flag
                 || (unsigned)tp->cursectnum >= (unsigned)numsectors)
                 continue;
-            int32_t const d = klabs(tp->pos.x - ps->pos.x) + klabs(tp->pos.y - ps->pos.y);
+            // Height counts triple: a target a floor away is a target a long
+            // detour away, and pistols cannot argue with a ledge.
+            int32_t const d = klabs(tp->pos.x - ps->pos.x) + klabs(tp->pos.y - ps->pos.y)
+                              + (klabs(tp->pos.z - ps->pos.z) >> 2) * 3;
             if (d < bestd) { bestd = d; best = i; }
         }
+        if (best < 0 && avoid >= 0)
+            best = avoid;   // nobody else exists: keep the old one
+        if (best != s_botTarget[k])
+            s_botTargetHold[k] = 0;
         s_botTarget[k] = (int8_t)best;
         if ((Bot_Rnd() & 3) == 0)
             s_botStrafeDir[k] = (Bot_Rnd() & 1) ? 1 : -1;
@@ -637,6 +651,8 @@ static input_t Bot_GetInput(int k)
     // lives long enough to walk anywhere -- measured spread: 220 units).
     if (s_botSpawnRoam[k] > 0)
         s_botSpawnRoam[k]--;
+    if (s_botTarget[k] >= 0 && s_botTargetHold[k] < 32000)
+        s_botTargetHold[k]++;
     int const t = (s_botSpawnRoam[k] > 0) ? -1 : s_botTarget[k];
     auto const tp = (t >= 0 && g_player[t].connected && g_player[t].ps != NULL) ? g_player[t].ps : NULL;
     bool const seesTarget = (tp != NULL && (unsigned)tp->cursectnum < (unsigned)numsectors
@@ -663,10 +679,37 @@ static input_t Bot_GetInput(int k)
         wantAng = s_botWanderAng[k];
 
     int diff = (((wantAng - fix16_to_int(ps->q16ang)) + 1024) & 2047) - 1024;
-    int const aimErr = seesTarget ? (int)(Bot_Rnd() % (2 * wobble[skill] + 1)) - wobble[skill] : 0;
-    in.q16avel = fix16_from_int(clamp(diff + aimErr, -turnCap[skill], turnCap[skill]));
+    // Tracking: SMALL wobble while the target is visible (the old +-48 at
+    // default skill was +-8 degrees of permanent miss -- "the bots can't aim",
+    // live-reported), and double the turn rate when far off so they snap on.
+    static int const trackWobble[3] = { 20, 8, 3 };
+    int const aimErr = seesTarget ? (int)(Bot_Rnd() % (2 * trackWobble[skill] + 1)) - trackWobble[skill]
+                                  : (int)(Bot_Rnd() % (2 * wobble[skill] + 1)) - wobble[skill];
+    int const cap = (seesTarget && klabs(diff) > turnCap[skill]) ? turnCap[skill] * 2 : turnCap[skill];
+    in.q16avel = fix16_from_int(clamp(diff + aimErr, -cap, cap));
 
     int32_t const dist2d = (tp != NULL) ? klabs(tp->pos.x - ps->pos.x) + klabs(tp->pos.y - ps->pos.y) : INT32_MAX;
+
+    // VERTICAL AIM via the sim's OWN aim keys: raw q16horz deltas fought the
+    // auto-centering and OSCILLATED (measured: shot-time horiz swinging
+    // 59..127 -- pistols into the floor, 384 shots 0 hits). Holding
+    // SK_AIM_UP/DOWN moves pitch at the sim's rate with centering suspended,
+    // so overshoot is structurally impossible; SK_CENTER_VIEW levels back
+    // off-combat.
+    {
+        int const curHoriz = fix16_to_int(ps->q16horiz);
+        if (seesTarget && dist2d > 256)
+        {
+            int32_t const dz = tp->pos.z - ps->pos.z;   // eye-to-eye; z grows down
+            int const wantHoriz = clamp(100 - (int)(((int64_t)dz * 16) / max(dist2d, 256)), 60, 140);
+            if (curHoriz < wantHoriz - 6)
+                in.bits |= BIT(SK_AIM_UP);
+            else if (curHoriz > wantHoriz + 6)
+                in.bits |= BIT(SK_AIM_DOWN);
+        }
+        else if (klabs(curHoriz - 100) > 10)
+            in.bits |= BIT(SK_CENTER_VIEW);
+    }
     if (seesTarget && dist2d <= 2048)
     {
         // Knife-fight range: circle-strafe with forward pressure.
@@ -685,7 +728,14 @@ static input_t Bot_GetInput(int k)
     if ((Bot_Rnd() & 127) < 2)
         in.bits |= BIT(SK_JUMP);
 
-    if (seesTarget && klabs(diff) < fireGate[skill])
+    // Fire discipline: the gate uses TRUE aim error (wobble is steering noise,
+    // not trigger noise), halves with distance so long shots need real aim,
+    // and runs a 24-on/8-off burst cadence instead of a held trigger.
+    int gate = fireGate[skill];
+    if (dist2d > 8192)  gate >>= 1;
+    if (dist2d > 20000) gate >>= 1;
+    s_botBurst[k] = (uint8_t)((s_botBurst[k] + 1) & 31);
+    if (seesTarget && klabs(diff) < max(gate, 16) && s_botBurst[k] < 24)
         in.bits |= BIT(SK_FIRE);
     // Blocker-clearing burst ("if an item is in the way of exiting a room,
     // destroy it"): fires along the facing while stuck, only when no player

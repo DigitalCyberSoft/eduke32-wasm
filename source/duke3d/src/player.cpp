@@ -25,6 +25,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "enet.h"
 #include "input.h"
 #include "savegame.h"
+#ifdef __EMSCRIPTEN__
+# include <emscripten.h>
+#endif
 
 #ifdef NETDUKE32
 # include "net_predict.h"  // predicted-view swap for frame-rate angle smoothing (MP)
@@ -86,6 +89,13 @@ static void P_IncurDamage(DukePlayer_t * const pPlayer)
         return;
 
     sprite[pPlayer->i].extra -= pPlayer->extra_extra8>>8;
+
+#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+    // Bot-combat forensics: prove hits land on players.
+    if (numplayers > 1 && (pPlayer->extra_extra8 >> 8) > 0)
+        EM_ASM({ console.log('[hit] victim=' + $0 + ' dmg=' + $1 + ' hp=' + $2); },
+               P_Get(pPlayer->i), pPlayer->extra_extra8 >> 8, sprite[pPlayer->i].extra);
+#endif
 
     int playerDamage = sprite[pPlayer->i].extra - pPlayer->last_extra;
 
@@ -1211,6 +1221,24 @@ static int32_t A_ShootHardcoded(int spriteNum, int projecTile, int shootAng, vec
             if (Proj_DoHitscan(spriteNum, 256 + 1, &startPos, Zvel, shootAng, &hitData))
                 return -1;
 
+#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+            // Bullet-impact forensics: name what every 8th hitscan ray ends on
+            // (wall / sprite+picnum / bare sector). 384 bot shots produced zero
+            // player-damage events; this decides between "aim off" and
+            // "players not hittable".
+            if (numplayers > 1)
+            {
+                static int s_impN;
+                // Sprite hits are the rare decisive events: log them ALL
+                // (walls stay 1-in-8, they dominate and say little).
+                if ((++s_impN & 7) == 0 || hitData.sprite >= 0)
+                    EM_ASM({ console.log('[impact] shooter=' + $0 + ' wall=' + $1 + ' spr=' + $2 + ' pic=' + $3 + ' stat=' + $4 + ' zv=' + $5); },
+                           spriteNum, hitData.wall, hitData.sprite,
+                           (hitData.sprite >= 0) ? sprite[hitData.sprite].picnum : -1,
+                           (hitData.sprite >= 0) ? sprite[hitData.sprite].statnum : -1, Zvel);
+            }
+#endif
+
             if ((krand() & 15) == 0 && sector[hitData.sect].lotag == ST_2_UNDERWATER)
                 Proj_DoWaterTracers(hitData.xyz, &startPos, 8 - (ud.multimode >> 1), pSprite->sectnum);
 
@@ -2065,6 +2093,16 @@ static void P_FireWeapon(int playerNum)
         pPlayer->ammo_amount[pPlayer->curr_weapon]--;
         P_DoWeaponRumble(playerNum);
     }
+#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+    // Bot-combat forensics: prove shots actually discharge (throttled).
+    if (numplayers > 1)
+    {
+        static int s_shotN;
+        if ((++s_shotN & 7) == 0)
+            EM_ASM({ console.log('[shot] p=' + $0 + ' weap=' + $1 + ' horiz=' + $2 + ' n=' + $3); },
+                   playerNum, pPlayer->curr_weapon, fix16_to_int(pPlayer->q16horiz), s_shotN);
+    }
+#endif
 
     if (PWEAPON(playerNum, pPlayer->curr_weapon, WorksLike) == FLAMETHROWER_WEAPON && sector[pPlayer->cursectnum].lotag == ST_2_UNDERWATER)
         return;
@@ -4129,6 +4167,14 @@ void P_FragPlayer(int playerNum)
     auto const pPlayer = g_player[playerNum].ps;
     auto const pSprite = &sprite[pPlayer->i];
 
+#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+    // Kill telemetry: the bot-combat harness measures frag RATE from these
+    // lines ("the bots can't kill each other" must be a number, not a vibe).
+    if (numplayers > 1)
+        EM_ASM({ console.log('[frag] victim=' + $0 + ' killer=' + $1 + ' tic=' + $2); },
+               playerNum, pPlayer->frag_ps, movefifoplc);
+#endif
+
 #if !defined(NETDUKE32)
     if (g_netClient) // [75] The server should not overwrite its own randomseed
         randomseed = ticrandomseed;
@@ -5106,6 +5152,16 @@ void P_ProcessInput(int playerNum)
 
     auto const pPlayer = thisPlayer.ps;
     auto const pSprite = &sprite[pPlayer->i];
+
+#ifdef NETDUKE32
+    // ARENA RULE: the pistol never runs dry in multiplayer. CPU players have
+    // no item-seeking, so they burned their 48 rounds and clicked an empty
+    // gun forever (measured: 0 frags in 4 minutes of 5-bot DM); humans get
+    // the same floor so a fight is always possible. Runs identically in
+    // every sim -- pure function of replicated state, no divergence.
+    if (numplayers > 1 && pPlayer->ammo_amount[PISTOL_WEAPON] < 12)
+        pPlayer->ammo_amount[PISTOL_WEAPON] = 12;
+#endif
 
     ++pPlayer->player_par;
 

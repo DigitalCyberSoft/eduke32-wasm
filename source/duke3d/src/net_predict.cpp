@@ -158,6 +158,32 @@ void Net_CorrectPrediction(void)
     predictedPlayer.q16horizoff = q16horizoff;  predictedPlayer.oq16horizoff = oq16horizoff;
     predictedPlayer.rotscrnang  = rotscrnang;   predictedPlayer.orotscrnang  = orotscrnang;
     predictedPlayer.look_ang    = look_ang;     predictedPlayer.olook_ang    = olook_ang;
+
+    // BOUNDED VIEW: the carried (frame-owned) direction and the sim's copy
+    // integrate the same deltas but apply clamps/centering in different
+    // orders, so they drift apart -- and the SIM is what shoots. A drifted
+    // crosshair means aimed shots miss ("can't hit a fire hydrant",
+    // live-reported twice). Glide any gap closed a quarter per correction
+    // pass: imperceptible per frame, and drift can never accumulate.
+    {
+        DukePlayer_t const *sim = p;   // original pointers active here
+        fix16_t gapH = fix16_ssub(predictedPlayer.q16horiz, sim->q16horiz);
+        if (fix16_abs(gapH) > F16(1))
+            predictedPlayer.q16horiz = fix16_ssub(predictedPlayer.q16horiz, gapH >> 2);
+        fix16_t gapO = fix16_ssub(predictedPlayer.q16horizoff, sim->q16horizoff);
+        if (fix16_abs(gapO) > F16(1))
+            predictedPlayer.q16horizoff = fix16_ssub(predictedPlayer.q16horizoff, gapO >> 2);
+        fix16_t gapA = fix16_ssub(predictedPlayer.q16ang, sim->q16ang);
+        while (gapA > F16(1024))  gapA = fix16_ssub(gapA, F16(2048));
+        while (gapA < -F16(1024)) gapA = fix16_sadd(gapA, F16(2048));
+        if (fix16_abs(gapA) > F16(1))
+        {
+            fix16_t a = fix16_ssub(predictedPlayer.q16ang, gapA >> 2);
+            while (a < 0)         a = fix16_sadd(a, F16(2048));
+            while (a >= F16(2048)) a = fix16_ssub(a, F16(2048));
+            predictedPlayer.q16ang = a;
+        }
+    }
 }
 
 void Net_InitializeStructPointers(void)
