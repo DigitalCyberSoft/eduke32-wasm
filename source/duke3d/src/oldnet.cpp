@@ -569,7 +569,13 @@ static int Bot_NavFirstHop(int fromSect, int toSect, int32_t *px, int32_t *py)
         for (int w = sector[s].wallptr; w < wend; w++)
         {
             int const ns = wall[w].nextsector;
-            if (ns < 0 || (unsigned)ns >= (unsigned)numsectors || seenGen[ns] == gen)
+            // cstat&1 = clip-blocking: fences/rails are two-sided walls WITH a
+            // nextsector -- without this skip the BFS routed straight through
+            // the E1L1 rooftop chain-link and parked the "portal" ON the mesh
+            // (nav measured zero improvement; bots ground the fence at the
+            // exact midpoint the router chose).
+            if (ns < 0 || (unsigned)ns >= (unsigned)numsectors || seenGen[ns] == gen
+                || (wall[w].cstat & 1))
                 continue;
             seenGen[ns]    = gen;
             parentSect[ns] = (int16_t)s;
@@ -620,7 +626,15 @@ static input_t Bot_GetInput(int k)
                     if (s < minSep) minSep = s;
                 }
             }
-            EM_ASM({ console.log('[botsep] plc=' + $0 + ' minsep=' + $1); }, movefifoplc, minSep);
+            int sct[5] = { -1, -1, -1, -1, -1 };
+            int na = 0;
+            TRAVERSE_CONNECT(a)
+            {
+                if (na >= 5) break;
+                sct[na++] = (g_player[a].ps != NULL) ? g_player[a].ps->cursectnum : -1;
+            }
+            EM_ASM({ console.log('[botsep] plc=' + $0 + ' minsep=' + $1 + ' sect=' + $2 + ',' + $3 + ',' + $4 + ',' + $5 + ',' + $6); },
+                   movefifoplc, minSep, sct[0], sct[1], sct[2], sct[3], sct[4]);
         }
     }
     // The pump can ask for a column BEFORE the level exists (seated at
@@ -767,7 +781,12 @@ static input_t Bot_GetInput(int k)
                 s_botOpenGrace[k]  = 0;
                 if (s_botStuckEpisodes[k] < 6)
                     s_botStuckEpisodes[k]++;
-                s_botBounceHold[k] = (int16_t)(20 + (Bot_Rnd() & 31) + 16 * s_botStuckEpisodes[k]);
+                // While a route is plotted, bounce SHORT and re-plan -- the
+                // escalated 5s random walks were overriding the navigator
+                // (steering priority: bounce > nav) and burying its effect.
+                s_botBounceHold[k] = (int16_t)(20 + (Bot_Rnd() & 31)
+                                     + (s_botNavOn[k] ? 0 : 16 * s_botStuckEpisodes[k]));
+                s_botThinkHold[k]  = 1;   // fresh route right after this bounce
                 s_botBounceAng[k]  = (int16_t)((fix16_to_int(ps->q16ang) + 512 + (int)(Bot_Rnd() & 1023)) & 2047);
                 if (Bot_Rnd() & 1)
                     in.bits |= BIT(SK_JUMP);    // ...unless it is a ledge
