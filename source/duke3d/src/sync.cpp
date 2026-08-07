@@ -605,6 +605,14 @@ void Net_GetSyncStat(void)
                movefifoplc, INPUTFIFO_CURTICK,
                (int)(uint8_t)syncData[INPUTFIFO_CURTICK][2],
                (int)(uint8_t)syncData[INPUTFIFO_CURTICK][6]);
+    // Forensics: EVERY peer dumps per-statnum hashes on the same cadence, so a
+    // cross-peer diff of same-tic STATDUMP lines names the diverging statnum
+    // without waiting for a detector (the host never detects -- guests do).
+    {
+        extern int32_t g_netForensics;
+        if (g_netForensics && (movefifoplc & 63) == 0)
+            Sync_DumpStatHashes(movefifoplc);
+    }
 #endif
 }
 

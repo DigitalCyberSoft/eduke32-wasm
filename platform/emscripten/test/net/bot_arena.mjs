@@ -11,6 +11,8 @@ const B = await chromium.launch({ headless: true, args: ['--mute-audio', '--auto
   '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows'] });
 const H = await B.newPage({ viewport: { width: 1024, height: 768 } });
 H.on('crash', () => { console.log('ARENA HOST CRASHED'); process.exit(3); });
+if (process.env.FORENSICS === '1')
+  H.on('console', (m) => { const t = m.text(); if (/MISMATCH|STATDUMP|INPDUMP|syncstat|desync|excise|joinApplied|joinScheduled/.test(t)) console.log(`[host] ${t.slice(0, 190)}`); });
 await H.goto('http://127.0.0.1:7800/', { waitUntil: 'commit', timeout: 60000 });
 let booted = false;
 for (let i = 0; i < 150 && !booted; i++) {
@@ -20,6 +22,8 @@ for (let i = 0; i < 150 && !booted; i++) {
 if (!booted) { console.log('FAIL boot'); process.exit(1); }
 await H.bringToFront().catch(() => {});
 await H.evaluate(() => { const c = document.querySelector('canvas'); if (c) { c.setAttribute('tabindex', '0'); c.focus(); } });
+if (process.env.FORENSICS === '1')
+  await H.evaluate(() => { try { Module.ccall('Web_SetForensics', null, ['number'], [1]); } catch (e) {} }).catch(() => {});
 const st = () => Promise.race([H.evaluate(() => window.__e32menu || {}).catch(() => ({})), new Promise(r => setTimeout(() => r({}), 4000))]);
 const KEY = { Up: 'ArrowUp', Down: 'ArrowDown', Left: 'ArrowLeft', Right: 'ArrowRight', Return: 'Enter' };
 const tap = async (k) => { await H.keyboard.down(KEY[k] || k).catch(() => {}); execSync('sleep 0.15'); await H.keyboard.up(KEY[k] || k).catch(() => {}); };

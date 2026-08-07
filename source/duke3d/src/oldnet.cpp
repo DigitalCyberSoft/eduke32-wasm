@@ -2638,6 +2638,12 @@ void Net_ApplyPendingJoins(void)
                 g_player[p2].myminlag = 0x7fffffff;
             mymaxlag = otherminlag = 0;
             Net_InitializePrediction();
+            // The catchup consume filled the compare ring at fast-forward
+            // phase: those slots hash a DIFFERENT moment than the host's
+            // real-time fills, so post-seat compares read them as divergence
+            // (forensics-proven false positive: STATDUMP parity while cat-18
+            // "mismatched"). Restart the compare window at the seat.
+            Net_ResetSyncCheck();
         }
 #ifdef __EMSCRIPTEN__
         EM_ASM({ console.log('[eng] joinApplied p=' + $0 + ' tic=' + $1 + ' np=' + $2 + ' me=' + $3); },
