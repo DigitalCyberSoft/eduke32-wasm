@@ -1129,7 +1129,41 @@ void Net_HandleInput(void)
     {
         if (isSlave)
         {
-            g_netSendRing[g_netSampleHead & (MOVEFIFOSIZ - 1)] = netInput;
+            input_t staged = netInput;
+            // CLOSED-LOOP AIM -- the shot truth comes from the PLAYER THAT
+            // FIRES (live-directed, twice). The wire carries direction DELTAS
+            // and open-loop accumulation drifts from the crosshair (staging
+            // clamps, sim centering): the host renders its own sim so its aim
+            // was always exact, while a guest's sim shot wherever the drift
+            // pointed. Stage, instead, exactly the delta that lands the sim
+            // ON the view's current direction: anchor at our own sim (the
+            // post-consume truth), replay the still-in-flight staged deltas,
+            // send the remaining gap. Truncation self-heals -- the next tic
+            // re-measures against a fresh anchor -- and every peer consumes
+            // identical bytes, so determinism is untouched. The local-bot
+            // test mode is exempt: its raw inputs ARE its intent (no view).
+            if (!g_netLocalBot && g_player[myconnectindex].ps != NULL
+                && (g_player[myconnectindex].ps->gm & MODE_GAME))
+            {
+                fix16_t wa = g_player[myconnectindex].ps->q16ang;
+                fix16_t wh = g_player[myconnectindex].ps->q16horiz;
+                int32_t const from = max(movefifoplc, g_netSampleHead - 64);
+                for (int32_t tt = from; tt < g_netSampleHead; tt++)
+                {
+                    input_t const &r = g_netSendRing[tt & (MOVEFIFOSIZ - 1)];
+                    wa = fix16_sadd(wa, r.q16avel);
+                    wh = fix16_clamp(fix16_sadd(wh, r.q16horz), F16(HORIZ_MIN), F16(HORIZ_MAX));
+                }
+                while (wa < 0)          wa = fix16_sadd(wa, F16(2048));
+                while (wa >= F16(2048)) wa = fix16_ssub(wa, F16(2048));
+                fix16_t da = fix16_ssub(predictedPlayer.q16ang, wa);
+                while (da > F16(1024))  da = fix16_ssub(da, F16(2048));
+                while (da < -F16(1024)) da = fix16_sadd(da, F16(2048));
+                staged.q16avel = fix16_clamp(da, -F16(512), F16(512));
+                staged.q16horz = fix16_clamp(fix16_ssub(predictedPlayer.q16horiz, wh),
+                                             -F16(127), F16(127));
+            }
+            g_netSendRing[g_netSampleHead & (MOVEFIFOSIZ - 1)] = staged;
             g_netSampleHead++;
         }
         else
