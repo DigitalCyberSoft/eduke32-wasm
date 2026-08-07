@@ -502,7 +502,8 @@ static int      s_healAckFence;      // host: 1 = post-apply acks are flowing
 static int32_t  s_softStrikes[MAXPLAYERS];
 static int32_t  s_softStrikeClock[MAXPLAYERS];
 // Tic-stamped soft snap awaiting its consume tic (guest side).
-static char     s_pendingSnap[600];  // [type][count][tic i32][seed i32][grand i32] + 8*69B
+static char     s_pendingSnap[704];  // [type][count][tic i32][seed i32][grand i32]
+                                     // + 8*69B players + [awc]+64*i16 animwall tags
 static int      s_pendingSnapLen;
 static int32_t  s_pendingSnapTic;
 
@@ -1960,7 +1961,10 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     break;
                 int32_t const snapTic = (int32_t)B_UNBUF32(&packbuf[2]);
                 int const cnt = (uint8_t)packbuf[1];
-                int const len = 14 + cnt * 69;
+                int const base = 14 + cnt * 69;
+                // Trailing animwall tag phases: [count][int16 tags...].
+                int const awc = (uint8_t)packbuf[base];
+                int const len = base + 1 + awc * 2;
                 if (snapTic < movefifoplc || len > (int)sizeof(s_pendingSnap))
                 {
 #ifdef __EMSCRIPTEN__
@@ -3060,6 +3064,22 @@ void Net_SendStateSnap(int k)
         n++;
     }
     packbuf[countPos] = (char)n;
+    // ANIMWALL TAG PHASES: the forcefield animator's tag reset is RNG-coupled
+    // (tag = 128<<(krand()&3)), so ONE transient stream fork makes every
+    // wall's phase absorb different random values -- and a soft snap that
+    // realigns randomseed but NOT the tags re-forks within a tic (wall-level
+    // forensics: same-tic krand windows on walls {1590,1570} vs {1574}). The
+    // phases ride along; the correction finally corrects the thing that was
+    // re-breaking it.
+    {
+        int const awc = min<int>(g_animWallCnt, 64);
+        packbuf[j++] = (char)awc;
+        for (int aw = 0; aw < awc; aw++)
+        {
+            B_BUF16(&packbuf[j], (int16_t)animwall[aw].tag);
+            j += 2;
+        }
+    }
     oldnet_sendpacket(k, (unsigned char *)packbuf, j);
     initprintf("net: soft state snap -> slot %d (%d players, %d bytes, tic %d)\n", k, n, j, movefifoplc);
 #ifdef __EMSCRIPTEN__
@@ -3133,6 +3153,19 @@ void Net_ApplyPendingStateSnap(void)
         }
         if ((unsigned)cursect < (unsigned)numsectors)
             ps->cursectnum = cursect;
+    }
+    // ANIMWALL TAG PHASES (see the sender): RNG-coupled state a seed-only
+    // correction left forked -- the realigned stream re-forked within a tic,
+    // sustaining the correction loop forever. Aligning the phases here is
+    // what lets a single soft snap actually STICK.
+    {
+        int const awc = (uint8_t)buf[jj++];
+        for (int aw = 0; aw < awc; aw++)
+        {
+            int16_t const tag = (int16_t)B_UNBUF16(&buf[jj]); jj += 2;
+            if (aw < g_animWallCnt)
+                animwall[aw].tag = tag;
+        }
     }
     Net_InitializePrediction();   // fresh prediction base off corrected state
     Net_ResetSyncCheck();         // stale verdicts described the pre-snap world
