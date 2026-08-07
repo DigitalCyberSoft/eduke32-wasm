@@ -605,13 +605,23 @@ void Net_GetSyncStat(void)
                movefifoplc, INPUTFIFO_CURTICK,
                (int)(uint8_t)syncData[INPUTFIFO_CURTICK][2],
                (int)(uint8_t)syncData[INPUTFIFO_CURTICK][6]);
-    // Forensics: EVERY peer dumps per-statnum hashes on the same cadence, so a
-    // cross-peer diff of same-tic STATDUMP lines names the diverging statnum
-    // without waiting for a detector (the host never detects -- guests do).
+    // Forensics: EVERY peer dumps per-statnum hashes AND the tic's krand call
+    // sites on the same cadence, so cross-peer same-tic diffs name a diverging
+    // statnum or RNG caller without waiting for a detector (detection moments
+    // never coincide across peers -- measured: zero common dump tics).
     {
         extern int32_t g_netForensics;
         if (g_netForensics && (movefifoplc & 63) == 0)
+        {
             Sync_DumpStatHashes(movefifoplc);
+            int const slot = INPUTFIFO_CURTICK;
+            char buf[512]; int n = 0;
+            for (int kk = 0; kk < 6 && s_krandSiteHist[slot][kk] != NULL && n < 480; kk++)
+                n += Bsnprintf(buf + n, sizeof(buf) - n, "%s%s", kk ? "," : "", s_krandSiteHist[slot][kk]);
+            buf[n] = 0;
+            EM_ASM({ console.log('[eng] RNGCAD tic=' + $0 + ' sites=' + UTF8ToString($1)); },
+                   movefifoplc, buf);
+        }
     }
 #endif
 }
