@@ -229,7 +229,13 @@
     canvas: (function(){ var c = document.getElementById('canvas');
       c.addEventListener('webglcontextlost', function(e){ alert('WebGL context lost.'); e.preventDefault(); }, false);
       return c; })(),
-    arguments: ['-nosetup'],
+    arguments: (function () {
+      var a = ['-nosetup'];
+      // ?join= / ?bot= flows go straight to work: skip the logo/title crawl.
+      var q = new URLSearchParams(location.search);
+      if (q.get('join') || q.get('bot') === '1') a.push('-nologo');
+      return a;
+    })(),
     // Cache-bust the wasm with the deploy build id so a fresh deploy is never served
     // from a stale browser/CDN cache. The 11 MB .data is intentionally NOT busted
     // (rarely changes; busting it would re-download the whole pack every deploy).

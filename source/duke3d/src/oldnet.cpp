@@ -526,6 +526,8 @@ static int16_t s_botBounceHold[MAXPLAYERS];  // tics left steering to bounceAng
 static int16_t s_botBounceAng[MAXPLAYERS];
 static int8_t  s_botWasDead[MAXPLAYERS];
 static int16_t s_botSpawnRoam[MAXPLAYERS];   // post-respawn target-blind roam
+static int8_t  s_botBreakFire[MAXPLAYERS];   // tics of blocker-clearing fire
+static int8_t  s_botOpenGrace[MAXPLAYERS];   // door-try: keep pushing before bouncing
 
 static input_t Bot_GetInput(int k)
 {
@@ -595,18 +597,44 @@ static input_t Bot_GetInput(int k)
     {
         if (++s_botStuckTics[k] > 10)
         {
-            s_botStuckTics[k]  = 0;
-            s_botBounceHold[k] = (int16_t)(20 + (Bot_Rnd() & 31));
-            s_botBounceAng[k]  = (int16_t)((fix16_to_int(ps->q16ang) + 512 + (int)(Bot_Rnd() & 1023)) & 2047);
-            in.bits |= BIT(SK_OPEN);            // whatever blocks us might be a door
-            if (Bot_Rnd() & 1)
-                in.bits |= BIT(SK_JUMP);        // ...or a ledge
+            s_botStuckTics[k] = 0;
+            if (s_botOpenGrace[k] == 0 && s_botBounceHold[k] == 0)
+            {
+                // First response to a blockage: it is probably a DOOR. Press
+                // open and KEEP PUSHING -- doors take tics to swing; turning
+                // away instantly (the old behavior) wasted every door press.
+                // Also burst-fire in case it is a destructible prop.
+                s_botOpenGrace[k]  = 26;
+                in.bits |= BIT(SK_OPEN);
+                s_botBreakFire[k]  = 8;
+            }
+            else
+            {
+                // Door try spent and still stuck: bounce away hard.
+                s_botOpenGrace[k]  = 0;
+                s_botBounceHold[k] = (int16_t)(20 + (Bot_Rnd() & 31));
+                s_botBounceAng[k]  = (int16_t)((fix16_to_int(ps->q16ang) + 512 + (int)(Bot_Rnd() & 1023)) & 2047);
+                if (Bot_Rnd() & 1)
+                    in.bits |= BIT(SK_JUMP);    // ...unless it is a ledge
+            }
         }
     }
     else if (s_botStuckTics[k] > 0)
         s_botStuckTics[k]--;
+    if (s_botOpenGrace[k] > 0)
+    {
+        s_botOpenGrace[k]--;
+        if ((s_botOpenGrace[k] & 7) == 0)
+            in.bits |= BIT(SK_OPEN);            // re-press while the grace runs
+    }
 
-    int const t = s_botTarget[k];
+    // Post-respawn roam window: target-blind AND trigger-blind, so freshly
+    // spawned bots scatter instead of re-joining the spawn-cluster bloodbath
+    // (all DM spawns on this map are mutually visible; without this nobody
+    // lives long enough to walk anywhere -- measured spread: 220 units).
+    if (s_botSpawnRoam[k] > 0)
+        s_botSpawnRoam[k]--;
+    int const t = (s_botSpawnRoam[k] > 0) ? -1 : s_botTarget[k];
     auto const tp = (t >= 0 && g_player[t].connected && g_player[t].ps != NULL) ? g_player[t].ps : NULL;
     bool const seesTarget = (tp != NULL && (unsigned)tp->cursectnum < (unsigned)numsectors
                              && cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
@@ -656,6 +684,15 @@ static input_t Bot_GetInput(int k)
 
     if (seesTarget && klabs(diff) < fireGate[skill])
         in.bits |= BIT(SK_FIRE);
+    // Blocker-clearing burst ("if an item is in the way of exiting a room,
+    // destroy it"): fires along the facing while stuck, only when no player
+    // is visible and outside the post-spawn pacifist window. Bullets against
+    // walls/doors are harmless; barrels and crates stop blocking.
+    else if (s_botBreakFire[k] > 0 && s_botSpawnRoam[k] == 0)
+    {
+        s_botBreakFire[k]--;
+        in.bits |= BIT(SK_FIRE);
+    }
 
     return in;
 }

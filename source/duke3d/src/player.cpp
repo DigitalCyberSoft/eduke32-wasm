@@ -3540,8 +3540,21 @@ void P_GetInput(int const playerNum)
 
         if (!(movementLocked & IL_NOHORIZ))
         {
-            float horizAngle   = atan2f(localInput.q16horz, F16(128)) * (512.f / fPI) + fix16_to_float(input.q16horz);
-            localInput.q16horz = fix16_clamp(Blrintf(F16(128) * tanf(horizAngle * (fPI / 512.f))), F16(-MAXHORIZVEL), F16(MAXHORIZVEL));
+#ifdef NETDUKE32
+            if (numplayers > 1)
+                // MP: LINEAR pitch staging. The view (frame path) and the sim
+                // (tic path) both integrate pitch linearly; folding the staged
+                // tic through tangent-space float trig made the SIM aim differ
+                // from the crosshair -- "can't hit what I'm aiming at",
+                // worst on props (no autoaim). All three now agree exactly.
+                localInput.q16horz = fix16_clamp(fix16_sadd(localInput.q16horz, input.q16horz),
+                                                 F16(-MAXHORIZVEL), F16(MAXHORIZVEL));
+            else
+#endif
+            {
+                float horizAngle   = atan2f(localInput.q16horz, F16(128)) * (512.f / fPI) + fix16_to_float(input.q16horz);
+                localInput.q16horz = fix16_clamp(Blrintf(F16(128) * tanf(horizAngle * (fPI / 512.f))), F16(-MAXHORIZVEL), F16(MAXHORIZVEL));
+            }
         }
     }
 
