@@ -519,6 +519,13 @@ static int8_t  s_botStrafeDir[MAXPLAYERS];
 static int16_t s_botWanderAng[MAXPLAYERS];
 static int16_t s_botThinkHold[MAXPLAYERS];   // reaction: tics until retarget allowed
 static int8_t  s_botTarget[MAXPLAYERS];
+// Waypoint-free navigation: stuck detection + wall-bounce + door press.
+static vec2_t  s_botLastPos[MAXPLAYERS];
+static int16_t s_botStuckTics[MAXPLAYERS];
+static int16_t s_botBounceHold[MAXPLAYERS];  // tics left steering to bounceAng
+static int16_t s_botBounceAng[MAXPLAYERS];
+static int8_t  s_botWasDead[MAXPLAYERS];
+static int16_t s_botSpawnRoam[MAXPLAYERS];   // post-respawn target-blind roam
 
 static input_t Bot_GetInput(int k)
 {
@@ -534,9 +541,20 @@ static input_t Bot_GetInput(int k)
 
     if (sprite[ps->i].extra <= 0 || ps->dead_flag)
     {
+        s_botWasDead[k] = 1;
         if ((Bot_Rnd() & 15) == 0)
             in.bits |= BIT(SK_FIRE);              // respawn
         return in;
+    }
+    if (s_botWasDead[k])
+    {
+        // Fresh spawn: DISPERSE before re-engaging. Without this, mutually
+        // visible spawns lock bots into an endless in-place kill loop (seen:
+        // 90s soak, position spread 220 map units) -- nobody ever roams the
+        // map to find the humans.
+        s_botWasDead[k]  = 0;
+        s_botSpawnRoam[k] = (int16_t)(90 + (Bot_Rnd() % 120));
+        s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
     }
 
     int const skill = clamp(g_netBotSkill, 0, 2);
@@ -568,41 +586,75 @@ static input_t Bot_GetInput(int k)
         s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
     }
 
-    int const t = s_botTarget[k];
-    if (t < 0 || !g_player[t].connected || g_player[t].ps == NULL)
+    // Stuck detection: intending to move but the feet aren't (walls, doors,
+    // ledges). Trip the wall-bounce: hard random turn held for a while, press
+    // OPEN (doors are everywhere in Duke) and occasionally JUMP (ledges).
+    int32_t const stepped = klabs(ps->pos.x - s_botLastPos[k].x) + klabs(ps->pos.y - s_botLastPos[k].y);
+    s_botLastPos[k] = ps->pos.xy;
+    if (stepped < 16)
     {
-        // Nobody to fight: wander.
-        int const diff = (((s_botWanderAng[k] - fix16_to_int(ps->q16ang)) + 1024) & 2047) - 1024;
-        in.q16avel = fix16_from_int(clamp(diff, -turnCap[skill], turnCap[skill]));
-        in.fvel    = 64;
-        in.extbits |= BIT(EK_MOVE_FORWARD);
-        return in;
+        if (++s_botStuckTics[k] > 10)
+        {
+            s_botStuckTics[k]  = 0;
+            s_botBounceHold[k] = (int16_t)(20 + (Bot_Rnd() & 31));
+            s_botBounceAng[k]  = (int16_t)((fix16_to_int(ps->q16ang) + 512 + (int)(Bot_Rnd() & 1023)) & 2047);
+            in.bits |= BIT(SK_OPEN);            // whatever blocks us might be a door
+            if (Bot_Rnd() & 1)
+                in.bits |= BIT(SK_JUMP);        // ...or a ledge
+        }
     }
+    else if (s_botStuckTics[k] > 0)
+        s_botStuckTics[k]--;
 
-    auto const tp = g_player[t].ps;
-    int32_t const dx = tp->pos.x - ps->pos.x, dy = tp->pos.y - ps->pos.y;
-    int const wantAng = getangle(dx, dy);
+    int const t = s_botTarget[k];
+    auto const tp = (t >= 0 && g_player[t].connected && g_player[t].ps != NULL) ? g_player[t].ps : NULL;
+    bool const seesTarget = (tp != NULL && (unsigned)tp->cursectnum < (unsigned)numsectors
+                             && cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
+                                       tp->pos.x, tp->pos.y, tp->pos.z, tp->cursectnum));
+
+    // Steering priority: wall-bounce > visible chase > blind homing/wander.
+    int wantAng;
+    if (s_botBounceHold[k] > 0)
+    {
+        s_botBounceHold[k]--;
+        wantAng = s_botBounceAng[k];
+    }
+    else if (tp != NULL)
+    {
+        // Toward the target: exact when visible, loosely (big wobble) when
+        // not -- blind homing walks the map toward players, and the bounce
+        // handles every wall it meets on the way.
+        wantAng = getangle(tp->pos.x - ps->pos.x, tp->pos.y - ps->pos.y);
+        if (!seesTarget)
+            wantAng = (wantAng + (int)(Bot_Rnd() % 257) - 128) & 2047;
+    }
+    else
+        wantAng = s_botWanderAng[k];
+
     int diff = (((wantAng - fix16_to_int(ps->q16ang)) + 1024) & 2047) - 1024;
-    int const aimErr = (int)(Bot_Rnd() % (2 * wobble[skill] + 1)) - wobble[skill];
+    int const aimErr = seesTarget ? (int)(Bot_Rnd() % (2 * wobble[skill] + 1)) - wobble[skill] : 0;
     in.q16avel = fix16_from_int(clamp(diff + aimErr, -turnCap[skill], turnCap[skill]));
 
-    int32_t const dist2d = klabs(dx) + klabs(dy);
-    if (dist2d > 2048)
+    int32_t const dist2d = (tp != NULL) ? klabs(tp->pos.x - ps->pos.x) + klabs(tp->pos.y - ps->pos.y) : INT32_MAX;
+    if (seesTarget && dist2d <= 2048)
     {
-        in.fvel = 80;
+        // Knife-fight range: circle-strafe with forward pressure.
+        in.svel = (int16_t)(s_botStrafeDir[k] * 48);
+        in.fvel = 24;
+        in.extbits |= BIT(s_botStrafeDir[k] > 0 ? EK_STRAFE_LEFT : EK_STRAFE_RIGHT);
         in.extbits |= BIT(EK_MOVE_FORWARD);
     }
     else
     {
-        in.svel = (int16_t)(s_botStrafeDir[k] * 48);
-        in.extbits |= BIT(s_botStrafeDir[k] > 0 ? EK_STRAFE_LEFT : EK_STRAFE_RIGHT);
+        // Roam/chase at full stride (RUN makes cross-map travel worthwhile).
+        in.fvel = 80;
+        in.bits |= BIT(SK_RUN);
+        in.extbits |= BIT(EK_MOVE_FORWARD);
     }
     if ((Bot_Rnd() & 127) < 2)
         in.bits |= BIT(SK_JUMP);
 
-    if (klabs(diff) < fireGate[skill]
-        && cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
-                  tp->pos.x, tp->pos.y, tp->pos.z, tp->cursectnum))
+    if (seesTarget && klabs(diff) < fireGate[skill])
         in.bits |= BIT(SK_FIRE);
 
     return in;

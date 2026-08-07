@@ -1799,7 +1799,8 @@ void netmenu_send_snapshot_to(int seatMask, int slot, int plc, int isJoin)
 // ud.monsters_off, game.cpp:3538). No gametype picker yet -> hardcode DM (coop 0,
 // global.cpp:44). Net_SendNewGame also broadcasts the SEAT MASK (oldnet.cpp) so
 // guests learn the authoritative session roster.
-static int32_t s_netBots     = 0;   // host-chosen CPU player count (0..6)
+static int32_t s_netBots     = 4;   // host-chosen CPU player count (0..6); a
+                                    // populated default -- one bot is not a match
 static int32_t s_netBotSkill = 1;   // host-chosen CPU skill (0..2)
 
 static void netmenu_relaunch(int vol, int lev)

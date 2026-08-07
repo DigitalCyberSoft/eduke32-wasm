@@ -283,6 +283,27 @@
   // size/style at video-mode init, re-apply the centered display size.
   fitCanvas();
   window.addEventListener('resize', fitCanvas);
+
+  // ?join=CODE[&name=NAME][&bot=1] — auto-join a match by invite code on boot.
+  // Doubles as a shareable invite link and as swarm-test plumbing (N pages
+  // piling into one match). bot=1 arms Web_SetLocalBot: this peer plays
+  // itself via the engine's bot brain through the full human input pipeline.
+  (function () {
+    var qs = new URLSearchParams(location.search);
+    var code = qs.get('join');
+    var isBot = qs.get('bot') === '1';
+    if (!code && !isBot) return;
+    var name = qs.get('name') || ('Link' + Math.floor(Math.random() * 900 + 100));
+    var tries = 0;
+    var t = setInterval(function () {
+      if (++tries > 240) return clearInterval(t);
+      if (!started) return;
+      if (code && !(window.NetMenu && window.NetMenu.joinCode)) return;
+      clearInterval(t);
+      if (isBot) { try { Module.ccall('Web_SetLocalBot', null, ['number'], [1]); } catch (e) {} }
+      if (code) { try { window.NetMenu.joinCode(code, name); } catch (e) {} }
+    }, 500);
+  })();
   new MutationObserver(fitCanvas).observe(document.getElementById('canvas'),
     { attributes: true, attributeFilter: ['width', 'height', 'style'] });
 
