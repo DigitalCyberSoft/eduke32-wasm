@@ -2926,6 +2926,34 @@ extern "C" void Net_SnapshotReady(int seatMask, int plc, int isJoin)
 #endif
 }
 
+// Rotate a CHOSEN free-list index to the head so the next insertsprite() hands
+// out exactly that index. The free chain's ORDER is not cross-peer stable
+// (per-viewer churn perturbs it), so deterministic lockstep events that
+// allocate sprites -- the SEAT insert above all -- were handed DIFFERENT
+// indices on different peers (measured: i=700 vs 712, i=801 vs 813), after
+// which every index-ordered sim walk diverges. Fixed per-slot indices from
+// the TOP of the table (allocated organically only after ~16k live sprites)
+// make the seat allocation a pure function of the slot number.
+static int Net_RotateFreeSpriteToHead(int16_t idx)
+{
+    if ((unsigned)idx >= MAXSPRITES || sprite[idx].statnum != MAXSTATUS)
+        return -1;
+    if (headspritestat[MAXSTATUS] == idx)
+        return 0;
+    int16_t const prev = prevspritestat[idx];
+    int16_t const next = nextspritestat[idx];
+    if (prev >= 0) nextspritestat[prev] = next;
+    if (next >= 0) prevspritestat[next] = prev;
+    if (tailspritefree == idx)
+        tailspritefree = prev;
+    int16_t const ohead = headspritestat[MAXSTATUS];
+    prevspritestat[idx] = -1;
+    nextspritestat[idx] = ohead;
+    if (ohead >= 0) prevspritestat[ohead] = idx;
+    headspritestat[MAXSTATUS] = idx;
+    return 0;
+}
+
 // Materialize a late joiner in the running level. Mirrors what level entry does
 // for players 1+ (G_ResetAllPlayers: players are memcpys of a reference ps with
 // identity/position fixups) plus the sprite insert. Under the barrier-free join
@@ -2944,6 +2972,12 @@ void Net_InsertLatePlayer(int k)
     Bmemset(plr.frags, 0, sizeof(plr.frags));
 
     auto &spawn = g_playerSpawnPoints[k % g_playerSpawnCnt];
+    // Deterministic seat index: slot k claims sprite MAXSPRITES-1-k on every
+    // peer (see Net_RotateFreeSpriteToHead). Fallback to the organic freelist
+    // only if the reserved index is somehow occupied -- loudly.
+    if (Net_RotateFreeSpriteToHead((int16_t)(MAXSPRITES - 1 - k)) != 0)
+        initprintf("net: seat %d reserved sprite %d unavailable -> organic freelist\n",
+                   k, MAXSPRITES - 1 - k);
     int const i = A_InsertSprite(spawn.sect, spawn.x, spawn.y, spawn.z,
                                  APLAYER, 0, 0, 0, spawn.ang, 0, 0, 0, 10);
     sprite[i].yvel = k; // classic contract: a player sprite's yvel is its player index
@@ -3021,6 +3055,17 @@ int Net_ApplyLateJoinSnapshot(void)
     // vs 712 -> permanent index-order fork no heal can outrun.)
     EM_ASM({ console.log('[eng] Apply: load r=' + $0 + ' np=' + $1 + ' nsect=' + $2 + ' nsprt=' + $3 + ' fh=' + $4); },
            r, numplayers, numsectors, (int)Numsprites, (int)headspritestat[MAXSTATUS]);
+    // MISC-timer fidelity canary (load side) -- see the save-side twin.
+    {
+        extern int32_t g_netForensics;
+        if (g_netForensics)
+        {
+            int shown = 0;
+            for (int i = headspritestat[5]; i >= 0 && shown < 16; i = nextspritestat[i], shown++)
+                EM_ASM({ console.log('[misc] i=' + $0 + ' pic=' + $1 + ' t0=' + $2 + ' t1=' + $3 + ' xr=' + $4); },
+                       i, sprite[i].picnum, actor[i].t_data[0], actor[i].t_data[1], sprite[i].xrepeat);
+        }
+    }
 #endif
 
     // The snapshot carries the HOST's view of every per-player struct; OUR identity
