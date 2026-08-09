@@ -830,6 +830,21 @@ void A_DeleteSprite(int spriteNum)
         g_dbgDelRing[g_dbgDelRingN & 31] = ((unsigned)spriteNum < MAXSPRITES) ? sprite[spriteNum].picnum : -1;
         g_dbgDelRingN++;
         g_dbgDelCount++;
+#ifdef __EMSCRIPTEN__
+        // Early-window deletion trace: the live host deletes MORE sprites in
+        // the first ~1.5s than a byte-identical catchup replay of the same
+        // canonical inputs (pair28: -38 vs -28 by the seat tic, prediction
+        // off, save/load boundary byte-perfect). Diffing the two consoles'
+        // [del] streams names the asymmetric deletion path.
+        {
+            extern int32_t g_netForensics;
+            if (g_netForensics && movefifoplc < 120)
+                EM_ASM({ console.log('[del] plc=' + $0 + ' i=' + $1 + ' pic=' + $2 + ' stat=' + $3); },
+                       movefifoplc, spriteNum,
+                       ((unsigned)spriteNum < MAXSPRITES) ? sprite[spriteNum].picnum : -1,
+                       ((unsigned)spriteNum < MAXSPRITES) ? sprite[spriteNum].statnum : -1);
+        }
+#endif
     }
 #endif
 

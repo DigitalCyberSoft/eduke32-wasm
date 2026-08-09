@@ -3014,7 +3014,13 @@ int Net_ApplyLateJoinSnapshot(void)
     int const r = G_LoadPlayer(sv);
 
 #ifdef __EMSCRIPTEN__
-    EM_ASM({ console.log('[eng] Apply: load r=' + $0 + ' np=' + $1 + ' nsect=' + $2); }, r, numplayers, numsectors);
+    // nsprt canary: the host's world had a specific sprite count at save time
+    // -- if ours differs right here, the savegame restore itself leaves local
+    // stragglers; if it matches here but skews by seat time, catchup replay
+    // diverges. (pair24: host 586 vs guest 598 at the seat -> index skew 700
+    // vs 712 -> permanent index-order fork no heal can outrun.)
+    EM_ASM({ console.log('[eng] Apply: load r=' + $0 + ' np=' + $1 + ' nsect=' + $2 + ' nsprt=' + $3 + ' fh=' + $4); },
+           r, numplayers, numsectors, (int)Numsprites, (int)headspritestat[MAXSTATUS]);
 #endif
 
     // The snapshot carries the HOST's view of every per-player struct; OUR identity
@@ -3173,10 +3179,17 @@ void Net_ApplyPendingJoins(void)
             Net_ResetSyncCheck();
         }
 #ifdef __EMSCRIPTEN__
-        EM_ASM({ console.log('[eng] joinApplied p=' + $0 + ' tic=' + $1 + ' np=' + $2 + ' me=' + $3); },
-               k, movefifoplc, numplayers, (int)(k == myconnectindex));
+        // i= is the DETERMINISM CANARY: the seat inserts this player's sprite
+        // on every peer at the same tic -- if the allocated index differs
+        // across peers (freelist order skew after a snapshot load), every
+        // index-ordered sim walk diverges from that moment on.
+        EM_ASM({ console.log('[eng] joinApplied p=' + $0 + ' tic=' + $1 + ' np=' + $2 + ' me=' + $3
+                 + ' i=' + $4 + ' nsprt=' + $5); },
+               k, movefifoplc, numplayers, (int)(k == myconnectindex),
+               (int)g_player[k].ps->i, (int)Numsprites);
 #else
-        initprintf("net: player %d seated at tic %d (%d players)\n", k, movefifoplc, numplayers);
+        initprintf("net: player %d seated at tic %d (%d players, sprite %d)\n",
+                   k, movefifoplc, numplayers, (int)g_player[k].ps->i);
 #endif
     }
 }
@@ -3502,13 +3515,22 @@ void Net_ApplyPendingStateSnap(void)
         ps->vel.x  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
         ps->vel.y  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
         ps->vel.z  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        // SIM facing re-anchors to host-truth for EVERYONE, self included: a
-        // forked own-angle means my shots hit on my sim but miss on the host's
-        // -- kills then only propagate via the ladder ("dead sync lags").
-        // The VIEW stays frame-owned (see net_predict.cpp) -- at worst this is
-        // a one-time small view adjustment when a real fork gets corrected.
-        ps->q16ang   = ps->oq16ang   = (fix16_t)B_UNBUF32(&buf[jj]); jj += 4;
-        ps->q16horiz = ps->oq16horiz = (fix16_t)B_UNBUF32(&buf[jj]); jj += 4;
+        // SELF-FACING IS CLIENT-OWNED, full stop ("the truth needs to come
+        // from the player that fires" / "it's meant to be client first" --
+        // the user's directive, twice). The closed-loop input staging already
+        // converges the sim's self-facing onto the view every tic, so a snap
+        // stomp here is redundant -- and applied every correction lap it WAS
+        // the live "mouse keeps bouncing / host correcting my movement".
+        // Remote players' facing still re-anchors to host truth.
+        {
+            fix16_t const snapAng   = (fix16_t)B_UNBUF32(&buf[jj]); jj += 4;
+            fix16_t const snapHoriz = (fix16_t)B_UNBUF32(&buf[jj]); jj += 4;
+            if (slot != myconnectindex)
+            {
+                ps->q16ang   = ps->oq16ang   = snapAng;
+                ps->q16horiz = ps->oq16horiz = snapHoriz;
+            }
+        }
         vec3_t sp;
         sp.x = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
         sp.y = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;

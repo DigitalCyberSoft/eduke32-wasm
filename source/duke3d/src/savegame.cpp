@@ -903,6 +903,13 @@ int Net_SaveLateJoinSnapshot(void)
     int const r = sv_saveandmakesnapshot(fil, "latejoin", 0, 0, 0, 0, false);
     buildvfs_fclose(fil);
     G_RestoreTimers();
+#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+    // Save-side half of the nsprt canary (compare with the receiver's
+    // "Apply: load ... nsprt=" line): a skew means the restore is not
+    // wholesale and every index allocation after it diverges.
+    EM_ASM({ console.log('[eng] snapshot saved r=' + $0 + ' nsprt=' + $1 + ' plc=' + $2 + ' fh=' + $3); },
+           r, (int)Numsprites, movefifoplc, (int)headspritestat[MAXSTATUS]);
+#endif
     return r;
 }
 
