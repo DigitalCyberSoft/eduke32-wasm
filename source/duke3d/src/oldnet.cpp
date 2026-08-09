@@ -3081,6 +3081,24 @@ int Net_ApplyLateJoinSnapshot(void)
 
 // Seat every queued late joiner (menus.cpp consumer calls this at a safe frame
 // point, right before relaunching the current map).
+// LAUNCH VIA SNAPSHOT (menus.cpp): pull every human guest out of the entry
+// roster and queue them on the late-join pipeline -- the host enters with the
+// CPU seats only, then streams each guest the canonical entry world.
+void Net_DemoteGuestsToSnapshotEntry(void)
+{
+    if (myconnectindex != connecthead)
+        return;
+    for (int k = 0; k < MAXPLAYERS && k < 16; k++)
+        if (k != myconnectindex && g_player[k].connected && !(g_netBotMask & (1 << k)))
+        {
+            g_player[k].connected = 0;
+            g_netLateJoinMask |= (1 << k);
+        }
+    Net_RebuildConnectChain();
+    ud.multimode            = numplayers;
+    g_mostConcurrentPlayers = ud.multimode;
+}
+
 void Net_SeatLateJoiners(void)
 {
     for (int k = 0; k < MAXPLAYERS; k++)

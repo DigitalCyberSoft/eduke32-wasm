@@ -1833,19 +1833,7 @@ static void netmenu_relaunch(int vol, int lev)
         // the entry roster, enters with the bots, and the late-join pipeline
         // streams each one the canonical entry snapshot.
         Net_SendNewGame(NEWGAME_VIA_SNAPSHOT);
-        if (myconnectindex == connecthead)
-        {
-            for (int k = 0; k < MAXPLAYERS && k < 16; k++)
-                if (k != myconnectindex && g_player[k].connected
-                    && !(g_netBotMask & (1u << k)))
-                {
-                    g_player[k].connected = 0;
-                    g_netLateJoinMask |= (1 << k);
-                }
-            Net_RebuildConnectChain();
-            ud.multimode            = numplayers;   // entry roster: host + bots
-            g_mostConcurrentPlayers = ud.multimode;
-        }
+        Net_DemoteGuestsToSnapshotEntry();
     }
     NetMenu_SetInGame(1);     // stop advertising open-state; joins now go the late-join route
     // Enter DIRECTLY, exactly like the single-player New Game path: the deferred-gm

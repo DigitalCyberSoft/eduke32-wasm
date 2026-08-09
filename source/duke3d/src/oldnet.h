@@ -154,6 +154,7 @@ extern int32_t g_netLateJoinMask; // slots whose peer-up landed mid-game; host s
 // forked at tic 0 lives on the softsnap drip forever.
 #define NEWGAME_VIA_SNAPSHOT 0x8000
 void Net_SeatLateJoiners(void);   // apply the mask to connected[] + rebuild the chain
+void Net_DemoteGuestsToSnapshotEntry(void);  // launch: guests leave entry roster -> join pipeline
 extern int32_t g_netHostGone;     // guest: the host peer went down; exit to the main menu
 extern int32_t g_netSnapshotReady; // receiver: late-join snapshot file landed; load + barrier
 void Net_InsertLatePlayer(int k);  // host: materialize a late joiner in the live world
