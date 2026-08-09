@@ -1822,7 +1822,31 @@ static void netmenu_relaunch(int vol, int lev)
     ud.m_monsters_off       = 1;   // no monsters in deathmatch
     ud.m_player_skill       = 0;
     if (numplayers > 1)
-        Net_SendNewGame(0);   // guests (re)enter the same map at tic 0 (reads ud.m_* above)
+    {
+        // LAUNCH VIA SNAPSHOT. Guests never build the world with their own
+        // premap: two independent entries are not bit-identical (each peer
+        // re-inserts player sprites from its LOCAL history), so a lobby guest
+        // forked from tic 0 and lived on the 5s softsnap drip -- the user's
+        // every MP session ("mouse keeps bouncing", ghost bots, ~30s hydrant
+        // sync; pair probe reproduced the cat18 storm + eternal softsnaps).
+        // NEW_GAME (flagged) tells guests to WAIT; the host demotes them from
+        // the entry roster, enters with the bots, and the late-join pipeline
+        // streams each one the canonical entry snapshot.
+        Net_SendNewGame(NEWGAME_VIA_SNAPSHOT);
+        if (myconnectindex == connecthead)
+        {
+            for (int k = 0; k < MAXPLAYERS && k < 16; k++)
+                if (k != myconnectindex && g_player[k].connected
+                    && !(g_netBotMask & (1u << k)))
+                {
+                    g_player[k].connected = 0;
+                    g_netLateJoinMask |= (1 << k);
+                }
+            Net_RebuildConnectChain();
+            ud.multimode            = numplayers;   // entry roster: host + bots
+            g_mostConcurrentPlayers = ud.multimode;
+        }
+    }
     NetMenu_SetInGame(1);     // stop advertising open-state; joins now go the late-join route
     // Enter DIRECTLY, exactly like the single-player New Game path: the deferred-gm
     // approach ran after the frame's MODE_NEWGAME check and blanked the screen. For

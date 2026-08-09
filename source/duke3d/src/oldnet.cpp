@@ -2233,6 +2233,21 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 ud.multimode            = numplayers;
                 g_mostConcurrentPlayers = ud.multimode;
                 ud.m_monsters_off       = 1;   // match the host's deathmatch setup
+                if (flags & NEWGAME_VIA_SNAPSHOT)
+                {
+                    // LAUNCH VIA SNAPSHOT: do NOT enter locally. The host
+                    // enters first (with the CPU seats) and streams this guest
+                    // the entry snapshot through the late-join pipeline --
+                    // sav_begin -> cold-process entry (savegame.cpp) -> catchup
+                    // -> deterministic seat. An independent local entry here is
+                    // what forked every lobby guest from tic 0.
+                    LOG_F(INFO, "[nnative] NEW_GAME via snapshot: awaiting entry stream (vol=%d lev=%d)",
+                          ud.m_volume_number, ud.m_level_number);
+#ifdef __EMSCRIPTEN__
+                    EM_ASM({ console.log('[eng] NEW_GAME via snapshot: awaiting entry stream'); });
+#endif
+                    break;
+                }
                 // Defer the level entry to the main loop instead of calling G_NewGame here:
                 // this runs INSIDE net_poll -> Net_ReceiveFrame with the shared packbuf
                 // mid-parse, so entering inline would re-enter net_poll and clobber packbuf.

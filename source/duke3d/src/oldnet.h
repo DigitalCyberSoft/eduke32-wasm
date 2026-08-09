@@ -146,6 +146,13 @@ OLDNET_EXTERN input_t netInput;
 
 OLDNET_EXTERN bool oldnet_gotinitialsettings; // True if we got PACKET_TYPE_INIT_SETTINGS from the host.
 extern int32_t g_netLateJoinMask; // slots whose peer-up landed mid-game; host seats them via relaunch (menus.cpp)
+
+// NEW_GAME flags bit (high half of the low 16 reserved bits): guests must NOT
+// run their own level entry -- the host enters first and streams each guest
+// the entry snapshot through the late-join pipeline. Two independent premaps
+// are never bit-identical (local sprite-insert histories differ), and a guest
+// forked at tic 0 lives on the softsnap drip forever.
+#define NEWGAME_VIA_SNAPSHOT 0x8000
 void Net_SeatLateJoiners(void);   // apply the mask to connected[] + rebuild the chain
 extern int32_t g_netHostGone;     // guest: the host peer went down; exit to the main menu
 extern int32_t g_netSnapshotReady; // receiver: late-join snapshot file landed; load + barrier
