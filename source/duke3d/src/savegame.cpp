@@ -909,6 +909,20 @@ int Net_SaveLateJoinSnapshot(void)
     // wholesale and every index allocation after it diverges.
     EM_ASM({ console.log('[eng] snapshot saved r=' + $0 + ' nsprt=' + $1 + ' plc=' + $2 + ' fh=' + $3); },
            r, (int)Numsprites, movefifoplc, (int)headspritestat[MAXSTATUS]);
+    // MISC-timer fidelity canary (save side): compare with the receiver's
+    // [misc] dump after load. A t_data skew for the same index = the snapshot
+    // loses effect-timer state (host expires debris at tic 1, guest ~25 tics
+    // later -> permanent freelist/krand skew).
+    {
+        extern int32_t g_netForensics;
+        if (g_netForensics)
+        {
+            int shown = 0;
+            for (int i = headspritestat[5]; i >= 0 && shown < 16; i = nextspritestat[i], shown++)
+                EM_ASM({ console.log('[misc] i=' + $0 + ' pic=' + $1 + ' t0=' + $2 + ' t1=' + $3 + ' xr=' + $4); },
+                       i, sprite[i].picnum, actor[i].t_data[0], actor[i].t_data[1], sprite[i].xrepeat);
+        }
+    }
 #endif
     return r;
 }

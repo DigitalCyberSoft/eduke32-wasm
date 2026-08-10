@@ -1207,6 +1207,16 @@ static int32_t VM_ResetPlayer(int const playerNum, int32_t vmFlags, int32_t cons
             P_ResetMultiPlayer(playerNum);
             Net_SpawnPlayer(playerNum);
         }
+        else if (numplayers > 1)
+            // Lockstep/stream MP (g_netServer is the dormant client/server
+            // macro, FALSE here): without this branch a dead MP player was
+            // NEVER reset -- the CON resetplayer landed in a no-op and every
+            // death was permanent (measured: 6/8 seats corpses with
+            // dead_flag>1200 while one surviving bot farmed an empty map;
+            // live: "I am the only player in the match"). Every peer runs
+            // this same opcode at the same consumed tic, so the reset is
+            // deterministic like any sim step.
+            P_ResetMultiPlayer(playerNum);
 #endif
     }
 

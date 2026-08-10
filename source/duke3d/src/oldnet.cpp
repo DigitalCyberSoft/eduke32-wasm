@@ -89,7 +89,9 @@ static int Net_EnterText(int /*x*/, int /*y*/, char * /*t*/, int /*dalen*/, int 
 // and difficulty are host-decided by construction. Sync-safe: inputs travel,
 // the sim stays identical everywhere.
 int32_t g_netBotMask;        // slots that are CPU seats (host-authoritative)
-int32_t g_netBotSkill = 1;   // 0 easy / 1 medium / 2 hard (host-side only)
+int32_t g_netBotSkill = 2;   // 0 easy / 1 medium / 2 hard (host-side only).
+                             // Default HARD: medium's wobble read as "an
+                             // absolute shit job at aiming" (live report).
 int32_t g_netMinPlayers = 5; // host's match-size floor: bots fill up to this
                              // count and yield seats back as humans join
 int32_t g_netLocalBot;       // TEST MODE: this peer's OWN input comes from the
@@ -140,6 +142,19 @@ int mymaxlag, otherminlag, bufferjitter = 1;
 
 int movefifosendplc;
 int movefifoplc;
+
+// ── STATE AUTHORITY (the OpenArena model; 2026-08-09 user directive) ────────
+// "get to parity with how openarena handles player actions, not this turn
+// based thing that keeps breaking." The input plane was already Q3-shaped
+// (master aggregates a canonical cmd timeline with deadline-fill; slaves
+// predict locally) -- what kept breaking was the STATE plane: guests lockstep-
+// simulated the world and any WASM nondeterminism forked them forever, patched
+// by 5s soft snaps and reload heals the user felt as rubber-banding. In stream
+// mode the host's sim is the ONLY truth: it broadcasts player packs and sprite
+// deltas continuously, guests keep their sim as a local predictor that the
+// stream repaints, and every divergence-repair mechanism is retired. There is
+// no "desync" anymore -- only correction latency, bounded by the stream rate.
+int32_t g_netStreamMode = 1;
 
 // NetDuke32 netcode globals not present in mainline. g_networkBroadcastMode
 // selects master/slave vs offline; botNameSeed drives deterministic bot names.
@@ -502,10 +517,27 @@ static int      s_healAckFence;      // host: 1 = post-apply acks are flowing
 static int32_t  s_softStrikes[MAXPLAYERS];
 static int32_t  s_softStrikeClock[MAXPLAYERS];
 // Tic-stamped soft snap awaiting its consume tic (guest side).
-static char     s_pendingSnap[704];  // [type][count][tic i32][seed i32][grand i32]
-                                     // + 8*69B players + [awc]+64*i16 animwall tags
+static char     s_pendingSnap[768];  // [type][count][tic i32][seed i32][grand i32]
+                                     // + 8*75B players + [awc]+64*i16 animwall tags
 static int      s_pendingSnapLen;
 static int32_t  s_pendingSnapTic;
+// Stream-mode machinery (defined after Net_ApplyPendingStateSnap).
+static void Net_StreamAuthoritativeState(void);
+static void Net_ApplySpriteStream(const char *buf, int len);
+static void Net_ApplySectorStream(const char *buf, int len);
+// NEW_GAME delivery hardening: a real browser can still be BOOTING the wasm
+// when the host launches (live: join_ok -> launch within 1s; the guest's
+// engine missed the roster packet and entered an empty world). The host
+// stores the launch packet (with a per-launch token) and re-sends it to any
+// guest that hasn't sent PLAYER_READY; guests dedupe by token so resends are
+// idempotent and can never restart an entered level.
+static uint8_t  s_newGameToken;
+static char     s_newGameBuf[64];
+static int      s_newGameLen;
+static int32_t  s_newGameClock;
+static uint32_t s_newGameAckMask;
+static int32_t  s_newGameResendClock[MAXPLAYERS];
+static void Net_ResendNewGameIfUnacked(void);
 
 static struct JoinTicInit { JoinTicInit() { for (auto &t : s_joinTic) t = -1; } } s_joinTicInit;
 
@@ -603,6 +635,560 @@ static int8_t  s_botOpenGrace[MAXPLAYERS];   // door-try: keep pushing before bo
 static uint8_t s_botBurst[MAXPLAYERS];       // fire cadence phase (24 on / 8 off)
 static int16_t s_botTargetHold[MAXPLAYERS];  // tics on the same target without a kill
 
+// ── Room-routine goal model (user directive 2026-08-10) ─────────────────────
+// "If items are in a room, small chance it tries to pick them up. Otherwise
+// its goal should be to exit the room through a door that it didn't enter
+// through. If it finds an opponent, engage. Very little jumping."
+// The room memory is a per-bot last-visit stamp on every sector: the freshest
+// sector behind a portal is where the bot just came FROM, so steering at the
+// STALEST portal is exactly "leave through the other door", and over minutes
+// the gradient walks the whole map (rooms in Build are clusters of small
+// sectors; percolating stale-ward crosses them like rooms).
+static int32_t s_botVisitT[MAXPLAYERS][MAXSECTORS];
+static int8_t  s_botGoal[MAXPLAYERS];        // 0 none, 1 portal/waypoint, 2 item
+static int32_t s_botGoalX[MAXPLAYERS], s_botGoalY[MAXPLAYERS];
+static int16_t s_botGoalSect[MAXPLAYERS];    // sector the goal leads into (-1 = free waypoint)
+static int16_t s_botGoalTics[MAXPLAYERS];    // time spent on this errand
+static int8_t  s_botGoalDoor[MAXPLAYERS];    // portal is a door sector: press OPEN on approach
+static int8_t  s_botGoalCrouch[MAXPLAYERS];  // low clearance portal: duck through
+static int16_t s_botGoalItem[MAXPLAYERS];    // sprite index of the item errand
+static int16_t s_botItemShun[MAXPLAYERS];    // last item that refused pickup (full hp etc.)
+static int16_t s_botPrevSect[MAXPLAYERS];    // sector this room was entered FROM
+static int16_t s_botSightTics[MAXPLAYERS];   // tics since the target was last actually seen
+static int32_t s_botJumps[MAXPLAYERS];       // telemetry: total jump presses (the user meter)
+static int8_t  s_botGoalSeen[MAXPLAYERS];    // walk line to errand: 0 unknown, 1 clear, -1 blocked
+static int8_t  s_botNavSeen[MAXPLAYERS];     // walk line to chase waypoint, same encoding
+static int16_t s_botJumpCool[MAXPLAYERS];    // hard floor between jumps (water exempt)
+static int16_t s_botLaneAng[MAXPLAYERS];     // furniture-field lane heading
+static int16_t s_botLaneHold[MAXPLAYERS];    // tics left committed to the lane
+static uint8_t s_botThreadFails[MAXPLAYERS]; // stuck trips while goal line was "clear"
+
+// Probe the straight WALK line to (tx,ty): can the feet take the direct path?
+// Follow-until-clear steering hangs off this -- goal-directed turning is only
+// allowed while the line is open; otherwise the wall-follow ladder keeps
+// tracing the obstacle. Probing only at plan time was the v18a failure: the
+// bot drifts, the line rotates into a fence, and steering grinds it there
+// at ~3 units/tic with the stuck ladder thrashing against the goal turn.
+// Sprite-AWARE knee-height ray fan: the longest open lane leaning toward
+// the goal. Furniture fields (theater chairs, alley crates) give short rays
+// down blocked rows and long rays down the aisles -- the player's read.
+static int Bot_PickLane(DukePlayer_t *ps, int32_t gx, int32_t gy)
+{
+    int const gb = getangle(gx - ps->pos.x, gy - ps->pos.y);
+    vec3_t knee = ps->pos;
+    knee.z += (24 << 8);                    // under chair backs, over floor
+    int32_t bestScore = -1; int bestDir = gb;
+    for (int d = 0; d < 16; d++)
+    {
+        int const da = (d * 128) & 2047;
+        hitdata_t lh = {};
+        hitscan(&knee, ps->cursectnum, sintable[(da + 512) & 2047],
+                sintable[da & 2047], 0, &lh, CLIPMASK0);
+        int32_t len = klabs(lh.xyz.x - ps->pos.x) + klabs(lh.xyz.y - ps->pos.y);
+        if (len > 3072) len = 3072;
+        int const adist = klabs((((da - gb) + 1024) & 2047) - 1024);
+        int32_t const w = 1024 - (adist * 3) / 4;    // goalward bias
+        int32_t const sc = len * w;
+        if (sc > bestScore) { bestScore = sc; bestDir = da; }
+    }
+    return bestDir;
+}
+
+// Core walk-line test from an arbitrary standpoint (feeds both live steering
+// and NAV GRAPH construction). Wall ray is WALLS ONLY -- blocking furniture
+// does not block WALKING (clipmove slides around sprite clip circles; with
+// sprites in the mask every line through the theater chair field read
+// "blocked" and the wall-follow orbited it forever). The foot march catches
+// what the eye-level ray sails over: knee walls, parapets, raised sills
+// (v18c: probe "clear", walk pinned at ~3 units/tic against a rooftop lip).
+static int Bot_SectorIsDoor(int s);
+static int Bot_LineWalkFrom(int16_t sect, int32_t x, int32_t y, int32_t z,
+                            int32_t tx, int32_t ty)
+{
+    if ((unsigned)sect >= (unsigned)numsectors)
+        return 0;
+    int32_t const wd = klabs(tx - x) + klabs(ty - y);
+    if (wd < 64)
+        return 1;
+    int const a = getangle(tx - x, ty - y);
+    vec3_t sv = { x, y, z };
+    hitdata_t h = {};
+    hitscan(&sv, sect, sintable[(a + 512) & 2047],
+            sintable[a & 2047], 0, &h, ((1) << 16));
+    if (klabs(h.xyz.x - x) + klabs(h.xyz.y - y) + 384 < wd)
+        return 0;
+    int32_t const dx = tx - x, dy = ty - y;
+    int const steps = min(16, (int)(min(wd, 4096) >> 8));
+    int16_t cs = sect;
+    int32_t lastF = getflorzofslope(cs, x, y);
+    for (int i = 1; i <= steps; i++)
+    {
+        int32_t const sx = x + (int32_t)(((int64_t)dx * (i << 8)) / max(wd, 1));
+        int32_t const sy = y + (int32_t)(((int64_t)dy * (i << 8)) / max(wd, 1));
+        updatesector(sx, sy, &cs);
+        if (cs < 0)
+            return 0;
+        int32_t const f = getflorzofslope(cs, sx, sy);
+        if (lastF - f > (18 << 8))      // z grows down: a step UP too tall
+            return 0;
+        lastF = f;
+    }
+    return 1;
+}
+static int Bot_LineWalkable(DukePlayer_t *ps, int32_t tx, int32_t ty)
+{
+    return Bot_LineWalkFrom(ps->cursectnum, ps->pos.x, ps->pos.y, ps->pos.z, tx, ty);
+}
+
+// ── OpenArena-style navigation, take two: FLOOR COVERAGE, not a skeleton
+// (user: "you built a 2d graph that doesn't follow the room properly").
+// Q3's AAS covers every walkable square of floor with convex areas; the
+// portal-midpoint graph only knew doorways, so rooms had no interior and
+// bots could not RUN AROUND them. Build-engine equivalent: a walkable grid
+// of 512-unit tiles (convex cells) spanning the map -- per-tile sector +
+// floor data, per-DIRECTION step gates, and build-time wall-crossing tests
+// so every 4-neighbor move is wall-free BY CONSTRUCTION. Door sectors stay
+// walkable (they open) and are flagged so the follower presses OPEN.
+// Sprites (furniture) are deliberately ignored -- clipmove slides around
+// them and the reactive lane layer threads the fields.
+#define NVG_TILE 512
+#define NVG_MAXW 288
+#define NVG_MAXH 288
+#define NVG_MAX  (NVG_MAXW * NVG_MAXH)
+static int32_t s_nvgMinX, s_nvgMinY;
+static int     s_nvgW, s_nvgH;
+static int32_t s_nvgStamp = -1;
+static int16_t s_nvgSect[NVG_MAX];      // containing sector, -1 = unwalkable
+static uint8_t s_nvgPass[NVG_MAX];      // dir bits out of this tile: 1 +x, 2 -x, 4 +y, 8 -y
+static uint8_t s_nvgFlagT[NVG_MAX];     // 1 = door-sector tile
+
+static inline int32_t Nvg_CX(int tx) { return s_nvgMinX + tx * NVG_TILE + NVG_TILE / 2; }
+static inline int32_t Nvg_CY(int ty) { return s_nvgMinY + ty * NVG_TILE + NVG_TILE / 2; }
+static inline int Nvg_TileOf(int32_t x, int32_t y)
+{
+    int const tx = (int)((x - s_nvgMinX) / NVG_TILE);
+    int const ty = (int)((y - s_nvgMinY) / NVG_TILE);
+    if (tx < 0 || ty < 0 || tx >= s_nvgW || ty >= s_nvgH)
+        return -1;
+    return ty * s_nvgW + tx;
+}
+
+// Does segment (x1,y1)-(x2,y2) cross a WALKING-blocking wall of sector s?
+// (one-sided walls and cstat&1 two-sided walls block; open portals do not.)
+static int Nvg_SegBlocked(int s, int32_t x1, int32_t y1, int32_t x2, int32_t y2)
+{
+    int const wend = sector[s].wallptr + sector[s].wallnum;
+    for (int w = sector[s].wallptr; w < wend; w++)
+    {
+        if (wall[w].nextsector >= 0 && !(wall[w].cstat & 1))
+            continue;
+        int32_t const ax = wall[w].x, ay = wall[w].y;
+        int32_t const bx = wall[wall[w].point2].x, by = wall[wall[w].point2].y;
+        int64_t const d1 = (int64_t)(bx - ax) * (y1 - ay) - (int64_t)(by - ay) * (x1 - ax);
+        int64_t const d2 = (int64_t)(bx - ax) * (y2 - ay) - (int64_t)(by - ay) * (x2 - ax);
+        if ((d1 > 0 && d2 > 0) || (d1 < 0 && d2 < 0))
+            continue;
+        int64_t const d3 = (int64_t)(x2 - x1) * (ay - y1) - (int64_t)(y2 - y1) * (ax - x1);
+        int64_t const d4 = (int64_t)(x2 - x1) * (by - y1) - (int64_t)(y2 - y1) * (bx - x1);
+        if ((d3 > 0 && d4 > 0) || (d3 < 0 && d4 < 0))
+            continue;
+        return 1;
+    }
+    return 0;
+}
+
+static void Bot_NavBuild(void)
+{
+    int32_t minx = INT32_MAX, miny = INT32_MAX, maxx = INT32_MIN, maxy = INT32_MIN;
+    for (int w = 0; w < numwalls; w++)
+    {
+        minx = min(minx, wall[w].x); maxx = max(maxx, wall[w].x);
+        miny = min(miny, wall[w].y); maxy = max(maxy, wall[w].y);
+    }
+    if (minx > maxx)
+        { s_nvgW = s_nvgH = 0; return; }
+    s_nvgMinX = minx - NVG_TILE; s_nvgMinY = miny - NVG_TILE;
+    s_nvgW = min((int)((maxx - s_nvgMinX) / NVG_TILE) + 2, NVG_MAXW);
+    s_nvgH = min((int)((maxy - s_nvgMinY) / NVG_TILE) + 2, NVG_MAXH);
+    int const total = s_nvgW * s_nvgH;
+    int walkable = 0;
+    int16_t seed = 0;
+    for (int t = 0; t < total; t++)
+    {
+        s_nvgSect[t] = -1; s_nvgPass[t] = 0; s_nvgFlagT[t] = 0;
+        int32_t const cx = Nvg_CX(t % s_nvgW), cy = Nvg_CY(t / s_nvgW);
+        int16_t cs = seed;
+        updatesector(cx, cy, &cs);
+        if (cs < 0)
+            continue;
+        seed = cs;
+        int const isDoor = Bot_SectorIsDoor(cs);
+        if (!isDoor)
+        {
+            int32_t const gap = getflorzofslope(cs, cx, cy) - getceilzofslope(cs, cx, cy);
+            if (gap < (26 << 8))
+                continue;                       // sealed / crush space
+        }
+        s_nvgSect[t] = cs;
+        s_nvgFlagT[t] = (uint8_t)isDoor;
+        walkable++;
+    }
+    // Directional adjacency: step gate + wall-crossing test per neighbor.
+    for (int ty = 0; ty < s_nvgH; ty++)
+    {
+        for (int tx = 0; tx < s_nvgW; tx++)
+        {
+            int const t = ty * s_nvgW + tx;
+            if (s_nvgSect[t] < 0)
+                continue;
+            int32_t const cx = Nvg_CX(tx), cy = Nvg_CY(ty);
+            int32_t const fA = getflorzofslope(s_nvgSect[t], cx, cy);
+            static int const dx4[2] = { 1, 0 };
+            static int const dy4[2] = { 0, 1 };
+            for (int d = 0; d < 2; d++)         // +x and +y; mirrors set the reverse
+            {
+                int const nx = tx + dx4[d], ny = ty + dy4[d];
+                if (nx >= s_nvgW || ny >= s_nvgH)
+                    continue;
+                int const u = ny * s_nvgW + nx;
+                if (s_nvgSect[u] < 0)
+                    continue;
+                int32_t const ux = Nvg_CX(nx), uy = Nvg_CY(ny);
+                if (Nvg_SegBlocked(s_nvgSect[t], cx, cy, ux, uy))
+                    continue;
+                if (s_nvgSect[u] != s_nvgSect[t]
+                    && Nvg_SegBlocked(s_nvgSect[u], cx, cy, ux, uy))
+                    continue;
+                int32_t const fB = getflorzofslope(s_nvgSect[u], ux, uy);
+                // z grows down: climbing means destination floor SMALLER.
+                if (fA - fB <= (18 << 8))
+                    s_nvgPass[t] |= (uint8_t)(d == 0 ? 1 : 4);      // t -> u
+                if (fB - fA <= (18 << 8))
+                    s_nvgPass[u] |= (uint8_t)(d == 0 ? 2 : 8);      // u -> t
+            }
+        }
+    }
+    EM_ASM({ console.log('[nav] grid ' + $0 + 'x' + $1 + ' walkable=' + $2 + ' of ' + $3); },
+           s_nvgW, s_nvgH, walkable, total);
+}
+
+static void Bot_NavEnsure(void)
+{
+    int32_t const stamp = (int32_t)numwalls ^ ((int32_t)numsectors << 16)
+                        ^ (numwalls > 0 ? wall[0].x + wall[0].y : 0);
+    if (stamp != s_nvgStamp)
+    {
+        s_nvgStamp = stamp;
+        Bot_NavBuild();
+    }
+}
+
+// Nearest walkable tile to a point (spiral out to radius 2): items sit on
+// tables, players straddle tile edges -- snap to the mesh like AAS does.
+static int Nvg_Snap(int32_t x, int32_t y)
+{
+    int const t = Nvg_TileOf(x, y);
+    if (t >= 0 && s_nvgSect[t] >= 0)
+        return t;
+    int const tx = t < 0 ? -1 : t % s_nvgW, ty = t < 0 ? -1 : t / s_nvgW;
+    if (tx < 0)
+        return -1;
+    for (int r = 1; r <= 2; r++)
+        for (int oy = -r; oy <= r; oy++)
+            for (int ox = -r; ox <= r; ox++)
+            {
+                if (klabs(ox) != r && klabs(oy) != r)
+                    continue;
+                int const nx = tx + ox, ny = ty + oy;
+                if (nx < 0 || ny < 0 || nx >= s_nvgW || ny >= s_nvgH)
+                    continue;
+                if (s_nvgSect[ny * s_nvgW + nx] >= 0)
+                    return ny * s_nvgW + nx;
+            }
+    return -1;
+}
+
+// BFS over the grid. Rolling horizon: cap stored waypoints; repath when the
+// window empties. parentDir packs the reconstruction into one byte per tile.
+static int Bot_NvgPath(int fromTile, int destTile, int16_t *outTx, int16_t *outTy, int maxOut)
+{
+    static uint16_t seenGen[NVG_MAX];
+    static uint8_t  parentDir[NVG_MAX];
+    static int32_t  queue[NVG_MAX];
+    static uint16_t gen = 0;
+    if (fromTile < 0 || destTile < 0)
+        return 0;
+    if (++gen == 0) { Bmemset(seenGen, 0, sizeof(seenGen)); gen = 1; }
+    int qh = 0, qt = 0;
+    queue[qt++] = fromTile;
+    seenGen[fromTile] = gen;
+    parentDir[fromTile] = 255;
+    int found = -1;
+    static int const stepdx[4] = { 1, -1, 0, 0 };
+    static int const stepdy[4] = { 0, 0, 1, -1 };
+    while (qh < qt)
+    {
+        int const t = queue[qh++];
+        if (t == destTile) { found = t; break; }
+        int const tx = t % s_nvgW, ty = t / s_nvgW;
+        for (int d = 0; d < 4; d++)
+        {
+            if (!(s_nvgPass[t] & (1 << d)))
+                continue;
+            int const u = (ty + stepdy[d]) * s_nvgW + (tx + stepdx[d]);
+            if (seenGen[u] == gen)
+                continue;
+            seenGen[u] = gen;
+            parentDir[u] = (uint8_t)d;
+            queue[qt++] = u;
+        }
+    }
+    if (found < 0)
+        return 0;
+    // Walk back to start, then emit the FIRST maxOut hops in forward order.
+    static int16_t revx[NVG_MAX / 8], revy[NVG_MAX / 8];
+    int rn = 0;
+    for (int t = found; parentDir[t] != 255 && rn < NVG_MAX / 8; )
+    {
+        revx[rn] = (int16_t)(t % s_nvgW); revy[rn] = (int16_t)(t / s_nvgW); rn++;
+        int const d = parentDir[t];
+        t -= stepdy[d] * s_nvgW + stepdx[d];
+    }
+    int cnt = 0;
+    for (int i = rn - 1; i >= 0 && cnt < maxOut; i--)
+        { outTx[cnt] = revx[i]; outTy[cnt] = revy[i]; cnt++; }
+    return cnt;
+}
+
+// Per-bot route follower state.
+static int16_t s_botRtX[MAXPLAYERS][32], s_botRtY[MAXPLAYERS][32];
+static int8_t  s_botRouteLen[MAXPLAYERS], s_botRouteIdx[MAXPLAYERS];
+static int32_t s_botRouteDX[MAXPLAYERS], s_botRouteDY[MAXPLAYERS];
+static int16_t s_botRouteCool[MAXPLAYERS];
+static int8_t  s_botWpDoor[MAXPLAYERS];      // upcoming waypoint is a door tile
+
+// Resolve a destination to the CURRENT steering waypoint over the floor
+// grid. String-pulled: aim at the FARTHEST stored waypoint the feet can walk
+// straight to, so tile chains become natural diagonal runs across the room
+// instead of Manhattan stair-steps. Falls back to the raw point off-mesh.
+// Returns 1 when the waypoint is MESH-GUIDED (straight shot or an on-route
+// tile): guided steering goes DIRECT every tic -- mesh legs are walkable by
+// construction, and any blocked-line fallback layered on top just injects
+// frozen-heading runaways (live report: "the walking is still wrong").
+// Returns 0 only when off-mesh (no route found): caller keeps the old
+// blocked-line crutch for that raw fallback alone.
+static int Bot_Waypoint(int k, DukePlayer_t *ps, int32_t dx2, int32_t dy2,
+                        int16_t dsect, int32_t *wx, int32_t *wy)
+{
+    (void)dsect;
+    *wx = dx2; *wy = dy2;
+    s_botWpDoor[k] = 0;
+    Bot_NavEnsure();
+    if (s_nvgW <= 0)
+        return 0;
+    if (Bot_LineWalkable(ps, dx2, dy2))
+    { s_botRouteLen[k] = 0; return 1; }         // straight shot IS mesh-guided
+    if (s_botRouteCool[k] > 0)
+        s_botRouteCool[k]--;
+    int const moved = klabs(s_botRouteDX[k] - dx2) + klabs(s_botRouteDY[k] - dy2);
+    int needPath = (s_botRouteIdx[k] >= s_botRouteLen[k]) || (moved > 1024);
+    if (needPath && s_botRouteCool[k] == 0)
+    {
+        int const from = Nvg_Snap(ps->pos.x, ps->pos.y);
+        int const dest = Nvg_Snap(dx2, dy2);
+        s_botRouteLen[k]  = (int8_t)Bot_NvgPath(from, dest, s_botRtX[k], s_botRtY[k], 32);
+        s_botRouteIdx[k]  = 0;
+        s_botRouteDX[k]   = dx2; s_botRouteDY[k] = dy2;
+        s_botRouteCool[k] = 26;                 // repath at most once a second
+    }
+    if (s_botRouteLen[k] == 0)
+        return 0;
+    // Advance past REACHED waypoints only -- arrival is the sole consumer.
+    while (s_botRouteIdx[k] < s_botRouteLen[k])
+    {
+        int32_t const tx = Nvg_CX(s_botRtX[k][s_botRouteIdx[k]]);
+        int32_t const ty = Nvg_CY(s_botRtY[k][s_botRouteIdx[k]]);
+        if (klabs(tx - ps->pos.x) + klabs(ty - ps->pos.y) < 400)
+            s_botRouteIdx[k]++;
+        else
+            break;
+    }
+    if (s_botRouteIdx[k] >= s_botRouteLen[k])
+        return 0;                               // window spent: next call repaths
+    // String pull AIMS at the farthest clean waypoint but never consumes it:
+    // committing the peek threw away the fallback chain the moment a peeked
+    // line broke, and the follower face-planted into raw-goal steering.
+    int pick = s_botRouteIdx[k];
+    for (int a = 1; a <= 6; a++)
+    {
+        int const i2 = s_botRouteIdx[k] + a;
+        if (i2 >= s_botRouteLen[k])
+            break;
+        if (Bot_LineWalkable(ps, Nvg_CX(s_botRtX[k][i2]), Nvg_CY(s_botRtY[k][i2])))
+            pick = i2;
+    }
+    *wx = Nvg_CX(s_botRtX[k][pick]);
+    *wy = Nvg_CY(s_botRtY[k][pick]);
+    for (int a = pick; a < pick + 3 && a < s_botRouteLen[k]; a++)
+    {
+        if (s_nvgFlagT[s_botRtY[k][a] * s_nvgW + s_botRtX[k][a]])
+            { s_botWpDoor[k] = 1; break; }
+    }
+    return 1;
+}
+
+static int Bot_IsPickup(int picnum)
+{
+    switch (tileGetMapping(picnum))
+    {
+    case COLA__: case SIXPAK__: case FIRSTAID__: case ATOMICHEALTH__:
+    case SHIELD__: case STEROIDS__: case AIRTANK__: case JETPACK__:
+    case HEATSENSOR__: case BOOTS__: case HOLODUKE__:
+    case AMMO__: case BATTERYAMMO__: case DEVISTATORAMMO__: case RPGAMMO__:
+    case GROWAMMO__: case CRYSTALAMMO__: case HBOMBAMMO__: case AMMOLOTS__:
+    case SHOTGUNAMMO__: case FREEZEAMMO__:
+    case FIRSTGUNSPRITE__: case SHOTGUNSPRITE__: case CHAINGUNSPRITE__:
+    case RPGSPRITE__: case FREEZESPRITE__: case DEVISTATORSPRITE__:
+    case SHRINKERSPRITE__: case TRIPBOMBSPRITE__: case GROWSPRITEICON__:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int Bot_SectorIsDoor(int s)
+{
+    switch (sector[s].lotag)
+    {
+    case ST_9_SLIDING_ST_DOOR: case ST_20_CEILING_DOOR: case ST_21_FLOOR_DOOR:
+    case ST_22_SPLITTING_DOOR: case ST_23_SWINGING_DOOR: case ST_25_SLIDING_DOOR:
+    case ST_26_SPLITTING_ST_DOOR: case ST_29_TEETH_DOOR:
+        return 1;
+    }
+    return 0;
+}
+
+// Pick the exit: score every portal of the current sector by the staleness of
+// what's behind it. The entry portal is the freshest by construction and gets
+// a further 16x haircut -- it is chosen only when it is the ONLY way out.
+// Feet-checked: portals needing a jump up are not exits (very little jumping),
+// door sectors are exits regardless of their current gap (they open), and a
+// crouch-height gap is an exit with the duck flag set (vents).
+static int Bot_PlanExplore(int k, DukePlayer_t *ps)
+{
+    int const cs = ps->cursectnum;
+    int32_t const plc = movefifoplc;
+    int32_t const myFlorz = getflorzofslope((int16_t)cs, ps->pos.x, ps->pos.y);
+    int const wend = sector[cs].wallptr + sector[cs].wallnum;
+    int32_t bestScore = INT32_MIN;
+    int bestW = -1, bestNs = -1, bestDoor = 0, bestCrouch = 0;
+    for (int w = sector[cs].wallptr; w < wend; w++)
+    {
+        int const ns = wall[w].nextsector;
+        if (ns < 0 || (unsigned)ns >= (unsigned)numsectors || (wall[w].cstat & 1))
+            continue;
+        int32_t const mx = (wall[w].x + wall[wall[w].point2].x) >> 1;
+        int32_t const my = (wall[w].y + wall[wall[w].point2].y) >> 1;
+        int const isDoor = Bot_SectorIsDoor(ns);
+        int32_t const nf   = getflorzofslope((int16_t)ns, mx, my);
+        int32_t const rise = myFlorz - nf;          // z grows down: >0 is a step UP
+        if (rise > (21 << 8))
+            continue;       // needs a jump -- and a DOOR on a raised sill is
+                            // just as unreachable (E1L1 lobby doors: +64px)
+        int crouch = 0;
+        if (!isDoor)
+        {
+            int32_t const gap = nf - getceilzofslope((int16_t)ns, mx, my);
+            if (gap < (26 << 8))
+                continue;                           // sealed slit
+            crouch = (gap < (52 << 8));
+        }
+        int32_t stamp = s_botVisitT[k][ns];
+        if (stamp > plc)
+            stamp = 0;                              // relaunch left future stamps
+        int32_t score = plc - stamp;
+        if (ns == s_botPrevSect[k])
+            score >>= 4;
+        // Prefer exits the feet can take directly from HERE (non-convex rooms
+        // hide their far portals behind inner corners and fences); a blocked
+        // one can still win, and follow-until-clear steering earns the rest.
+        if (!Bot_LineWalkable(ps, mx, my))
+            score >>= 6;
+        score += (int32_t)(Bot_Rnd() & 255);        // tiebreak: twin bots split up
+        if (score > bestScore)
+            { bestScore = score; bestW = w; bestNs = ns; bestDoor = isDoor; bestCrouch = crouch; }
+    }
+    if (bestW < 0)
+        return 0;
+    s_botGoal[k]       = 1;
+    s_botGoalX[k]      = (wall[bestW].x + wall[wall[bestW].point2].x) >> 1;
+    s_botGoalY[k]      = (wall[bestW].y + wall[wall[bestW].point2].y) >> 1;
+    s_botGoalSect[k]   = (int16_t)bestNs;
+    s_botGoalDoor[k]   = (int8_t)bestDoor;
+    s_botGoalCrouch[k] = (int8_t)bestCrouch;
+    s_botGoalTics[k]   = 0;
+    s_botGoalItem[k]   = -1;
+    s_botGoalSeen[k]   = 0;
+    return 1;
+}
+
+// Item errand: nearest live pickup in the current room or one portal over,
+// same floor. Pickup itself is the sim's job -- walking over it is ours.
+static int Bot_PlanItem(int k, DukePlayer_t *ps)
+{
+    int const cs = ps->cursectnum;
+    int16_t sects[24];
+    int ns = 0;
+    sects[ns++] = (int16_t)cs;
+    int const wend = sector[cs].wallptr + sector[cs].wallnum;
+    for (int w = sector[cs].wallptr; w < wend && ns < 24; w++)
+    {
+        int const nx = wall[w].nextsector;
+        if (nx < 0 || (unsigned)nx >= (unsigned)numsectors || (wall[w].cstat & 1))
+            continue;
+        int dup = 0;
+        for (int q = 0; q < ns; q++)
+            if (sects[q] == nx) { dup = 1; break; }
+        if (!dup)
+            sects[ns++] = (int16_t)nx;
+    }
+    int best = -1; int32_t bestd = INT32_MAX; int16_t bestSect = -1;
+    for (int q = 0; q < ns; q++)
+    {
+        for (int j = headspritesect[sects[q]]; j >= 0; j = nextspritesect[j])
+        {
+            auto const &sp = sprite[j];
+            if (!Bot_IsPickup(sp.picnum) || (sp.cstat & 32768) || j == s_botItemShun[k])
+                continue;
+            if (sp.statnum != STAT_DEFAULT && sp.statnum != STAT_ACTOR && sp.statnum != STAT_ZOMBIEACTOR)
+                continue;
+            if (klabs(sp.z - ps->pos.z) > (72 << 8))
+                continue;                           // different floor: not this room
+            int32_t const d = klabs(sp.x - ps->pos.x) + klabs(sp.y - ps->pos.y);
+            if (d < bestd) { bestd = d; best = j; bestSect = sects[q]; }
+        }
+    }
+    if (best < 0)
+        return 0;
+    // "If items are in a room, a SMALL CHANCE it tries to pick the item up"
+    // means a nearby detour, not a quest: an errand across a giant sector's
+    // furniture field times out, rolls the next item, and eats the whole
+    // match in one room (v18e: theater bot ping-ponged between pickups 4300
+    // units apart and never took any of the five walkable exits).
+    if (bestd > 3000 || !Bot_LineWalkable(ps, sprite[best].x, sprite[best].y))
+        return 0;
+    s_botGoal[k]       = 2;
+    s_botGoalX[k]      = sprite[best].x;
+    s_botGoalY[k]      = sprite[best].y;
+    s_botGoalSect[k]   = bestSect;
+    s_botGoalDoor[k]   = 0;
+    s_botGoalCrouch[k] = 0;
+    s_botGoalTics[k]   = 0;
+    s_botGoalItem[k]   = (int16_t)best;
+    s_botGoalSeen[k]   = 0;
+    return 1;
+}
+
 static input_t Bot_GetInput(int k)
 {
     input_t in = {};
@@ -641,6 +1227,11 @@ static input_t Bot_GetInput(int k)
             }
             EM_ASM({ console.log('[botsep] plc=' + $0 + ' minsep=' + $1 + ' sect=' + $2 + ',' + $3 + ',' + $4 + ',' + $5 + ',' + $6); },
                    movefifoplc, minSep, sct[0], sct[1], sct[2], sct[3], sct[4]);
+            // Jump audit: cumulative SK_JUMP presses per seat. The user's
+            // metric -- "jumping around constantly makes the bot seem like an
+            // idiot" -- should read near-flat outside water/stuck escapes.
+            EM_ASM({ console.log('[botact] plc=' + $0 + ' jumps=' + $1 + ',' + $2 + ',' + $3 + ',' + $4 + ',' + $5); },
+                   movefifoplc, s_botJumps[0], s_botJumps[1], s_botJumps[2], s_botJumps[3], s_botJumps[4]);
         }
     }
     // The pump can ask for a column BEFORE the level exists (seated at
@@ -654,9 +1245,29 @@ static input_t Bot_GetInput(int k)
     if (sprite[ps->i].extra <= 0 || ps->dead_flag)
     {
         s_botWasDead[k] = 1;
+        // Respawn wants SK_OPEN: the CON death state gates resetplayer on
+        // ifhitspace (gameexec.cpp:3348), NOT fire -- fire-only presses left
+        // every dead bot a corpse forever (measured dead_flag>1100 with the
+        // resetplayer branch fixed and live; the user's decaying matches).
         if ((Bot_Rnd() & 15) == 0)
-            in.bits |= BIT(SK_FIRE);              // respawn
+            in.bits |= BIT(SK_OPEN) | BIT(SK_FIRE);
         return in;
+    }
+    // First live tic for this seat: seed the trap machinery from REALITY.
+    // Zero-init left trapDir pointing at Build angle 0 (due EAST) and the
+    // trap anchor at the map origin -- the first displacement check then
+    // computed a garbage "escape heading" from the origin vector, and a bot
+    // that got pinned before real travel held that compass line into a wall
+    // forever (the user's "doing that east thing", live 2026-08-10).
+    {
+        static uint8_t s_botLive[MAXPLAYERS];
+        if (!s_botLive[k])
+        {
+            s_botLive[k]       = 1;
+            s_botTrapAnchor[k] = ps->pos.xy;
+            s_botTrapDir[k]    = (int16_t)(fix16_to_int(ps->q16ang) & 2047);
+            s_botBounceAng[k]  = s_botTrapDir[k];
+        }
     }
     if (s_botWasDead[k])
     {
@@ -672,6 +1283,18 @@ static input_t Bot_GetInput(int k)
         // shotgun loadout, continuous spawn-cluster combat IS the arena.
         s_botSpawnRoam[k] = 0;
         s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
+        s_botGoal[k]      = 0;      // spawned somewhere new: fresh errand
+        s_botGoalItem[k]  = -1;
+        s_botItemShun[k]  = -1;
+        s_botPrevSect[k]  = -1;     // teleported in -- no entry door to shun
+        s_botSightTics[k] = 200;    // stale target: must re-SEE (or be shot) to re-engage
+        s_botGoalSeen[k]  = 0;
+        s_botNavSeen[k]   = 0;
+        s_botTrapAnchor[k] = ps->pos.xy;    // respawn is a teleport: re-anchor
+        s_botTrapDir[k]    = (int16_t)(fix16_to_int(ps->q16ang) & 2047);
+        s_botTrapTics[k]   = 0;
+        s_botRouteLen[k]   = 0;             // routes don't survive teleports
+        s_botRouteCool[k]  = 0;
     }
 
     int const skill = clamp(g_netBotSkill, 0, 2);
@@ -683,11 +1306,22 @@ static input_t Bot_GetInput(int k)
     static int const holdMax[3]  = { 30, 16, 6 };
 
     // Crossing into a new sector invalidates the plotted portal: re-plan now.
+    // It also feeds the room memory: stamp where we are, remember where we
+    // came from, and retire a portal errand the moment it is consumed.
     if (ps->cursectnum != s_botLastSect[k])
     {
+        s_botPrevSect[k]  = s_botLastSect[k];
         s_botLastSect[k]  = ps->cursectnum;
         s_botThinkHold[k] = 0;
+        s_botVisitT[k][ps->cursectnum] = movefifoplc;
+        s_botThreadFails[k] = 0;    // real progress: the field is behind us
+        if (s_botGoal[k] == 1)
+            s_botGoal[k] = 0;       // new room reached: pick its far exit fresh
     }
+    else if ((movefifoplc & 31) == 0)
+        s_botVisitT[k][ps->cursectnum] = movefifoplc;   // lingering ages a room too
+    if (s_botJumpCool[k] > 0)
+        s_botJumpCool[k]--;
 
     // Reacquire target only when the hold expires (reaction time).
     if (--s_botThinkHold[k] <= 0)
@@ -708,31 +1342,48 @@ static input_t Bot_GetInput(int k)
                 && (unsigned)sprite[wa].yvel < MAXPLAYERS)
                 revenge = sprite[wa].yvel;
         }
-        int best = -1; int32_t bestd = INT32_MAX; int i;
+        // FIND before FIGHT (user directive): acquisition needs LINE OF SIGHT
+        // -- or revenge, because you know who just shot you. The old
+        // omniscient nearest-player pick beelined every bot across the map
+        // through walls; nothing about it read as patrolling a level. A
+        // sighted target sticks for ~5s of pursuit memory after LOS breaks,
+        // then the bot returns to its room routine. Height penalty stays x1:
+        // falling is free in Duke, a floor apart is CLOSE.
+        int best = -1, heard = -1; int32_t bestd = INT32_MAX, heardd = INT32_MAX; int i;
+        int bestSeen = 0;
         TRAVERSE_CONNECT(i)
         {
             if (i == k || i == avoid) continue;
-            auto const tp = g_player[i].ps;
-            if (tp == NULL || (unsigned)tp->i >= MAXSPRITES || sprite[tp->i].extra <= 0 || tp->dead_flag
-                || (unsigned)tp->cursectnum >= (unsigned)numsectors)
+            auto const cp = g_player[i].ps;
+            if (cp == NULL || (unsigned)cp->i >= MAXSPRITES || sprite[cp->i].extra <= 0 || cp->dead_flag
+                || (unsigned)cp->cursectnum >= (unsigned)numsectors)
                 continue;
-            // Height penalty x1 (was x3): the x3 pinned every bot to its own
-            // floor -- rooftop pairs never dropped down to fight, encounter
-            // rate ~0 (5-minute probe: 2 sprite hits, 0 frags). Falling is
-            // free in Duke; a floor apart is CLOSE.
-            int32_t d = klabs(tp->pos.x - ps->pos.x) + klabs(tp->pos.y - ps->pos.y)
-                        + (klabs(tp->pos.z - ps->pos.z) >> 2);
+            int32_t d = klabs(cp->pos.x - ps->pos.x) + klabs(cp->pos.y - ps->pos.y)
+                        + (klabs(cp->pos.z - ps->pos.z) >> 2);
+            int seen = 1;
             if (i == revenge)
                 d >>= 2;
-            if (d < bestd) { bestd = d; best = i; }
+            else if (!cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
+                             cp->pos.x, cp->pos.y, cp->pos.z, cp->cursectnum))
+            {
+                // Unseen but close counts as HEARD -- a hunting hint, not a lock.
+                if (d < heardd) { heardd = d; heard = i; }
+                continue;
+            }
+            if (i == revenge)
+                seen = cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
+                              cp->pos.x, cp->pos.y, cp->pos.z, cp->cursectnum);
+            if (d < bestd) { bestd = d; best = i; bestSeen = seen; }
         }
-        if (best < 0 && avoid >= 0)
-            best = avoid;   // nobody else exists: keep the old one
+        if (best < 0 && s_botTarget[k] >= 0 && s_botTarget[k] != avoid
+            && s_botSightTics[k] < 130)
+            best = s_botTarget[k];      // pursuit memory: chase the last sighting briefly
         if (best != s_botTarget[k])
         {
             s_botTargetHold[k] = 0;
             s_botNoHitTics[k]  = 0;
             s_botLastTDist[k]  = INT32_MAX;
+            s_botSightTics[k]  = 0;
         }
         s_botTarget[k] = (int8_t)best;
         // Plot the route: first portal toward the target, recomputed each
@@ -741,12 +1392,44 @@ static input_t Bot_GetInput(int k)
         if (best >= 0 && g_player[best].ps != NULL
             && Bot_NavFirstHop(ps->cursectnum, g_player[best].ps->cursectnum,
                                &s_botNavX[k], &s_botNavY[k]))
-            s_botNavOn[k] = 1;
+            { s_botNavOn[k] = 1; s_botNavSeen[k] = 0; }
+        if (best >= 0 && (bestSeen || s_botNavOn[k]))
+            s_botGoal[k] = 0;           // a fight we can PROSECUTE: drop the errand
+        else if (s_botGoal[k] == 0)
+        {
+            // Nobody in sight: run the ROOM ROUTINE. A close unseen enemy
+            // is worth half the coin flips (walk toward the noise); a far
+            // one still pulls a quarter of them -- pure staleness patrol is
+            // ANTI-convergent (another bot's fresh trail reads as "recently
+            // visited, skip"), and v18h measured the fleet mutually avoiding
+            // itself to minsep ~12000 and zero fights for a full window. The
+            // hunt is an ERRAND down a real route, not a target lock, so the
+            // wall-hump class stays dead.
+            int const huntRoll = (heardd < 10000) ? (int)(Bot_Rnd() & 1)
+                                                  : ((Bot_Rnd() & 3) == 0);
+            if (heard >= 0 && huntRoll
+                && Bot_NavFirstHop(ps->cursectnum, g_player[heard].ps->cursectnum,
+                                   &s_botGoalX[k], &s_botGoalY[k]))
+            {
+                s_botGoal[k]       = 1;
+                s_botGoalSect[k]   = -1;
+                s_botGoalDoor[k]   = 0;
+                s_botGoalCrouch[k] = 0;
+                s_botGoalTics[k]   = 0;
+                s_botGoalItem[k]   = -1;
+                s_botGoalSeen[k]   = 0;
+            }
+            else
+            {
+                int const wantItem = ((Bot_Rnd() & 3) == 0);
+                if ((!wantItem || !Bot_PlanItem(k, ps)) && !Bot_PlanExplore(k, ps))
+                    s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);   // portal-less void
+            }
+        }
         if ((Bot_Rnd() & 3) == 0)
             s_botStrafeDir[k] = (Bot_Rnd() & 1) ? 1 : -1;
         if (s_botTurnPref[k] == 0 || (Bot_Rnd() & 63) == 0)
             s_botTurnPref[k] = (Bot_Rnd() & 1) ? 1 : -1;
-        s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
     }
 
     // Stuck detection: intending to move but the feet aren't (walls, doors,
@@ -766,16 +1449,42 @@ static input_t Bot_GetInput(int k)
                 // on every trip locked bots in PERMANENT bounce mode -- the
                 // navigator never steered again (bot 1's trace: pinned at one
                 // xy for a full 3 minutes, bounce never expiring). Keep
-                // hopping and let the rotation finish; if still stuck after
-                // it expires, the door/bounce ladder below runs fresh.
-                in.bits |= BIT(SK_JUMP);
+                // the rotation finish; if still stuck after it expires, the
+                // door/bounce ladder below runs fresh. NO hop here at all:
+                // the re-trip fires every ~10 tics while cornered, and any
+                // jump wired to it becomes a metronome (measured 35 presses
+                // per 512 tics -- the user's "jumping around constantly").
             }
             else if (s_botOpenGrace[k] == 0)
             {
-                // First response to a blockage: it is probably a DOOR. Press
-                // open and KEEP PUSHING -- doors take tics to swing; turning
-                // away instantly (the old behavior) wasted every door press.
-                s_botOpenGrace[k]  = 26;
+                // First response to a blockage: if what is AHEAD fronts a
+                // door sector, press open and KEEP PUSHING -- doors take
+                // tics to swing. Pushing into arbitrary masonry for 26 tics
+                // per cycle was the last deliberate wall-lean left (a bot
+                // nose-first into the street wall reads as broken even when
+                // it recovers); non-door blockages go straight to the
+                // bounce/lane ladder next trip.
+                int doorish = 0;
+                {
+                    hitdata_t dh = {};
+                    int const da = fix16_to_int(ps->q16ang) & 2047;
+                    hitscan(&ps->pos, ps->cursectnum, sintable[(da + 512) & 2047],
+                            sintable[da & 2047], 0, &dh, CLIPMASK0);
+                    if (dh.wall >= 0 && klabs(dh.xyz.x - ps->pos.x)
+                                        + klabs(dh.xyz.y - ps->pos.y) < 1024)
+                    {
+                        int const dns = wall[dh.wall].nextsector;
+                        if ((unsigned)dns < (unsigned)numsectors && Bot_SectorIsDoor(dns))
+                            doorish = 1;
+                        // Switch-faced walls count: pressing them IS the move.
+                        if (wall[dh.wall].lotag > 0)
+                            doorish = 1;
+                    }
+                    else if (dh.sprite >= 0)
+                        doorish = 1;        // sprite blocker: press is harmless,
+                                            // and the break-fire below handles it
+                }
+                s_botOpenGrace[k]  = doorish ? 26 : 1;
                 in.bits |= BIT(SK_OPEN);
                 // Blocker-clearing fire ONLY when a sprite is actually in the
                 // way. The old unconditional burst re-armed on every stuck
@@ -790,6 +1499,19 @@ static input_t Bot_GetInput(int k)
                     && klabs(sprite[hit.sprite].x - ps->pos.x)
                        + klabs(sprite[hit.sprite].y - ps->pos.y) < 2048)
                     s_botBreakFire[k] = 8;
+                else if (hit.wall >= 0
+                         && klabs(hit.xyz.x - ps->pos.x) + klabs(hit.xyz.y - ps->pos.y) < 2048)
+                {
+                    // A breakable pane/grate/forcefield between us and the
+                    // route is an exit with a health bar: shoot it open
+                    // ("if it can destroy something to get to an exit").
+                    switch (tileGetMapping(wall[hit.wall].overpicnum))
+                    {
+                    case GLASS__: case GLASS2__: case BIGFORCE__: case W_FORCEFIELD__:
+                        s_botBreakFire[k] = 8;
+                        break;
+                    }
+                }
             }
             else
             {
@@ -798,17 +1520,50 @@ static input_t Bot_GetInput(int k)
                 // and bots milled inside their spawn rooms for entire 5-minute
                 // probes (sector telemetry: 3 of 5 players never changed
                 // sector). Rotating a CONSISTENT 90 degrees per trip rounds
-                // furniture and doorframes like a maze-following bug; jumping
-                // on every trip clears the knee-high blockers (theater seats,
-                // rails) that trip the loop in the first place.
+                // furniture and doorframes like a maze-following bug; the
+                // knee-high blockers (theater seats, rails) get a jump only
+                // once the trap REPEATS -- episode 2+ -- never as a habit.
                 s_botOpenGrace[k]  = 0;
                 if (s_botStuckEpisodes[k] < 6)
                     s_botStuckEpisodes[k]++;
-                s_botBounceHold[k] = (int16_t)(s_botNavOn[k] ? 15 + (Bot_Rnd() & 15)
+                // FURNITURE-FIELD LANE PICK: repeated stuck trips while the
+                // wall probe calls the goal line clear mean the blockage is
+                // SPRITES (theater chair grids, alley crates) -- geometry the
+                // wall-follow cannot trace and clip-slide will not thread at
+                // speed (measured: full drive, ~2.5 units/tic net). Do what a
+                // player does: look down the open lanes (sprite-AWARE knee-
+                // height ray fan) and commit to the longest one that still
+                // leans toward the goal -- the E1L1 aisles light up exactly
+                // this way.
+                if (s_botThreadFails[k] < 8)
+                    s_botThreadFails[k]++;
+                if ((s_botGoal[k] != 0 || s_botNavOn[k]) && s_botThreadFails[k] >= 2)
+                {
+                    int32_t const gx = s_botNavOn[k] ? s_botNavX[k] : s_botGoalX[k];
+                    int32_t const gy = s_botNavOn[k] ? s_botNavY[k] : s_botGoalY[k];
+                    s_botLaneAng[k]    = (int16_t)Bot_PickLane(ps, gx, gy);
+                    s_botLaneHold[k]   = 60;
+                    s_botBounceHold[k] = 0;         // the lane IS the recovery
+                    s_botThinkHold[k]  = 1;
+                }
+                else
+                {
+                // Short bounces whenever ANY navigation is live (target route
+                // or room errand): long blind rotations steered AWAY from a
+                // perfectly good goal for seconds at a time.
+                s_botBounceHold[k] = (int16_t)((s_botNavOn[k] || s_botGoal[k] != 0)
+                                     ? 15 + (Bot_Rnd() & 15)
                                      : 20 + (Bot_Rnd() & 31) + 16 * s_botStuckEpisodes[k]);
                 s_botBounceAng[k]  = (int16_t)((fix16_to_int(ps->q16ang) + s_botTurnPref[k] * 512) & 2047);
-                in.bits |= BIT(SK_JUMP);
+                s_botGoalSeen[k] = 0;   // heading changed: re-probe on expiry
+                s_botNavSeen[k]  = 0;
+                if (s_botStuckEpisodes[k] >= 3 && s_botJumpCool[k] == 0)
+                {
+                    in.bits |= BIT(SK_JUMP);   // the LAST rung, and rate-limited
+                    s_botJumpCool[k] = 78;
+                }
                 s_botThinkHold[k]  = 1;   // fresh route right after this bounce
+                }
             }
         }
     }
@@ -821,6 +1576,45 @@ static input_t Bot_GetInput(int k)
         s_botOpenGrace[k]--;
         if ((s_botOpenGrace[k] & 7) == 0)
             in.bits |= BIT(SK_OPEN);            // re-press while the grace runs
+    }
+
+    // Errand upkeep: arrival, timeout, and the DOOR/vent etiquette on approach.
+    if (s_botGoal[k] != 0)
+    {
+        int32_t const goalDist = klabs(s_botGoalX[k] - ps->pos.x) + klabs(s_botGoalY[k] - ps->pos.y);
+        if (++s_botGoalTics[k] > 390)
+        {
+            // 15s on one errand is a locked door / unreachable shelf: mark it
+            // satisfied so the gradient stops wanting it, and move on. EVERY
+            // timed-out portal gets stamped, door or not -- an unstamped
+            // unreachable neighbor stays the stalest thing in the room and
+            // the planner re-picks it forever (the seat-pinned loop).
+            if (s_botGoal[k] == 2)
+                s_botItemShun[k] = s_botGoalItem[k];
+            else if ((unsigned)s_botGoalSect[k] < (unsigned)numsectors)
+                s_botVisitT[k][s_botGoalSect[k]] = movefifoplc;
+            s_botGoal[k] = 0;
+        }
+        else if (s_botGoal[k] == 2)
+        {
+            int const it = s_botGoalItem[k];
+            if ((unsigned)it >= MAXSPRITES || (sprite[it].cstat & 32768)
+                || !Bot_IsPickup(sprite[it].picnum))
+                s_botGoal[k] = 0;               // taken (ideally by us): errand done
+            else if (goalDist < 512 && s_botGoalTics[k] > 60)
+            {
+                // Standing ON it and nothing happened -- full health/ammo, the
+                // sim refuses. Shun it and get back to the room routine.
+                s_botItemShun[k] = (int16_t)it;
+                s_botGoal[k]     = 0;
+            }
+        }
+        else if (goalDist < 384 && s_botGoalSect[k] < 0)
+            s_botGoal[k] = 0;                   // free waypoint (heard-them walk) reached
+        if (s_botGoal[k] != 0 && s_botGoalDoor[k] && goalDist < 1600 && (movefifoplc & 7) == 0)
+            in.bits |= BIT(SK_OPEN);            // doors get PRESSED, not bumped
+        if (s_botGoal[k] != 0 && s_botGoalCrouch[k] && goalDist < 1024)
+            in.bits |= BIT(SK_CROUCH);          // duck into the vent as we arrive
     }
 
     // Post-respawn roam window: target-blind AND trigger-blind, so freshly
@@ -836,6 +1630,15 @@ static input_t Bot_GetInput(int k)
     bool const seesTarget = (tp != NULL && (unsigned)tp->cursectnum < (unsigned)numsectors
                              && cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
                                        tp->pos.x, tp->pos.y, tp->pos.z, tp->cursectnum));
+    // Pursuit-memory clock: acquisition is sight-gated, so how long ago the
+    // target was SEEN decides when the chase is called off (think block).
+    if (s_botTarget[k] >= 0)
+    {
+        if (seesTarget)
+            s_botSightTics[k] = 0;
+        else if (s_botSightTics[k] < 30000)
+            s_botSightTics[k]++;
+    }
 
     // "Can SEE" is not "can HIT": cansee() threads through masked walls
     // (chain-link fences, window bars) that hitscan bullets terminate on. The
@@ -858,8 +1661,14 @@ static input_t Bot_GetInput(int k)
         int32_t const rayLen = klabs(ray.xyz.x - ps->pos.x) + klabs(ray.xyz.y - ps->pos.y);
         if (ray.sprite >= 0 && sprite[ray.sprite].picnum == APLAYER)
             canHit = true;
-        else if (rayLen + 1024 < distT)
-            canHit = false;   // ray died strictly SHORT of the target: fence/wall between
+        else if (rayLen + 256 < distT)
+            canHit = false;   // ray died SHORT of the target: fence/wall between
+                              // (256 = torso slack only; the old 1024 let a
+                              // target one THIN WALL away count as hittable --
+                              // the bot fired into masonry, canHit kept
+                              // resetting the no-hit breaker, and the chase
+                              // branch drove it face-first into the wall
+                              // indefinitely: the user's screenshot)
         else
         {
             // Ray reaches the target's range (or beyond): decide by how far
@@ -887,31 +1696,104 @@ static input_t Bot_GetInput(int k)
 
     // Steering priority: wall-bounce > visible chase > blind homing/wander.
     int wantAng;
-    if (s_botTrapTics[k] > 104)
+    if (s_botTrapTics[k] > 104 && !(s_botGoal[k] != 0 && s_botGoalSeen[k] > 0))
     {
         // Hard-trapped: hold the escape axis (the way we came in is the way
-        // out of a duct) -- outranks bounce, which only knows walls.
+        // out of a duct) -- outranks bounce, which only knows walls. An
+        // errand with a CLEAR walk line outranks the trap heading though:
+        // walking the errand IS the escape, and real displacement resets
+        // the trap clock on its own.
         wantAng = s_botTrapDir[k];
     }
     else if (s_botBounceHold[k] > 0)
     {
         s_botBounceHold[k]--;
         wantAng = s_botBounceAng[k];
-        if (s_botNavOn[k] && (s_botBounceHold[k] & 7) == 0)
-            in.bits |= BIT(SK_JUMP);    // keep hopping the low blocker we round
+        // (No rhythmic hop here anymore: the wall-follow rotation does the
+        // work, and the metronome jumping was THE tell the user called out.)
     }
-    else if (tp != NULL)
+    else if (s_botLaneHold[k] > 0)
+    {
+        s_botLaneHold[k]--;
+        wantAng = s_botLaneAng[k];      // committed to the open lane
+    }
+    else if (tp != NULL && (canHit || seesTarget || s_botNavOn[k]))
     {
         // Toward the target when the shot can land; along the ROUTE (first
         // portal midpoint) when it cannot -- homing at an unhittable target
         // grinds fences forever, the measured no-encounter equilibrium.
         if (!canHit && s_botNavOn[k])
-            wantAng = getangle(s_botNavX[k] - ps->pos.x, s_botNavY[k] - ps->pos.y);
+        {
+            // Follow-until-clear (chase flavor): straight at the waypoint
+            // only while the walk line is open, else hold the follow heading.
+            int32_t nx2 = s_botNavX[k], ny2 = s_botNavY[k];
+            int guided2 = 0;
+            if ((unsigned)tp->cursectnum < (unsigned)numsectors)
+                guided2 = Bot_Waypoint(k, ps, tp->pos.x, tp->pos.y, tp->cursectnum, &nx2, &ny2);
+            if (s_botWpDoor[k] && (movefifoplc & 7) == 0
+                && klabs(nx2 - ps->pos.x) + klabs(ny2 - ps->pos.y) < 1600)
+                in.bits |= BIT(SK_OPEN);
+            if (guided2)
+            {
+                s_botNavSeen[k] = 1;
+                wantAng = getangle(nx2 - ps->pos.x, ny2 - ps->pos.y);
+            }
+            else
+            {
+                if ((movefifoplc & ((s_botNavSeen[k] < 0) ? 31 : 15)) == 0 || s_botNavSeen[k] == 0)
+                {
+                    int const wasBlocked = (s_botNavSeen[k] < 0);
+                    s_botNavSeen[k] = Bot_LineWalkable(ps, nx2, ny2) ? 1 : -1;
+                    if (s_botNavSeen[k] < 0 && !wasBlocked && s_botBounceHold[k] == 0)
+                        s_botBounceAng[k] = (int16_t)(fix16_to_int(ps->q16ang) & 2047);
+                }
+                wantAng = (s_botNavSeen[k] > 0)
+                          ? getangle(nx2 - ps->pos.x, ny2 - ps->pos.y)
+                          : s_botBounceAng[k];
+            }
+        }
         else
         {
             wantAng = getangle(tp->pos.x - ps->pos.x, tp->pos.y - ps->pos.y);
             if (!seesTarget)
                 wantAng = (wantAng + (int)(Bot_Rnd() % 129) - 64) & 2047;
+        }
+    }
+    else if (s_botGoal[k] != 0)
+    {
+        // Follow-until-clear (errand flavor) -- the v18a grinder's cure.
+        // Straight at the goal only while the walk line is open; blocked
+        // means HOLD the current heading and let stuck trips rotate it a
+        // consistent 90 degrees -- tracing the obstacle like a maze bug
+        // until the line opens again. Steering back at the goal every tic
+        // while blocked was the measured thrash: +-700 ang units of
+        // oscillation at max turn rate, ~3 units/tic net drift, zero exits.
+        // ROUTE FIRST (OpenArena-style): mesh-guided waypoints get DIRECT
+        // steering every tic; the blocked-line crutch survives only for the
+        // off-mesh raw fallback.
+        int32_t sx2, sy2;
+        int const guided = Bot_Waypoint(k, ps, s_botGoalX[k], s_botGoalY[k],
+                                        s_botGoalSect[k], &sx2, &sy2);
+        if (s_botWpDoor[k] && (movefifoplc & 7) == 0
+            && klabs(sx2 - ps->pos.x) + klabs(sy2 - ps->pos.y) < 1600)
+            in.bits |= BIT(SK_OPEN);        // mid-route door: press through it
+        if (guided)
+        {
+            s_botGoalSeen[k] = 1;
+            wantAng = getangle(sx2 - ps->pos.x, sy2 - ps->pos.y);
+        }
+        else
+        {
+            if ((movefifoplc & ((s_botGoalSeen[k] < 0) ? 31 : 15)) == 0 || s_botGoalSeen[k] == 0)
+            {
+                int const wasBlocked = (s_botGoalSeen[k] < 0);
+                s_botGoalSeen[k] = Bot_LineWalkable(ps, sx2, sy2) ? 1 : -1;
+                if (s_botGoalSeen[k] < 0 && !wasBlocked && s_botBounceHold[k] == 0)
+                    s_botBounceAng[k] = (int16_t)(fix16_to_int(ps->q16ang) & 2047);
+            }
+            wantAng = (s_botGoalSeen[k] > 0)
+                      ? getangle(sx2 - ps->pos.x, sy2 - ps->pos.y)
+                      : s_botBounceAng[k];
         }
     }
     else
@@ -924,7 +1806,7 @@ static input_t Bot_GetInput(int k)
     // Medium wobble halved 8->4: 48 honest canHit discharges converted only 2
     // sprite terminations in 5 minutes -- +-8 ang units is +-1.4 degrees of
     // permanent miss at range even with the shotgun cone.
-    static int const trackWobble[3] = { 20, 4, 3 };
+    static int const trackWobble[3] = { 20, 4, 2 };
     int const aimErr = seesTarget ? (int)(Bot_Rnd() % (2 * trackWobble[skill] + 1)) - trackWobble[skill]
                                   : (int)(Bot_Rnd() % (2 * wobble[skill] + 1)) - wobble[skill];
     int const cap = (seesTarget && klabs(diff) > turnCap[skill]) ? turnCap[skill] * 2 : turnCap[skill];
@@ -960,10 +1842,24 @@ static input_t Bot_GetInput(int k)
         in.extbits |= BIT(s_botStrafeDir[k] > 0 ? EK_STRAFE_LEFT : EK_STRAFE_RIGHT);
         in.extbits |= BIT(EK_MOVE_FORWARD);
     }
+    else if (canHit && dist2d <= 8192)
+    {
+        // Mid-range with a shot: PRESS THE FIGHT -- approach with a strafe
+        // slant instead of standing off. Passive engagement read as "the
+        // bots are broken" from the player's side of the barrel.
+        in.fvel = 56;
+        in.svel = (int16_t)(s_botStrafeDir[k] * 32);
+        in.bits |= BIT(SK_RUN);
+        in.extbits |= BIT(EK_MOVE_FORWARD);
+        in.extbits |= BIT(s_botStrafeDir[k] > 0 ? EK_STRAFE_LEFT : EK_STRAFE_RIGHT);
+    }
     else if (s_botBounceHold[k] > 0 && klabs(diff) > 150)
     {
-        // Mid-bounce with the nose still in the wall: rotate first, walk
-        // after -- driving forward through the turn re-trips stuck instantly.
+        // Mid-bounce with the nose still in the wall: keep HALF stride
+        // through the rotation -- a statue-turn reads as wedged to anyone
+        // watching, and the slide along the wall is the wall-follow anyway.
+        in.fvel = 40;
+        in.extbits |= BIT(EK_MOVE_FORWARD);
     }
     else
     {
@@ -972,8 +1868,6 @@ static input_t Bot_GetInput(int k)
         in.bits |= BIT(SK_RUN);
         in.extbits |= BIT(EK_MOVE_FORWARD);
     }
-    if ((Bot_Rnd() & 127) < 2)
-        in.bits |= BIT(SK_JUMP);
 
     // Fire discipline: the gate uses TRUE aim error (wobble is steering noise,
     // not trigger noise) and halves with distance so long shots need real aim.
@@ -1033,6 +1927,31 @@ static input_t Bot_GetInput(int k)
             s_botTrapCool[k]--;
     }
 
+    // Environmental reflexes ("expand to other interactive options"):
+    // swimming is the one sanctioned jump; warp elevators want an OPEN press
+    // to run; crawl-height sectors get a proactive duck instead of a 4s trap
+    // ladder discovery.
+    {
+        int const cls = sector[ps->cursectnum].lotag;
+        if (cls == ST_2_UNDERWATER)
+        {
+            if (ps->airleft < 26 * 12 || (Bot_Rnd() & 7) == 0)
+                in.bits |= BIT(SK_JUMP);        // surface: air outranks errands
+        }
+        else
+        {
+            if (cls == ST_15_WARP_ELEVATOR && (movefifoplc & 63) == 0)
+                in.bits |= BIT(SK_OPEN);
+            int32_t const clr = getflorzofslope(ps->cursectnum, ps->pos.x, ps->pos.y)
+                              - getceilzofslope(ps->cursectnum, ps->pos.x, ps->pos.y);
+            if (clr < (52 << 8))
+            {
+                in.bits |= BIT(SK_CROUCH);
+                in.bits &= ~BIT(SK_JUMP);       // ducts: jumping just grinds the ceiling
+            }
+        }
+    }
+
     int gate = fireGate[skill];
     if (dist2d > 8192)  gate >>= 1;
     if (dist2d > 20000) gate >>= 1;
@@ -1047,6 +1966,23 @@ static input_t Bot_GetInput(int k)
     {
         s_botBreakFire[k]--;
         in.bits |= BIT(SK_FIRE);
+    }
+
+    // WORLD-SPACE VELOCITIES: P_ProcessInput consumes input.fvel/svel as
+    // vel.x/vel.y DIRECTLY (player.cpp ~5903; the human sampler pre-rotates
+    // stick input into world components before storing them). The brain
+    // computes LOCAL forward/strafe -- unrotated, every emitted step was due
+    // EAST regardless of facing ([sim1]: vy==0 in every sample, vx huge,
+    // pinned at the first east-blocking wall; the user's "jumping up and
+    // down, zero x/y movement" bots). Rotate by the bot's facing on the way
+    // out; the localbot seat is untouched (its input rides the real sampler).
+    if (in.fvel || in.svel)
+    {
+        int const wa = fix16_to_int(ps->q16ang) & 2047;
+        int32_t const wc = sintable[(wa + 512) & 2047], ws = sintable[wa & 2047];
+        int32_t const fwd = in.fvel, str = in.svel;
+        in.fvel = (int16_t)clamp((int32_t)((fwd * wc - str * ws) >> 14), -127, 127);
+        in.svel = (int16_t)clamp((int32_t)((fwd * ws + str * wc) >> 14), -127, 127);
     }
 
     // Single-bot decision trace (forensics only): the room-escape failure has
@@ -1070,12 +2006,25 @@ static input_t Bot_GetInput(int k)
             }
             EM_ASM({ console.log('[bot1] plc=' + $0 + ' x=' + $1 + ' y=' + $2 + ' sect=' + $3
                      + ' ang=' + $4 + ' fv=' + $5 + ' stuck=' + $6 + ' bounce=' + $7
-                     + ' blkpic=' + $8 + ' blkstat=' + $9 + ' blkd=' + $10); },
+                     + ' blkpic=' + $8 + ' blkd=' + $9); },
                    movefifoplc, ps->pos.x, ps->pos.y, ps->cursectnum,
                    fix16_to_int(ps->q16ang), (int)in.fvel,
-                   s_botStuckTics[k], s_botBounceHold[k], bPic, bStat, bDist);
+                   s_botStuckTics[k], s_botBounceHold[k], bPic, bDist);
+            EM_ASM({ console.log('[bot1g] plc=' + $0 + ' vx=' + $1 + ' vy=' + $2 + ' nown=' + $3
+                     + ' thold=' + $4 + ' acc=' + $5 + ' fist=' + $6 + ' hland=' + $7); },
+                   movefifoplc, ps->vel.x, ps->vel.y, (int)ps->newowner,
+                   (int)ps->transporter_hold, (int)ps->access_incs,
+                   (int)ps->fist_incs, (int)ps->hard_landing);
+            EM_ASM({ console.log('[bot1n] plc=' + $0 + ' goal=' + $1 + ' gx=' + $2 + ' gy=' + $3
+                     + ' gsect=' + $4 + ' door=' + $5 + ' tgt=' + $6 + ' sightt=' + $7); },
+                   movefifoplc, (int)s_botGoal[k], s_botGoalX[k], s_botGoalY[k],
+                   (int)s_botGoalSect[k], (int)s_botGoalDoor[k],
+                   (int)s_botTarget[k], (int)s_botSightTics[k]);
         }
     }
+
+    if (in.bits & BIT(SK_JUMP))
+        s_botJumps[k]++;
 
     return in;
 }
@@ -1309,6 +2258,15 @@ static void Net_CheckPeerHealth(void)
         if (i == s_joinFlowSlot) { s_lastRealRecvClock[i] = now; continue; }
         // CPU seats have no transport to be silent on.
         if (g_netBotMask & (1 << i)) { s_lastRealRecvClock[i] = now; continue; }
+        // A guest still inside the NEW_GAME redelivery window is BOOTING its
+        // engine -- a real browser can take minutes, and the axe was measured
+        // kicking a throttled guest 48s after launch while its entry packets
+        // sat queued in the reliable channel (the user's every "empty match").
+        // Transport peer-downs (above) still reap genuine disconnects
+        // instantly; the axe just waits for entry.
+        if (!(s_newGameAckMask & (1u << i)) && s_newGameLen > 0
+            && now - s_newGameClock < 7200)   // up to ~4 min of boot patience
+        { s_lastRealRecvClock[i] = now; continue; }
 
         if (s_lastRealRecvClock[i] > now)   // totalclock reset
             s_lastRealRecvClock[i] = now;
@@ -1499,7 +2457,15 @@ void Net_HandleInput(void)
                     staged.bits |= BIT(SK_FIRE);
                 if (g_testDrive)
                 {
-                    staged.fvel = 96;
+                    // WORLD-SPACE CONTRACT: fvel/svel are world velocity
+                    // components (P_ProcessInput adds them straight to
+                    // vel.x/y). Rotate "forward 96" by the current facing or
+                    // the probe walks due EAST forever regardless of view --
+                    // the exact bug that froze the bots for two sessions.
+                    auto const dps = g_player[myconnectindex].ps;
+                    int const da = (dps != NULL) ? (fix16_to_int(dps->q16ang) & 2047) : 0;
+                    staged.fvel = (int16_t)clamp((96 * sintable[(da + 512) & 2047]) >> 14, -127, 127);
+                    staged.svel = (int16_t)clamp((96 * sintable[da & 2047]) >> 14, -127, 127);
                     staged.bits |= BIT(SK_RUN);
                     staged.extbits |= BIT(EK_MOVE_FORWARD);
                 }
@@ -1544,7 +2510,7 @@ void Net_HandleInput(void)
         // WATCHERS (unseated joiners / healing guests mid-catchup) never
         // report: their compares are gated off, and any stale latch from
         // before the catchup must not re-trigger the heal that just ran.
-        if (seated && (g_foundSyncError || Net_SyncErrorDetected()))
+        if (!g_netStreamMode && seated && (g_foundSyncError || Net_SyncErrorDetected()))
         {
             static int32_t s_lastReportClock;
             int32_t const now = (int32_t)totalclock;
@@ -1769,6 +2735,13 @@ void Net_HandleInput(void)
     // by the acks its empty S2Ms carry.
     if (s_joinFlowSlot >= 0 && !g_player[s_joinFlowSlot].connected)
         sendMasterTo(s_joinFlowSlot);
+
+    // STATE AUTHORITY: after the cmd fan-out, broadcast what is actually TRUE.
+    if (g_netStreamMode)
+        Net_StreamAuthoritativeState();
+    // NEW_GAME redelivery: a guest whose engine was still booting at launch
+    // missed the roster packet and entered an empty world (live, twice).
+    Net_ResendNewGameIfUnacked();
 
     // Classic master self-quit: exit once our own quit-bit tic has been
     // aggregated (its broadcast + the drop machinery inform every peer).
@@ -2199,6 +3172,19 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 ud.m_coop           = packbuf[j++];
                 ud.m_dmflags        = (int32_t)B_UNBUF32(&packbuf[j]);  j += sizeof(int32_t);
                 uint32_t flags      = (uint32_t)B_UNBUF32(&packbuf[j]); j += sizeof(int32_t);
+                // Launch-token dedupe: the host REDELIVERS this packet until
+                // our entry ack lands (a booting engine can miss the first
+                // send); a duplicate of a launch we already applied must not
+                // restart the level. Token 0 = legacy sender, never deduped.
+                {
+                    uint8_t launchToken = 0;
+                    if (packbufleng > j)
+                        launchToken = (uint8_t)packbuf[j++];
+                    static uint8_t s_lastLaunchToken;
+                    if (launchToken != 0 && launchToken == s_lastLaunchToken)
+                        break;
+                    s_lastLaunchToken = launchToken;
+                }
                 // [NetDuke32 port] Upstream: G_NewGame(flags | NEWGAME_FROMSERVER).
                 // TODO(netcode): upstream NEWGAME_* flag nuances (NOSEND/RESETALL) are
                 // not modeled by this tree's G_NewGame. Low 16 bits stay reserved for
@@ -2275,7 +3261,8 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 // snapshot to the diverged peer only -- veterans play on.
                 // Reports from unseated peers are noise by the watcher
                 // contract (they should not send them; old builds might).
-                if (myconnectindex == connecthead && g_player[other].connected)
+                // Stream mode has no divergence concept: never arm the ladder.
+                if (!g_netStreamMode && myconnectindex == connecthead && g_player[other].connected)
                 {
                     g_foundSyncError = true;
                     g_netDesyncReporters |= (1 << other);
@@ -2298,11 +3285,14 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     break;
                 int32_t const snapTic = (int32_t)B_UNBUF32(&packbuf[2]);
                 int const cnt = (uint8_t)packbuf[1];
-                int const base = 14 + cnt * 69;
+                int const base = 14 + cnt * 75;
                 // Trailing animwall tag phases: [count][int16 tags...].
                 int const awc = (uint8_t)packbuf[base];
                 int const len = base + 1 + awc * 2;
-                if (snapTic < movefifoplc || len > (int)sizeof(s_pendingSnap))
+                // Stream mode: the pack is a PAINT of current truth, not a
+                // timeline repair -- "stale on arrival" does not exist; the
+                // newest pack always supersedes whatever is pending.
+                if ((!g_netStreamMode && snapTic < movefifoplc) || len > (int)sizeof(s_pendingSnap))
                 {
 #ifdef __EMSCRIPTEN__
                     EM_ASM({ console.log('[eng] softsnap DROPPED (tic=' + $0 + ' plc=' + $1 + ' len=' + $2 + ')'); },
@@ -2314,9 +3304,41 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 s_pendingSnapLen = len;
                 s_pendingSnapTic = snapTic;
 #ifdef __EMSCRIPTEN__
-                EM_ASM({ console.log('[eng] softsnap stashed for tic ' + $0 + ' (plc=' + $1 + ')'); },
-                       snapTic, movefifoplc);
+                {
+                    extern int32_t g_netForensics;   // defined below (file pattern)
+                    if (!g_netStreamMode || g_netForensics)
+                        EM_ASM({ console.log('[eng] softsnap stashed for tic ' + $0 + ' (plc=' + $1 + ')'); },
+                               snapTic, movefifoplc);
+                }
 #endif
+                break;
+            }
+            case PACKET_TYPE_SPRITE_STREAM:
+            {
+                // Host's continuous authoritative sprite deltas (stream mode).
+                // Applied AT RECEIVE: this is a paint of current truth -- the
+                // sooner it lands the smaller the visible drift. Guests only;
+                // a watcher mid-catchup has a world mid-load (skip).
+                if (myconnectindex == connecthead || other != connecthead
+                    || g_netJoinCatchup || !g_netStreamMode)
+                    break;
+                if (g_player[myconnectindex].ps == NULL
+                    || !(g_player[myconnectindex].ps->gm & MODE_GAME))
+                    break;
+                Net_ApplySpriteStream((const char *)packbuf, packbufleng);
+                break;
+            }
+            case PACKET_TYPE_SECTOR_STREAM:
+            {
+                // Host-owned sector heights (doors/elevators). Same guards as
+                // the sprite stream.
+                if (myconnectindex == connecthead || other != connecthead
+                    || g_netJoinCatchup || !g_netStreamMode)
+                    break;
+                if (g_player[myconnectindex].ps == NULL
+                    || !(g_player[myconnectindex].ps->gm & MODE_GAME))
+                    break;
+                Net_ApplySectorStream((const char *)packbuf, packbufleng);
                 break;
             }
             case PACKET_TYPE_PLAYER_READY:
@@ -2325,6 +3347,24 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     LOG_F(INFO, "Player %d is ready", other);
                 g_player[other].playerreadyflag++;
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                if (myconnectindex == connecthead)
+                {
+                    // Entry ack: stop NEW_GAME redelivery for this guest.
+                    s_newGameAckMask |= (1u << other);
+                    // ENTRY AUDIT -- the guest reports the world size it
+                    // entered with; an empty-world entry (missed roster,
+                    // live-reported twice) is visible in the host log.
+                    if (packbufleng >= 2)
+                    {
+                        int const guestNp = (uint8_t)packbuf[1];
+                        initprintf("net: guest %d entered with np=%d (host np=%d)\n",
+                                   other, guestNp, numplayers);
+#ifdef __EMSCRIPTEN__
+                        EM_ASM({ console.log('[eng] entry audit: guest ' + $0 + ' np=' + $1 + ' hostNp=' + $2); },
+                               other, guestNp, numplayers);
+#endif
+                    }
+                }
                 // MASTER ECHO (late-join rendezvous): the master's one-shot READY
                 // broadcast can land while a late joiner is still LOADING the
                 // snapshot -- the load then restores the saved (zero) readyflags
@@ -2747,6 +3787,38 @@ extern "C" void Web_SetPredictMode(int mode)
     g_netPredictMode = mode;
     EM_ASM({ console.log('[eng] predictMode=' + $0); }, mode);
 }
+// One-line world-truth dump for pair probes: position drift, health/score
+// parity. Two call paths: Web_NetProbe (JS, wall-time cadence) and the
+// tic-aligned site in Net_GetSyncStat (forensics, movefifoplc&255==0) --
+// tic-aligned lines carry the SAME plc on every peer, so the differ compares
+// the same sim tic exactly. This is the OA-model acceptance instrument
+// (there is no CRC verdict to read in stream mode).
+extern "C" void Web_NetProbe(void)
+{
+    char line[640];
+    int n = 0, i;
+    n += Bsprintf(line + n, "[probe] plc=%d np=%d", movefifoplc, numplayers);
+    TRAVERSE_CONNECT(i)
+    {
+        auto const ps = g_player[i].ps;
+        if (ps == NULL || (unsigned)ps->i >= MAXSPRITES)
+            continue;
+        n += Bsprintf(line + n, " p%d[x=%d y=%d s=%d hp=%d fr=%d dd=%d z=%d cw=%d gw=%d]",
+                      i, ps->pos.x, ps->pos.y, (int)ps->cursectnum,
+                      (int)sprite[ps->i].extra, (int)ps->frag, (int)ps->dead_flag,
+                      ps->pos.z, (int)ps->curr_weapon, (int)ps->gotweapon);
+        if (n > (int)sizeof(line) - 96)
+            break;
+    }
+    EM_ASM({ console.log(UTF8ToString($0)); }, line);
+}
+
+extern "C" void Web_SetStreamMode(int on)
+{
+    g_netStreamMode = on ? 1 : 0;
+    EM_ASM({ console.log('[eng] stream mode (state authority) ' + ($0 ? 'ON' : 'OFF -> legacy lockstep repair')); }, on);
+}
+
 extern "C" void Web_SetForensics(int on)
 {
     g_netForensics = on;
@@ -2971,7 +4043,10 @@ void Net_InsertLatePlayer(int k)
     Bmemcpy(plr.ps, g_player[connecthead].ps, sizeof(DukePlayer_t));
     Bmemset(plr.frags, 0, sizeof(plr.frags));
 
-    auto &spawn = g_playerSpawnPoints[k % g_playerSpawnCnt];
+    // Farthest row from the living: a late joiner must not materialize into
+    // the fight pit (index-keyed rows concentrated on E1L1's start street).
+    extern int G_PickFarSpawnRow(void);
+    auto &spawn = g_playerSpawnPoints[G_PickFarSpawnRow()];
     // Deterministic seat index: slot k claims sprite MAXSPRITES-1-k on every
     // peer (see Net_RotateFreeSpriteToHead). Fallback to the organic freelist
     // only if the reserved index is somehow occupied -- loudly.
@@ -2980,7 +4055,6 @@ void Net_InsertLatePlayer(int k)
                    k, MAXSPRITES - 1 - k);
     int const i = A_InsertSprite(spawn.sect, spawn.x, spawn.y, spawn.z,
                                  APLAYER, 0, 0, 0, spawn.ang, 0, 0, 0, 10);
-    sprite[i].yvel = k; // classic contract: a player sprite's yvel is its player index
 
     auto &p = *plr.ps;
     p.i          = i;
@@ -2988,13 +4062,37 @@ void Net_InsertLatePlayer(int k)
     p.bobpos     = p.pos.xy;
     p.cursectnum = spawn.sect;
     p.oq16ang = p.q16ang = fix16_from_int(spawn.ang);
+    p.q16horiz   = F16(100);
+    p.q16horizoff = 0;
+    p.vel        = { 0, 0, 0 };
     p.dead_flag  = 0;
     p.newowner   = -1;
     p.frag = p.fraggedself = 0;
+    p.frag_ps    = k;
     p.gm         = MODE_GAME;
-    sprite[i].cstat = CSTAT_SPRITE_BLOCK + CSTAT_SPRITE_BLOCK_HITSCAN;
+    p.spritezoffset = 38 << 8;  // PHEIGHT: G_MovePlayerSprite hangs the body below the eye
 
-    P_ResetWeapons(k);
+    // BODY INIT -- the exact premap P_ResetMultiPlayer block. A_InsertSprite
+    // leaves extra at the EGS default (<=0) and repeats at 0: the seat shipped
+    // a size-zero, dead-to-every-check body, so the joiner had no HUD weapon
+    // (weapon draw gates on sprite extra > 0), sat eye-at-floor, and the
+    // player pack re-imposed the dead body 3x/sec (live: "did not spawn
+    // fully, he hasn't got a gun and is in the middle of the ground").
+    auto &s = sprite[i];
+    s.yvel     = k;    // classic contract: a player sprite's yvel is its player index
+    s.clipdist = 64;
+    s.cstat    = 257;
+    s.owner    = i;
+    s.pal      = p.palookup;
+    s.shade    = -12;
+    s.xoffset  = 0;
+    s.xrepeat  = 42;
+    s.yrepeat  = 36;
+    s.extra    = p.max_player_health;
+    p.last_extra = p.max_player_health;
+    p.inv_amount[GET_SHIELD] = g_startArmorAmount;
+
+    P_ResetWeapons(k);   // includes the MP shotgun arena loadout
     P_ResetInventory(k);
 
     initprintf("net: inserted late player %d at spawn %d\n", k, k % g_playerSpawnCnt);
@@ -3489,6 +4587,11 @@ void Net_SendStateSnap(int k)
         B_BUF32(&packbuf[j], sprite[ps->i].z); j += 4;
         B_BUF16(&packbuf[j], (int16_t)sprite[ps->i].extra); j += 2;
         B_BUF16(&packbuf[j], ps->cursectnum); j += 2;
+        // Host-truth score/death state: a guest's local sim rolls its own RNG
+        // for hits, so its kill ledger drifts -- the pack is the scoreboard.
+        B_BUF16(&packbuf[j], ps->frag);         j += 2;
+        B_BUF16(&packbuf[j], ps->fraggedself);  j += 2;
+        B_BUF16(&packbuf[j], ps->dead_flag);    j += 2;
         n++;
     }
     packbuf[countPos] = (char)n;
@@ -3509,10 +4612,14 @@ void Net_SendStateSnap(int k)
         }
     }
     oldnet_sendpacket(k, (unsigned char *)packbuf, j);
-    initprintf("net: soft state snap -> slot %d (%d players, %d bytes, tic %d)\n", k, n, j, movefifoplc);
+    // Stream mode sends this ~3x/sec per guest: prints are forensics-only there.
+    if (!g_netStreamMode || g_netForensics)
+    {
+        initprintf("net: soft state snap -> slot %d (%d players, %d bytes, tic %d)\n", k, n, j, movefifoplc);
 #ifdef __EMSCRIPTEN__
-    EM_ASM({ console.log('[eng] softsnap sent p=' + $0 + ' bytes=' + $1 + ' tic=' + $2); }, k, j, movefifoplc);
+        EM_ASM({ console.log('[eng] softsnap sent p=' + $0 + ' bytes=' + $1 + ' tic=' + $2); }, k, j, movefifoplc);
 #endif
+    }
 }
 
 // Consume a stashed tic-stamped soft snap. Called at the top of EVERY consumed
@@ -3524,94 +4631,638 @@ void Net_ApplyPendingStateSnap(void)
 {
     if (s_pendingSnapLen == 0 || numplayers < 2)
         return;
-    if (movefifoplc < s_pendingSnapTic)
-        return;                                  // not at the stamp yet
-    s_pendingSnapLen = 0;
-    if (movefifoplc > s_pendingSnapTic)
+    // Stream mode: the pack paints current truth -- apply the moment we are
+    // here, no tic alignment (the echo RTT means our consume cursor is always
+    // past the host's stamp; under lockstep that made every pack "stale").
+    if (!g_netStreamMode)
     {
-        // Overshot: shouldn't happen (this runs every tic) -- drop; the ladder
-        // re-sends if the divergence persists.
+        if (movefifoplc < s_pendingSnapTic)
+            return;                              // not at the stamp yet
+        if (movefifoplc > s_pendingSnapTic)
+        {
+            // Overshot: shouldn't happen (this runs every tic) -- drop; the
+            // ladder re-sends if the divergence persists.
+            s_pendingSnapLen = 0;
 #ifdef __EMSCRIPTEN__
-        EM_ASM({ console.log('[eng] softsnap OVERSHOT (tic=' + $0 + ' plc=' + $1 + ')'); },
-               s_pendingSnapTic, movefifoplc);
+            EM_ASM({ console.log('[eng] softsnap OVERSHOT (tic=' + $0 + ' plc=' + $1 + ')'); },
+                   s_pendingSnapTic, movefifoplc);
 #endif
-        return;
+            return;
+        }
     }
+    s_pendingSnapLen = 0;
     char *buf = s_pendingSnap;
     int jj = 1;
     int const cnt = (uint8_t)buf[jj++];
     jj += 4;                                     // tic stamp (already matched)
-    randomseed     = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-    g_globalRandom = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+    // RNG rides the wire for the legacy path only. Stream mode never touches
+    // the guest's RNG ("there shouldn't be much RNG here" -- live directive):
+    // the guest sim is a cosmetic predictor, world truth arrives as state.
+    if (!g_netStreamMode)
+    {
+        randomseed     = (int32_t)B_UNBUF32(&buf[jj]);
+        g_globalRandom = (int32_t)B_UNBUF32(&buf[jj + 4]);
+    }
+    jj += 8;
+    bool selfCorrected = false;
     for (int e = 0; e < cnt; e++)
     {
         int const slot = (uint8_t)buf[jj++];
         if ((unsigned)slot >= MAXPLAYERS || g_player[slot].ps == NULL)
-            { jj += 68; continue; }
+            { jj += 74; continue; }
         auto const ps = g_player[slot].ps;
-        ps->pos.x  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        ps->pos.y  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        ps->pos.z  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        ps->opos.x = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        ps->opos.y = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        ps->opos.z = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        ps->bobpos.x = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        ps->bobpos.y = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        ps->vel.x  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        ps->vel.y  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        ps->vel.z  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        // SELF-FACING IS CLIENT-OWNED, full stop ("the truth needs to come
-        // from the player that fires" / "it's meant to be client first" --
-        // the user's directive, twice). The closed-loop input staging already
-        // converges the sim's self-facing onto the view every tic, so a snap
-        // stomp here is redundant -- and applied every correction lap it WAS
-        // the live "mouse keeps bouncing / host correcting my movement".
-        // Remote players' facing still re-anchors to host truth.
+        vec3_t pp, op, vel, sp;
+        vec2_t bob;
+        pp.x  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        pp.y  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        pp.z  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        op.x  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        op.y  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        op.z  = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        bob.x = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        bob.y = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        vel.x = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        vel.y = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        vel.z = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        fix16_t const snapAng   = (fix16_t)B_UNBUF32(&buf[jj]); jj += 4;
+        fix16_t const snapHoriz = (fix16_t)B_UNBUF32(&buf[jj]); jj += 4;
+        sp.x = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        sp.y = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        sp.z = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
+        int16_t  const sprExtra = (int16_t)B_UNBUF16(&buf[jj]); jj += 2;
+        int16_t  const cursect  = (int16_t)B_UNBUF16(&buf[jj]); jj += 2;
+        uint16_t const frag     = (uint16_t)B_UNBUF16(&buf[jj]); jj += 2;
+        uint16_t const fragged  = (uint16_t)B_UNBUF16(&buf[jj]); jj += 2;
+        int16_t  const dead     = (int16_t)B_UNBUF16(&buf[jj]); jj += 2;
+
+        bool const self = (slot == myconnectindex);
+        // SELF-MOVEMENT IS CLIENT-OWNED (the OpenArena rule; the user's
+        // directive, twice: "it's meant to be client first"). Under stream
+        // mode the pack corrects self position only at teleport scale
+        // (respawn, teleporter, RESPAWN pad) -- anything smaller is ordinary
+        // prediction skew the closed loop absorbs, and stomping it WAS the
+        // live "host keeps correcting my movement". Legacy lockstep mode
+        // keeps the full tic-aligned correction.
+        bool applyPos = true;
+        if (self && g_netStreamMode)
         {
-            fix16_t const snapAng   = (fix16_t)B_UNBUF32(&buf[jj]); jj += 4;
-            fix16_t const snapHoriz = (fix16_t)B_UNBUF32(&buf[jj]); jj += 4;
-            if (slot != myconnectindex)
+            // XY only: teleporters and respawns always move laterally, while
+            // a long FALL legitimately opens a z gap of RTT * zvel that a
+            // z-term falsely flagged (live: "snapping my view... to different
+            // places" mid-air). Vertical drift settles through local gravity.
+            int32_t const dx = klabs(ps->pos.x - pp.x);
+            int32_t const dy = klabs(ps->pos.y - pp.y);
+            applyPos = (dx > 2048 || dy > 2048);
+            if (applyPos)
+                selfCorrected = true;
+        }
+        if (applyPos)
+        {
+            ps->pos = pp;
+            ps->opos = op;
+            ps->bobpos = bob;
+            ps->vel = vel;
+        }
+        // SELF-FACING IS CLIENT-OWNED, full stop ("the truth needs to come
+        // from the player that fires"). Remote facing: the guest's local sim
+        // turns remotes smoothly from the echoed inputs -- re-anchoring every
+        // pack snapped their heads 3x/sec for nothing (animations are client
+        // side wherever possible). Re-anchor only past real drift.
+        if (!self)
+        {
+            if (g_netStreamMode)
+            {
+                fix16_t dAng = fix16_ssub(ps->q16ang, snapAng);
+                while (dAng > F16(1024))  dAng = fix16_ssub(dAng, F16(2048));
+                while (dAng < -F16(1024)) dAng = fix16_sadd(dAng, F16(2048));
+                if (fix16_abs(dAng) > F16(32)
+                    || fix16_abs(fix16_ssub(ps->q16horiz, snapHoriz)) > F16(16))
+                {
+                    ps->q16ang   = ps->oq16ang   = snapAng;
+                    ps->q16horiz = ps->oq16horiz = snapHoriz;
+                }
+            }
+            else
             {
                 ps->q16ang   = ps->oq16ang   = snapAng;
                 ps->q16horiz = ps->oq16horiz = snapHoriz;
             }
         }
-        vec3_t sp;
-        sp.x = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        sp.y = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        sp.z = (int32_t)B_UNBUF32(&buf[jj]); jj += 4;
-        int16_t const sprExtra = (int16_t)B_UNBUF16(&buf[jj]); jj += 2;
-        int16_t const cursect  = (int16_t)B_UNBUF16(&buf[jj]); jj += 2;
         if ((unsigned)ps->i < MAXSPRITES)
         {
-            setsprite(ps->i, &sp);
-            sprite[ps->i].extra = sprExtra;
-            actor[ps->i].bpos   = sp;
+            if (applyPos)
+            {
+                setsprite(ps->i, &sp);
+                actor[ps->i].bpos = sp;
+            }
+            sprite[ps->i].extra = sprExtra;   // health is host truth, always
         }
-        if ((unsigned)cursect < (unsigned)numsectors)
+        if (applyPos && (unsigned)cursect < (unsigned)numsectors)
             ps->cursectnum = cursect;
+        // Scoreboard is host truth (guest hit rolls drift). Self death
+        // transitions stay local-sim-owned: painting dead_flag backwards
+        // (host pack staler than a local respawn) would kill the view.
+        ps->frag        = frag;
+        ps->fraggedself = fragged;
+        if (!self)
+            ps->dead_flag = dead;
     }
-    // ANIMWALL TAG PHASES (see the sender): RNG-coupled state a seed-only
-    // correction left forked -- the realigned stream re-forked within a tic,
-    // sustaining the correction loop forever. Aligning the phases here is
-    // what lets a single soft snap actually STICK.
+    // ANIMWALL TAG PHASES -- LEGACY ONLY: they exist to realign RNG-coupled
+    // lockstep state. Wall animation phases are pure visuals; under stream
+    // mode they are client-owned ("make sure animations are client side only
+    // wherever possible") -- parse past, never apply.
     {
         int const awc = (uint8_t)buf[jj++];
         for (int aw = 0; aw < awc; aw++)
         {
             int16_t const tag = (int16_t)B_UNBUF16(&buf[jj]); jj += 2;
-            if (aw < g_animWallCnt)
+            if (!g_netStreamMode && aw < g_animWallCnt)
                 animwall[aw].tag = tag;
         }
     }
-    Net_InitializePrediction();   // fresh prediction base off corrected state
-    Net_ResetSyncCheck();         // stale verdicts described the pre-snap world
+    // Prediction re-base yanks the rendered view onto the authoritative ps --
+    // correct after a real correction, POISON as a 3Hz habit: with self state
+    // untouched there is nothing to re-base on, and doing it anyway was the
+    // live "still snapping my view/angle" (the replay window races the
+    // sampler mid-frame). Stream mode re-bases ONLY when the pack actually
+    // teleport-corrected us; legacy keeps the old always-re-base.
+    if (!g_netStreamMode || selfCorrected)
+    {
+        Net_InitializePrediction();   // fresh prediction base off corrected state
+        Net_ResetSyncCheck();         // stale verdicts described the pre-snap world
+    }
+    // Stream mode applies ~3x/sec: prints are forensics-only there.
+    if (!g_netStreamMode || g_netForensics)
+    {
 #ifdef __EMSCRIPTEN__
-    EM_ASM({ console.log('[eng] softsnap applied ALIGNED at tic ' + $0 + ' (' + $1 + ' players)'); },
-           movefifoplc, cnt);
+        EM_ASM({ console.log('[eng] softsnap applied ALIGNED at tic ' + $0 + ' (' + $1 + ' players)'); },
+               movefifoplc, cnt);
 #else
-    initprintf("net: soft state snap applied at tic %d (%d players)\n", movefifoplc, cnt);
+        initprintf("net: soft state snap applied at tic %d (%d players)\n", movefifoplc, cnt);
 #endif
+    }
+}
+
+// ── STATE-AUTHORITY STREAM (the OpenArena model; see g_netStreamMode) ───────
+// The host's world is the only truth. Every stream lap it broadcasts (a) the
+// player pack (Net_SendStateSnap: position/health/score for every seat) and
+// (b) sprite deltas against a host-side shadow of what was last streamed,
+// plus a round-robin keyframe sweep that repaints the whole active set every
+// few seconds -- so entry-time divergence (independently premapped guests)
+// and any dropped delta self-heal by construction. Guests keep simulating as
+// a PREDICTOR (animation between paints, local feel); the stream overwrites
+// their drift. Records address sprites BY HOST INDEX: guests materialize
+// missing indices exactly there (Net_RotateFreeSpriteToHead) and delete what
+// the host deleted, so "a hydrant shot on the host" exists/dies on the guest
+// within one stream lap -- the 30-second class of sync complaints becomes a
+// <=200ms paint. Player-owned sprites are excluded (the player pack owns
+// them); SE effectors are excluded (runtime-motion carriers whose fields are
+// sim-internal, and painting them would fight sector machinery).
+enum
+{
+    NET_STREAM_PLAYER_TICS = 10,   // player pack cadence (~3Hz)
+    NET_STREAM_SPRITE_TICS = 5,    // sprite delta cadence (~6Hz)
+    NET_STREAM_DIRTY_CAP   = 128,  // dirty records per lap (64 measured saturated in combat)
+    NET_STREAM_SWEEP_CAP   = 48,   // keyframe records per lap
+    NET_SPRREC_BYTES       = 37,
+    // Record flags. OWNERSHIP MATRIX (live directive: "gun animations are
+    // owned by the client. Doors are owned by the host. Item states are owned
+    // by the host."): full records carry identity (picnum/cstat/...) and fire
+    // only on REAL host-side change -- item taken/respawned paints promptly.
+    // Sweep refreshes are KINEMATIC (position/statnum/health only) so they
+    // can never restart an animation the guest already has right (live: "an
+    // abnormal amount of updates, syncing the same game animations more than
+    // once"). Weapon/HUD anim state is never streamed at all.
+    NET_SPRF_DELETE    = 0x1,
+    NET_SPRF_KINEMATIC = 0x2,
+    // Sector stream (doors/elevators/crushers = ceiling+floor heights).
+    NET_STREAM_SECT_DIRTY = 48,
+    NET_STREAM_SECT_SWEEP = 16,
+    NET_SECREC_BYTES      = 10,
+};
+// Statnums that never stream: SE effectors are sim-internal machinery, and
+// STAT_MISC is pure cosmetics (casings, debris, teleport FX) every guest's
+// local sim spawns for itself -- painting those by-index would fight the
+// guest's own short-lived spawns at colliding indices, for zero visual gain.
+// (Pair33 measured casing churn saturating the old 64-record budget.)
+static inline bool Net_StreamSkipsStat(int st)
+{
+    return st == STAT_EFFECTOR || st == STAT_MISC;
+}
+struct NetSprShadow { vec3_t pos; int16_t ang, sect, stat, picnum, cstat; };
+static NetSprShadow s_sprShadow[MAXSPRITES];
+struct NetSecShadow { int32_t cz, fz; };
+static NetSecShadow s_secShadow[MAXSECTORS];
+static int32_t s_lastPlayerStreamPlc = -1;
+static int32_t s_lastSpriteStreamPlc = -1;
+static int32_t s_sprShadowPrimedPlc  = -1;   // <0: prime shadows before deltas
+static int32_t s_dirtyCursor, s_sweepCursor;
+static int32_t s_secDirtyCursor, s_secSweepCursor;
+static uint32_t s_strmLap;                   // sweep goes FULL every 8th lap (repairs
+                                             // missing sprites; kinematic otherwise)
+
+static inline void Net_ShadowFrom(int idx)
+{
+    auto &sh = s_sprShadow[idx];
+    sh.pos.x  = sprite[idx].x;
+    sh.pos.y  = sprite[idx].y;
+    sh.pos.z  = sprite[idx].z;
+    sh.ang    = sprite[idx].ang;
+    sh.sect   = sprite[idx].sectnum;
+    sh.stat   = sprite[idx].statnum;
+    sh.picnum = sprite[idx].picnum;
+    sh.cstat  = sprite[idx].cstat;
+}
+
+static inline bool Net_IsPlayerSprite(int idx)
+{
+    for (int p = 0; p < MAXPLAYERS; p++)
+        if (g_player[p].connected && g_player[p].ps != NULL && g_player[p].ps->i == idx)
+            return true;
+    return false;
+}
+
+static int Net_WriteSpriteRec(char *buf, int j, int idx, uint8_t flags)
+{
+    bool const del = (flags & NET_SPRF_DELETE) != 0;
+    B_BUF16(&buf[j], (uint16_t)idx);                             j += 2;
+    buf[j++] = (char)flags;
+    B_BUF16(&buf[j], del ? 0xFFFFu : (uint16_t)sprite[idx].statnum); j += 2;
+    B_BUF16(&buf[j], (uint16_t)sprite[idx].picnum);              j += 2;
+    B_BUF16(&buf[j], (uint16_t)sprite[idx].sectnum);             j += 2;
+    B_BUF32(&buf[j], sprite[idx].x);                             j += 4;
+    B_BUF32(&buf[j], sprite[idx].y);                             j += 4;
+    B_BUF32(&buf[j], sprite[idx].z);                             j += 4;
+    B_BUF16(&buf[j], (uint16_t)sprite[idx].ang);                 j += 2;
+    B_BUF16(&buf[j], (uint16_t)sprite[idx].xvel);                j += 2;
+    B_BUF16(&buf[j], (uint16_t)sprite[idx].zvel);                j += 2;
+    B_BUF16(&buf[j], (uint16_t)sprite[idx].cstat);               j += 2;
+    B_BUF16(&buf[j], (uint16_t)sprite[idx].owner);               j += 2;
+    B_BUF16(&buf[j], (uint16_t)sprite[idx].extra);               j += 2;
+    buf[j++] = (char)sprite[idx].shade;
+    buf[j++] = (char)sprite[idx].pal;
+    buf[j++] = (char)sprite[idx].xrepeat;
+    buf[j++] = (char)sprite[idx].yrepeat;
+    return j;
+}
+
+static void Net_StreamAuthoritativeState(void)
+{
+    if (myconnectindex != connecthead || numplayers < 2)
+        return;
+    auto const myps = g_player[myconnectindex].ps;
+    if (myps == NULL || !(myps->gm & MODE_GAME))
+        return;
+
+    // Level (re)entry: the consume cursor regressed -> shadow is a stale map.
+    if (movefifoplc < s_lastPlayerStreamPlc || movefifoplc < s_lastSpriteStreamPlc)
+    {
+        s_sprShadowPrimedPlc  = -1;
+        s_lastPlayerStreamPlc = s_lastSpriteStreamPlc = -1;
+    }
+
+    int i, humanGuests = 0;
+    TRAVERSE_CONNECT(i)
+        if (i != myconnectindex && !(g_netBotMask & (1 << i)))
+            humanGuests++;
+    if (!humanGuests)
+    {
+        s_sprShadowPrimedPlc = -1;   // next guest starts from a fresh prime
+        return;
+    }
+    // NEW GUEST SEATED: status events sync exactly once, so a guest who
+    // missed some (the catchup guard drops stream packets while it loads)
+    // gets a ONE-SHOT full world paint -- invalidate the shadows and let the
+    // dirty caps pace the burst out over ~1s. This is the only time identity
+    // is ever re-sent without a host-side change.
+    {
+        static int s_lastHumanGuests;
+        if (humanGuests > s_lastHumanGuests && s_sprShadowPrimedPlc >= 0)
+        {
+            for (int idx = 0; idx < MAXSPRITES; idx++)
+                s_sprShadow[idx].stat = -1;
+            for (int sct = 0; sct < numsectors; sct++)
+                s_secShadow[sct].cz = s_secShadow[sct].fz = INT32_MIN;
+        }
+        s_lastHumanGuests = humanGuests;
+    }
+
+    // Player pack: position/velocity/facing/health/score truth, every seat.
+    if (s_lastPlayerStreamPlc < 0 || movefifoplc - s_lastPlayerStreamPlc >= NET_STREAM_PLAYER_TICS)
+    {
+        s_lastPlayerStreamPlc = movefifoplc;
+        TRAVERSE_CONNECT(i)
+            if (i != myconnectindex && !(g_netBotMask & (1 << i)))
+                Net_SendStateSnap(i);
+    }
+
+    if (s_sprShadowPrimedPlc < 0)
+    {
+        // Prime: shadows := live world, deltas measure from here. The sweeps
+        // below repaint entry-time divergence within a few seconds.
+        for (int idx = 0; idx < MAXSPRITES; idx++)
+        {
+            if (sprite[idx].statnum < MAXSTATUS)
+                Net_ShadowFrom(idx);
+            else
+                s_sprShadow[idx].stat = -1;
+        }
+        for (int sct = 0; sct < numsectors; sct++)
+        {
+            s_secShadow[sct].cz = sector[sct].ceilingz;
+            s_secShadow[sct].fz = sector[sct].floorz;
+        }
+        s_sprShadowPrimedPlc  = movefifoplc;
+        s_lastSpriteStreamPlc = movefifoplc;
+        return;
+    }
+    if (movefifoplc - s_lastSpriteStreamPlc < NET_STREAM_SPRITE_TICS)
+        return;
+    s_lastSpriteStreamPlc = movefifoplc;
+
+    static char strm[6600];   // 2 + 176 records * 36B = 6338 max
+    int j = 0;
+    strm[j++] = (char)PACKET_TYPE_SPRITE_STREAM;
+    int const cntPos = j++;
+    int recs = 0;
+
+    // Pass 1 -- dirty scan, rotating start (a burst can't starve high
+    // indices). Also emits deletions: shadow active, world free.
+    int scanned = 0;
+    for (; scanned < MAXSPRITES && recs < NET_STREAM_DIRTY_CAP; scanned++)
+    {
+        int const idx = (s_dirtyCursor + scanned) & (MAXSPRITES - 1);
+        auto &sh = s_sprShadow[idx];
+        if (sprite[idx].statnum >= MAXSTATUS)
+        {
+            // Freed. Emit a delete only if the guest was ever SENT this
+            // sprite (last shadowed stat was a streamed one) -- cosmetic
+            // (skipped-stat) churn must not flood the record budget.
+            if (sh.stat >= 0 && !Net_StreamSkipsStat(sh.stat))
+            {
+                j = Net_WriteSpriteRec(strm, j, idx, NET_SPRF_DELETE);
+                recs++;
+            }
+            sh.stat = -1;
+            continue;
+        }
+        if (Net_StreamSkipsStat(sprite[idx].statnum) || Net_IsPlayerSprite(idx))
+        {
+            // Streamed -> skipped transition (actor became debris): the guest
+            // holds a stale streamed copy -- delete it; its own local sim
+            // owns the cosmetic from here.
+            if (sh.stat >= 0 && !Net_StreamSkipsStat(sh.stat) && !Net_IsPlayerSprite(idx))
+            {
+                j = Net_WriteSpriteRec(strm, j, idx, NET_SPRF_DELETE);
+                recs++;
+            }
+            Net_ShadowFrom(idx);
+            continue;
+        }
+        // STATUS SYNCS ONCE (live directive): identity changes (picked up,
+        // destroyed, awakened, spawned) go as ONE full record on the reliable
+        // ordered channel; motion drift goes kinematic and can never restart
+        // an animation the guest owns.
+        bool const statusChanged = (sh.stat < 0
+            || sprite[idx].statnum != sh.stat || sprite[idx].picnum != sh.picnum
+            || sprite[idx].cstat != sh.cstat);
+        bool const moved = (sprite[idx].x != sh.pos.x || sprite[idx].y != sh.pos.y
+            || sprite[idx].z != sh.pos.z || sprite[idx].ang != sh.ang
+            || sprite[idx].sectnum != sh.sect);
+        if (statusChanged || moved)
+        {
+            j = Net_WriteSpriteRec(strm, j, idx, statusChanged ? 0 : NET_SPRF_KINEMATIC);
+            Net_ShadowFrom(idx);
+            recs++;
+        }
+    }
+    s_dirtyCursor = (s_dirtyCursor + scanned) & (MAXSPRITES - 1);
+
+    // Pass 2 -- keyframe sweep over active sprites, round-robin. ALWAYS
+    // kinematic (position/statnum/health): identity syncs exactly once, on
+    // change, and a routine refresh can never restart an animation the guest
+    // owns. Guests who missed events (seated mid-match while the catchup
+    // guard dropped stream packets) get the one-shot full world paint below.
+    uint8_t const sweepFlags = NET_SPRF_KINEMATIC;
+    int sweeps = 0, walked = 0;
+    for (; walked < MAXSPRITES && sweeps < NET_STREAM_SWEEP_CAP; walked++)
+    {
+        int const idx = (s_sweepCursor + walked) & (MAXSPRITES - 1);
+        if (sprite[idx].statnum >= MAXSTATUS || Net_StreamSkipsStat(sprite[idx].statnum)
+            || Net_IsPlayerSprite(idx))
+            continue;
+        j = Net_WriteSpriteRec(strm, j, idx, sweepFlags);
+        if (sweepFlags == 0)
+            Net_ShadowFrom(idx);
+        sweeps++;
+    }
+    s_sweepCursor = (s_sweepCursor + walked) & (MAXSPRITES - 1);
+
+    if (recs + sweeps)
+    {
+        strm[cntPos] = (char)(recs + sweeps);
+        TRAVERSE_CONNECT(i)
+            if (i != myconnectindex && !(g_netBotMask & (1 << i)))
+                oldnet_sendpacket(i, (unsigned char *)strm, j);
+    }
+
+    // Sector stream -- doors/elevators/crushers ("doors are owned by the
+    // host", live directive). Ceiling+floor heights: the dirty pass catches
+    // motion the moment it starts; the small sweep repairs baseline drift
+    // and pins any door a guest's local sim moved out of phase.
+    static char sec[700];
+    int sj = 0;
+    sec[sj++] = (char)PACKET_TYPE_SECTOR_STREAM;
+    int const secCntPos = sj++;
+    int srecs = 0, sscanned = 0;
+    for (; sscanned < numsectors && srecs < NET_STREAM_SECT_DIRTY; sscanned++)
+    {
+        int const sct = (s_secDirtyCursor + sscanned) % numsectors;
+        if (sector[sct].ceilingz != s_secShadow[sct].cz
+            || sector[sct].floorz != s_secShadow[sct].fz)
+        {
+            B_BUF16(&sec[sj], (uint16_t)sct);        sj += 2;
+            B_BUF32(&sec[sj], sector[sct].ceilingz); sj += 4;
+            B_BUF32(&sec[sj], sector[sct].floorz);   sj += 4;
+            s_secShadow[sct].cz = sector[sct].ceilingz;
+            s_secShadow[sct].fz = sector[sct].floorz;
+            srecs++;
+        }
+    }
+    s_secDirtyCursor = (numsectors > 0) ? (s_secDirtyCursor + sscanned) % numsectors : 0;
+    int ssweeps = 0, swalked = 0;
+    for (; swalked < numsectors && ssweeps < NET_STREAM_SECT_SWEEP; swalked++)
+    {
+        int const sct = (s_secSweepCursor + swalked) % numsectors;
+        B_BUF16(&sec[sj], (uint16_t)sct);        sj += 2;
+        B_BUF32(&sec[sj], sector[sct].ceilingz); sj += 4;
+        B_BUF32(&sec[sj], sector[sct].floorz);   sj += 4;
+        ssweeps++;
+    }
+    s_secSweepCursor = (numsectors > 0) ? (s_secSweepCursor + swalked) % numsectors : 0;
+    if (srecs + ssweeps)
+    {
+        sec[secCntPos] = (char)(srecs + ssweeps);
+        TRAVERSE_CONNECT(i)
+            if (i != myconnectindex && !(g_netBotMask & (1 << i)))
+                oldnet_sendpacket(i, (unsigned char *)sec, sj);
+    }
+#ifdef __EMSCRIPTEN__
+    if (g_netForensics)
+    {
+        static int32_t s_lastStrmLog;
+        if (movefifoplc - s_lastStrmLog >= 150)
+        {
+            s_lastStrmLog = movefifoplc;
+            EM_ASM({ console.log('[strm] plc=' + $0 + ' dirty=' + $1 + ' sweep=' + $2 + ' bytes=' + $3); },
+                   movefifoplc, recs, sweeps, j);
+        }
+    }
+#endif
+}
+
+static void Net_ApplySpriteStream(const char *buf, int len)
+{
+    if (len < 2)
+        return;
+    int j = 1;
+    int const cnt = (uint8_t)buf[j++];
+    for (int e = 0; e < cnt; e++)
+    {
+        if (j + NET_SPRREC_BYTES > len)
+            break;
+        int      const idx    = (uint16_t)B_UNBUF16(&buf[j]); j += 2;
+        uint8_t  const flags  = (uint8_t)buf[j++];
+        uint16_t const stat   = (uint16_t)B_UNBUF16(&buf[j]); j += 2;
+        int16_t  const picnum = (int16_t)B_UNBUF16(&buf[j]);  j += 2;
+        int16_t  const sect   = (int16_t)B_UNBUF16(&buf[j]);  j += 2;
+        int32_t  const x      = (int32_t)B_UNBUF32(&buf[j]);  j += 4;
+        int32_t  const y      = (int32_t)B_UNBUF32(&buf[j]);  j += 4;
+        int32_t  const z      = (int32_t)B_UNBUF32(&buf[j]);  j += 4;
+        int16_t  const ang    = (int16_t)(B_UNBUF16(&buf[j]) & 2047); j += 2;
+        int16_t  const xvel   = (int16_t)B_UNBUF16(&buf[j]);  j += 2;
+        int16_t  const zvel   = (int16_t)B_UNBUF16(&buf[j]);  j += 2;
+        uint16_t const cstat  = (uint16_t)B_UNBUF16(&buf[j]); j += 2;
+        int16_t  const owner  = (int16_t)B_UNBUF16(&buf[j]);  j += 2;
+        int16_t  const extra  = (int16_t)B_UNBUF16(&buf[j]);  j += 2;
+        int8_t   const shade  = (int8_t)buf[j++];
+        uint8_t  const pal    = (uint8_t)buf[j++];
+        uint8_t  const xrep   = (uint8_t)buf[j++];
+        uint8_t  const yrep   = (uint8_t)buf[j++];
+
+        if ((unsigned)idx >= MAXSPRITES)
+            continue;
+        if (Net_IsPlayerSprite(idx))
+            continue;                      // the player pack owns those
+        if ((flags & NET_SPRF_DELETE) || stat == 0xFFFFu)
+        {
+            if (sprite[idx].statnum < MAXSTATUS)
+                A_DeleteSprite(idx);
+            continue;
+        }
+        if (stat >= MAXSTATUS || Net_StreamSkipsStat(stat))
+            continue;
+        if ((unsigned)sect >= (unsigned)numsectors)
+            continue;
+
+        if (flags & NET_SPRF_KINEMATIC)
+        {
+            // Position/statnum/health refresh ONLY -- identity (picnum,
+            // cstat, angle, looks) stays client-owned so a routine sweep can
+            // never restart an animation or resurrect a locally-consumed
+            // item's look. No materialization without identity.
+            if (sprite[idx].statnum >= MAXSTATUS)
+                continue;
+            if (sprite[idx].statnum != (int16_t)stat)
+                changespritestat((int16_t)idx, (int16_t)stat);
+            sprite[idx].extra = extra;
+            vec3_t kp = { x, y, z };
+            setsprite((int16_t)idx, &kp);
+            actor[idx].bpos = kp;
+            continue;
+        }
+
+        if (sprite[idx].statnum >= MAXSTATUS)
+        {
+            // Materialize at the host's exact index (freelist rotation makes
+            // the engine's next insert claim precisely this slot).
+            if (Net_RotateFreeSpriteToHead((int16_t)idx) != 0)
+                continue;
+            int const ni = A_InsertSprite(sect, x, y, z, picnum, shade, xrep, yrep,
+                                          ang, xvel, zvel, owner, (int16_t)stat);
+            if (ni != idx)
+            {
+                // Impossible by construction; keep the world consistent anyway.
+                if (ni >= 0)
+                    A_DeleteSprite(ni);
+                continue;
+            }
+        }
+        else if (sprite[idx].statnum != (int16_t)stat)
+            changespritestat((int16_t)idx, (int16_t)stat);
+
+        sprite[idx].picnum  = picnum;
+        sprite[idx].cstat   = cstat;
+        sprite[idx].ang     = ang;
+        sprite[idx].xvel    = xvel;
+        sprite[idx].zvel    = zvel;
+        sprite[idx].owner   = owner;
+        sprite[idx].extra   = extra;
+        sprite[idx].shade   = shade;
+        sprite[idx].pal     = pal;
+        sprite[idx].xrepeat = xrep;
+        sprite[idx].yrepeat = yrep;
+        vec3_t p = { x, y, z };
+        setsprite((int16_t)idx, &p);
+        actor[idx].bpos = p;
+    }
+}
+
+static void Net_ApplySectorStream(const char *buf, int len)
+{
+    if (len < 2)
+        return;
+    int j = 1;
+    int const cnt = (uint8_t)buf[j++];
+    for (int e = 0; e < cnt; e++)
+    {
+        if (j + NET_SECREC_BYTES > len)
+            break;
+        int     const sct = (uint16_t)B_UNBUF16(&buf[j]); j += 2;
+        int32_t const cz  = (int32_t)B_UNBUF32(&buf[j]);  j += 4;
+        int32_t const fz  = (int32_t)B_UNBUF32(&buf[j]);  j += 4;
+        if ((unsigned)sct >= (unsigned)numsectors)
+            continue;
+        sector[sct].ceilingz = cz;
+        sector[sct].floorz   = fz;
+    }
+}
+
+static void Net_ResendNewGameIfUnacked(void)
+{
+    if (myconnectindex != connecthead || numplayers < 2 || s_newGameLen <= 0)
+        return;
+    auto const myps = g_player[myconnectindex].ps;
+    if (myps == NULL || !(myps->gm & MODE_GAME))
+        return;
+    int32_t const now = (int32_t)totalclock;
+    if (now < s_newGameClock)              // totalclock reset (level transition)
+        s_newGameClock = now;
+    if (now - s_newGameClock > 3600)       // ~2min: a guest this late re-enters via late join
+        return;
+    int i;
+    TRAVERSE_CONNECT(i)
+    {
+        if (i == myconnectindex || (g_netBotMask & (1 << i)) || (s_newGameAckMask & (1u << i)))
+            continue;
+        if (s_newGameResendClock[i] > now)
+            s_newGameResendClock[i] = 0;
+        if (now - s_newGameResendClock[i] < 120)   // ~1s cadence
+            continue;
+        s_newGameResendClock[i] = now;
+        oldnet_sendpacket(i, (unsigned char *)s_newGameBuf, s_newGameLen);
+        initprintf("net: NEW_GAME redelivered to slot %d (no entry ack yet)\n", i);
+    }
 }
 
 // Divergence response ladder: soft in-place corrections first; the full
@@ -4076,6 +5727,18 @@ void Net_SendNewGame(uint32_t flags)
     }
 #endif
     B_BUF32(&packbuf[j], flags);        j += sizeof(int32_t);
+    // Per-launch token: lets guests dedupe redeliveries (see the resend
+    // machinery) -- a resend can never restart an already-entered level.
+    packbuf[j++] = (char)++s_newGameToken;
+
+    // Stash for redelivery to slow-booting guests (join_ok -> launch can beat
+    // a real browser's engine boot; the missed packet = an empty world).
+    s_newGameLen = min<int>(j, (int)sizeof(s_newGameBuf));
+    Bmemcpy(s_newGameBuf, packbuf, s_newGameLen);
+    s_newGameClock   = (int32_t)totalclock;
+    s_newGameAckMask = 0;
+    for (int k = 0; k < MAXPLAYERS; k++)
+        s_newGameResendClock[k] = 0;
 
     int i;
     TRAVERSE_CONNECT(i)
@@ -4588,8 +6251,9 @@ void Net_WaitForPlayers()
             if (g_netBotMask & (1 << bk))
                 g_player[bk].playerreadyflag = g_player[myconnectindex].playerreadyflag;
     packbuf[0] = PACKET_TYPE_PLAYER_READY;
+    packbuf[1] = (char)numplayers;   // entry audit: the world size we entered with
     if (myconnectindex != connecthead)
-        oldnet_sendpacket(connecthead, (unsigned char*)packbuf, 1);
+        oldnet_sendpacket(connecthead, (unsigned char*)packbuf, 2);
 
     auto oldPal = g_player[myconnectindex].ps->palette;
     P_SetGamePalette(g_player[myconnectindex].ps, TITLEPAL, 11);

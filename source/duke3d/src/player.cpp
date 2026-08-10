@@ -6200,6 +6200,32 @@ RECHECK:
     }
 #endif
 
+#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+    // SIM-SIDE truth for the frozen-bot hunt ([bot1g] showed vel.y == 0
+    // exactly, every sample, while vel.x swung 26k-54k across rotating
+    // facings -- impossible for the rotation math; something axis-specific
+    // eats y). This prints what the SIM consumed and produced for seat 1.
+    {
+        extern int32_t g_netForensics;
+        if (g_netForensics && playerNum == 1 && !oldnet_predicting && (movefifoplc % 26) == 0)
+        {
+            EM_ASM({ console.log('[sim1] plc=' + $0 + ' infv=' + $1 + ' insv=' + $2 + ' inav=' + $3
+                     + ' ang=' + $4 + ' vx=' + $5 + ' vy=' + $6 + ' x=' + $7 + ' y=' + $8 + ' og=' + $9); },
+                   movefifoplc, (int)thisPlayer.input.fvel, (int)thisPlayer.input.svel,
+                   fix16_to_int(thisPlayer.input.q16avel), fix16_to_int(pPlayer->q16ang),
+                   pPlayer->vel.x, pPlayer->vel.y, pPlayer->pos.x, pPlayer->pos.y,
+                   (int)pPlayer->on_ground);
+            if ((unsigned)pPlayer->cursectnum < (unsigned)numsectors)
+                EM_ASM({ console.log('[sim1s] plc=' + $0 + ' sect=' + $1 + ' lot=' + $2 + ' hit=' + $3
+                         + ' flz=' + $4 + ' clz=' + $5 + ' eyez=' + $6 + ' bodz=' + $7); },
+                       movefifoplc, (int)pPlayer->cursectnum,
+                       (int)sector[pPlayer->cursectnum].lotag, (int)sector[pPlayer->cursectnum].hitag,
+                       sector[pPlayer->cursectnum].floorz, sector[pPlayer->cursectnum].ceilingz,
+                       pPlayer->pos.z, sprite[pPlayer->i].z);
+        }
+    }
+#endif
+
     if (P_DoCounters(playerNum))
         return;
 

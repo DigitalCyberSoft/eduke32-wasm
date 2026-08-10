@@ -627,7 +627,38 @@ void P_MoveToRandomSpawnPoint(int playerNum)
 
     if ((g_netServer || ud.multimode > 1) && !(g_gametypeFlags[ud.coop] & GAMETYPE_FIXEDRESPAWN))
     {
+        // THREE krand candidates, keep the one farthest from living enemies
+        // (max-min distance). Plain krand kept dropping respawns back into
+        // the start-street row cluster ("respawning at the exact same spawn
+        // point rather than random", live). Fixed draw count = deterministic
+        // under lockstep; stream mode only trusts the host anyway.
         i = krand() % g_playerSpawnCnt;
+        {
+            int64_t bestScore = -1;
+            int cand[3];
+            cand[0] = i;
+            cand[1] = krand() % g_playerSpawnCnt;
+            cand[2] = krand() % g_playerSpawnCnt;
+            for (int c = 0; c < 3; c++)
+            {
+                int64_t minD = INT64_MAX;
+                int j2;
+                for (TRAVERSE_CONNECT(j2))
+                {
+                    if (j2 == playerNum)
+                        continue;
+                    auto const &op = *g_player[j2].ps;
+                    if ((unsigned)op.i >= MAXSPRITES || sprite[op.i].extra <= 0 || op.dead_flag)
+                        continue;
+                    int64_t const d = (int64_t)klabs(op.pos.x - g_playerSpawnPoints[cand[c]].x)
+                                    + (int64_t)klabs(op.pos.y - g_playerSpawnPoints[cand[c]].y);
+                    if (d < minD) minD = d;
+                }
+                if (minD == INT64_MAX)
+                    minD = 0;
+                if (minD > bestScore) { bestScore = minD; i = cand[c]; }
+            }
+        }
 
         if (g_gametypeFlags[ud.coop] & GAMETYPE_TDMSPAWN)
         {
@@ -1545,6 +1576,76 @@ void G_NewGame(int volumeNum, int levelNum, int skillNum)
 // positions, sect 313/154). engineLoadBoard marks the rows stale.
 int32_t g_spawnRowsStale = 1;
 
+// Seat -> spawn row assignment by GREEDY MAX-MIN SPREAD. E1L1's real DM rows
+// concentrate along the start street (measured: 6 of the first 7 rows in
+// sector 309, a ~3-grid patch) -- index-order pairing launched every seat
+// into that one patch (live: "you spawned all bots at exactly the same spawn
+// point"). Seat 0 keeps row 0 (the classic start); each further seat takes
+// the unused row FARTHEST from everything already assigned.
+static int16_t s_entryRow[MAXPLAYERS];
+static void G_AssignSpreadRows(void)
+{
+    int const cnt = g_playerSpawnCnt;
+    for (int i = 0; i < MAXPLAYERS; i++)
+        s_entryRow[i] = (int16_t)(cnt > 0 ? i % cnt : 0);
+    if (cnt < 3)
+        return;
+    uint8_t used[MAXPLAYERS] = {};
+    used[0] = 1;
+    for (int seat = 1; seat < MAXPLAYERS; seat++)
+    {
+        if (seat >= cnt)
+        {   // more seats than rows: wrap through the spread order
+            s_entryRow[seat] = s_entryRow[seat % cnt];
+            continue;
+        }
+        int best = -1; int64_t bestScore = -1;
+        for (int r = 0; r < cnt; r++)
+        {
+            if (used[r])
+                continue;
+            int64_t minD = INT64_MAX;
+            for (int a = 0; a < cnt; a++)
+            {
+                if (!used[a])
+                    continue;
+                int64_t const d = (int64_t)klabs(g_playerSpawnPoints[r].x - g_playerSpawnPoints[a].x)
+                                + (int64_t)klabs(g_playerSpawnPoints[r].y - g_playerSpawnPoints[a].y);
+                if (d < minD) minD = d;
+            }
+            if (minD > bestScore) { bestScore = minD; best = r; }
+        }
+        if (best < 0)
+            break;
+        used[best] = 1;
+        s_entryRow[seat] = (int16_t)best;
+    }
+}
+
+// Farthest row from every LIVING connected player -- late joins and (with
+// candidates) respawns use this so nobody materializes into the fight pit.
+int G_PickFarSpawnRow(void)
+{
+    int best = 0; int64_t bestScore = -1;
+    for (int r = 0; r < g_playerSpawnCnt; r++)
+    {
+        int64_t minD = INT64_MAX; int p;
+        for (TRAVERSE_CONNECT(p))
+        {
+            auto const ps = g_player[p].ps;
+            if (ps == NULL || (unsigned)ps->i >= MAXSPRITES || sprite[ps->i].extra <= 0 || ps->dead_flag)
+                continue;
+            int64_t const d = (int64_t)klabs(g_playerSpawnPoints[r].x - ps->pos.x)
+                            + (int64_t)klabs(g_playerSpawnPoints[r].y - ps->pos.y);
+            if (d < minD) minD = d;
+        }
+        if (minD == INT64_MAX)
+            minD = 0;
+        if (minD > bestScore) { bestScore = minD; best = r; }
+    }
+    return best;
+}
+
 static void G_CollectSpawnPoints(int gameMode)
 {
     int const wasStale = g_spawnRowsStale;
@@ -1561,11 +1662,13 @@ static void G_CollectSpawnPoints(int gameMode)
             auto &s     = sprite[i];
             auto &spawn = g_playerSpawnPoints[g_playerSpawnCnt];
             spawn.xyz  = s.xyz;
+            spawn.z   -= (38 << 8);   // body z -> EYE convention (see the lock)
             spawn.ang  = s.ang;
             spawn.sect = s.sectnum;
             g_playerSpawnCnt++;
         }
         g_spawnRowsStale = 0;
+        G_AssignSpreadRows();
     }
 #ifdef __EMSCRIPTEN__
     {
@@ -1599,7 +1702,7 @@ static void G_CollectSpawnPoints(int gameMode)
         // identical to stock; re-entries heal the drift instead of shipping it.
         if (g_playerSpawnCnt > 0)
         {
-            auto &row = g_playerSpawnPoints[pindex % g_playerSpawnCnt];
+            auto &row = g_playerSpawnPoints[s_entryRow[pindex % MAXPLAYERS]];
             s.ang = row.ang;
             setsprite(i, &row.xyz);
         }
@@ -1695,7 +1798,7 @@ static void G_CollectSpawnPoints(int gameMode)
         {
             if (!g_player[j].connected || g_player[j].ps == NULL)
                 continue;
-            auto &spawn = g_playerSpawnPoints[j % g_playerSpawnCnt];
+            auto &spawn = g_playerSpawnPoints[s_entryRow[j % MAXPLAYERS]];
             int const i = A_InsertSprite(spawn.sect, spawn.x, spawn.y, spawn.z,
                                          APLAYER, 0, 0, 0, spawn.ang, 0, 0, 0, 10);
             auto &p = *g_player[j].ps;
@@ -2159,11 +2262,20 @@ int G_EnterLevel(int gameMode)
             continue;
         auto &spawn = g_playerSpawnPoints[g_playerSpawnCnt];
         spawn.xyz  = sprite[i].xyz;
+        // EYE CONVENTION: rows feed ps->pos directly, and ps->pos.z is the
+        // EYE. The start row (map header) is already eye-height, but a map
+        // APLAYER sprite's z is its FLOOR anchor -- consumed raw, the body
+        // (hung PHEIGHT below the eye) spawned 2.4m INSIDE the floor:
+        // clipmove refused all lateral motion, so every scan-row seat stood
+        // frozen, z-jittering ([bot1]: fv=80, full rotation, zero x/y, no
+        // blocker -- and the live "in the middle of the ground").
+        spawn.z   -= (38 << 8) /*PHEIGHT*/;
         spawn.ang  = sprite[i].ang;
         spawn.sect = sprite[i].sectnum;
         g_playerSpawnCnt++;
     }
     g_spawnRowsStale = 0;   // rows locked: entry pairing places bodies AT them
+    G_AssignSpreadRows();   // seat->row spread (greedy max-min; see the def)
 
     p0.q16ang = fix16_from_int(playerAngle);
 

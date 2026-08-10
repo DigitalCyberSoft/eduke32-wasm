@@ -26,6 +26,8 @@ Prepared for public release: 03/28/2005 - Charlie Wiederhold, 3D Realms
 
 #include "duke3d.h"
 #include "soundefs.h"  // DUKE_KILLED2 (desync alert sound)
+
+extern "C" void Web_NetProbe(void);   // oldnet.cpp: world-truth probe line
 #ifdef __EMSCRIPTEN__
 # include <emscripten.h>
 #endif
@@ -42,6 +44,10 @@ bool syncError[MAX_SYNC_TYPES];
 // sets g_foundSyncError but was never wired into this fork's render loop).
 int Net_SyncErrorDetected(void)
 {
+    // Stream mode (state authority): divergence is not a fault condition --
+    // the host stream repaints it continuously. Nothing may act on verdicts.
+    if (g_netStreamMode)
+        return 0;
     for (int32_t i = 0; i < MAX_SYNC_TYPES; i++)
         if (syncError[i])
             return 1;
@@ -558,6 +564,28 @@ void Net_GetSyncStat(void)
 {
     if (numplayers < 2)
         return;
+
+    // Stream mode: lockstep CRC stamps exist only to flag divergence for the
+    // repair ladder, which is retired -- skip the whole per-tic CRC walk
+    // (allactor/world hashing, real CPU every consumed tic). Forensics keeps
+    // the stamps flowing so pair probes can still MEASURE divergence extent.
+    {
+        extern int32_t g_netForensics;
+        if (g_netStreamMode && !g_netForensics)
+            return;
+        // Tic-aligned world-truth line (see Web_NetProbe): every peer prints
+        // at the SAME plc values, so the pair differ compares the same sim
+        // tic exactly -- no wall-clock pairing slack.
+        if (g_netForensics && (movefifoplc & 255) == 0)
+        {
+            static int32_t s_probePlc = -1;
+            if (movefifoplc != s_probePlc)
+            {
+                s_probePlc = movefifoplc;
+                Web_NetProbe();
+            }
+        }
+    }
 
     // The CRC table was NEVER initialized in this port -- classic called
     // initsynccrc() from game init, and the call was lost. With a zero table,

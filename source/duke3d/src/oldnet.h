@@ -145,6 +145,12 @@ void Net_SendClientInfo(void);
 OLDNET_EXTERN input_t netInput;
 
 OLDNET_EXTERN bool oldnet_gotinitialsettings; // True if we got PACKET_TYPE_INIT_SETTINGS from the host.
+// OpenArena-model state authority (2026-08-09 user directive): 1 = host streams
+// authoritative player+sprite state continuously and ALL lockstep divergence
+// machinery (CRC compare, desync reports, heal ladder, tic-stamped snap gating)
+// is off. 0 = legacy lockstep repair, kept only as an A/B kill-switch.
+// Plain extern (not OLDNET_EXTERN): the default is 1, set at the definition.
+extern int32_t g_netStreamMode;
 extern int32_t g_netLateJoinMask; // slots whose peer-up landed mid-game; host seats them via relaunch (menus.cpp)
 
 // NEW_GAME flags bit (high half of the low 16 reserved bits): guests must NOT
@@ -253,6 +259,8 @@ enum DukePacket_t
     // for 70+ seconds while the host stayed blind -- permanent silent split.
     PACKET_TYPE_DESYNC_REPORT,
     PACKET_TYPE_STATE_SNAP,   // host -> diverged guest: in-place RNG+player correction (no reload)
+    PACKET_TYPE_SPRITE_STREAM, // host -> guest: continuous authoritative sprite deltas (stream mode)
+    PACKET_TYPE_SECTOR_STREAM, // host -> guest: sector ceiling/floor heights (doors are host-owned)
     PACKET_END, // Should remain last in list.
 };
 

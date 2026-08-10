@@ -1799,13 +1799,27 @@ void netmenu_send_snapshot_to(int seatMask, int slot, int plc, int isJoin)
 // ud.monsters_off, game.cpp:3538). No gametype picker yet -> hardcode DM (coop 0,
 // global.cpp:44). Net_SendNewGame also broadcasts the SEAT MASK (oldnet.cpp) so
 // guests learn the authoritative session roster.
-static int32_t s_netMinPlayers = 5; // host-chosen match-size FLOOR (1..8): CPU
+static int32_t s_netMinPlayers = 8; // host-chosen match-size FLOOR (1..8): CPU
                                     // players fill only the seats humans leave
-                                    // empty, and yield them as humans join. A
-                                    // populated default -- one bot is not a match
-static int32_t s_netBotSkill = 1;   // host-chosen CPU skill (0..2); default Hard --
-                                    // Medium's aim wobble read as "the bots are
-                                    // stupid" (live), and the menu can lower it
+                                    // empty, and yield them as humans join.
+                                    // FULL-ARENA default (live directive, told
+                                    // twice: "you need more bots... 2 people is
+                                    // not enough") -- discovery can strand a
+                                    // small human count, so every match ships
+                                    // with all 8 seats fighting from tic 0.
+static int32_t s_netBotSkill = 2;   // host-chosen CPU skill (0..2); default Hard
+                                    // (2 -- the old "1" was actually Medium, whose
+                                    // wobble read as "shit job at aiming", live)
+
+#ifdef __EMSCRIPTEN__
+// Test-harness knob: lean fills for probe/keeper hosts ("4 is enough, and you
+// used too much resources" -- live directive). The menu default stays 8 for
+// player-hosted matches.
+extern "C" void Web_SetMinPlayers(int n)
+{
+    s_netMinPlayers = clamp(n, 1, MAXPLAYERS);
+}
+#endif
 
 static void netmenu_relaunch(int vol, int lev)
 {
@@ -1823,17 +1837,13 @@ static void netmenu_relaunch(int vol, int lev)
     ud.m_player_skill       = 0;
     if (numplayers > 1)
     {
-        // LAUNCH VIA SNAPSHOT. Guests never build the world with their own
-        // premap: two independent entries are not bit-identical (each peer
-        // re-inserts player sprites from its LOCAL history), so a lobby guest
-        // forked from tic 0 and lived on the 5s softsnap drip -- the user's
-        // every MP session ("mouse keeps bouncing", ghost bots, ~30s hydrant
-        // sync; pair probe reproduced the cat18 storm + eternal softsnaps).
-        // NEW_GAME (flagged) tells guests to WAIT; the host demotes them from
-        // the entry roster, enters with the bots, and the late-join pipeline
-        // streams each one the canonical entry snapshot.
-        Net_SendNewGame(NEWGAME_VIA_SNAPSHOT);
-        Net_DemoteGuestsToSnapshotEntry();
+        // Guests enter locally (legacy path). The launch-via-snapshot attempt
+        // (NEWGAME_VIA_SNAPSHOT + demote) left guests with no input pump --
+        // ready2send is set below on the HOST only; the cold-load entry never
+        // set it on guests -- and did not close the divergence anyway (pair32:
+        // equal seat indices, still mm=32/dr=10 over 6 min). Parked: the
+        // host-authoritative streaming model replaces lockstep entry entirely.
+        Net_SendNewGame(0);
     }
     NetMenu_SetInGame(1);     // stop advertising open-state; joins now go the late-join route
     // Enter DIRECTLY, exactly like the single-player New Game path: the deferred-gm
@@ -3761,8 +3771,23 @@ static void Menu_PreDraw(MenuID_t cm, MenuEntry_t* entry, const vec2_t origin)
                 netmenu_mtext_r(origin.x + (262<<16), origin.y + (y<<16), tempbuf, MF_Minifont.pal_deselected);
             }
         }
+        // CPU seats are part of the match from tic 0 (min-players fill) --
+        // SHOW them ("still only myself and 1 other player in the lobby",
+        // flagged three times: an invisible fill reads as an empty match).
+        // Every peer previews with its own compiled default; the host's live
+        // menu value is authoritative for the actual fill at launch.
+        {
+            int const fill = s_netMinPlayers;
+            int const humans = s_netRosterCount ? s_netRosterCount : 1;
+            for (int b = 0; b < fill - humans && y <= 140; ++b, y += 8)
+            {
+                Bsnprintf(tempbuf, sizeof tempbuf, "%d. CPU player (fills at start)", humans + b);
+                mminitext(origin.x + ((MENU_MARGIN_REGULAR+8)<<16), origin.y + (y<<16), tempbuf,
+                          MF_Minifont.pal_disabled);
+            }
+        }
         if (s_netRosterCount == 0)
-            mminitext(origin.x + ((MENU_MARGIN_REGULAR+8)<<16), origin.y + (82<<16), "(nobody has joined yet)", MF_Minifont.pal_disabled);
+            mminitext(origin.x + ((MENU_MARGIN_REGULAR+8)<<16), origin.y + (150<<16), "(waiting for your connection...)", MF_Minifont.pal_disabled);
         if (s_netMyConnectIndex != 0)   // a joining player only waits; the host controls the start
             mminitext(origin.x + (MENU_MARGIN_REGULAR<<16), origin.y + (150<<16), "Waiting for the host to start the match...", MF_Minifont.pal_deselected);
         netmenu_draw_status(origin);
@@ -9224,7 +9249,8 @@ void M_DisplayMenus(void)
             static int32_t s_lastResyncTic = -100000;
             if ((int32_t)totalclock < s_lastResyncTic)
                 s_lastResyncTic = -100000; // timers were reset (level entry)
-            if ((g_foundSyncError || Net_SyncErrorDetected()) && myconnectindex == connecthead && numplayers > 1
+            if (!g_netStreamMode   // stream mode: no divergence concept, no heal ladder
+                && (g_foundSyncError || Net_SyncErrorDetected()) && myconnectindex == connecthead && numplayers > 1
                 && g_player[myconnectindex].ps != NULL
                 && (g_player[myconnectindex].ps->gm & MODE_GAME)
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)

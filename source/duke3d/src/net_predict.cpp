@@ -159,12 +159,16 @@ void Net_CorrectPrediction(void)
     predictedPlayer.rotscrnang  = rotscrnang;   predictedPlayer.orotscrnang  = orotscrnang;
     predictedPlayer.look_ang    = look_ang;     predictedPlayer.olook_ang    = olook_ang;
 
-    // BOUNDED VIEW: the carried (frame-owned) direction and the sim's copy
-    // integrate the same deltas but apply clamps/centering in different
-    // orders, so they drift apart -- and the SIM is what shoots. A drifted
-    // crosshair means aimed shots miss ("can't hit a fire hydrant",
-    // live-reported twice). Glide any gap closed a quarter per correction
-    // pass: imperceptible per frame, and drift can never accumulate.
+    // BOUNDED VIEW glide -- LEGACY LOCKSTEP ONLY. It pulls the frame-owned
+    // view a quarter of the way toward the sim's direction every consumed
+    // tic; with echo RTT the sim's direction is where the mouse was ~100ms
+    // ago, so during any sustained turn the view is dragged backward against
+    // the mouse ~30x/sec (live, third report: "moving the mouse is still
+    // glitchy" -- this was the root all along). The problem it solved
+    // (crosshair drifting off the fired shot) is owned by the closed-loop
+    // aim staging now: the SIM chases the VIEW every tic, truth flows from
+    // the player that fires, and nothing may ever pull the view back.
+    if (!g_netStreamMode)
     {
         DukePlayer_t const *sim = p;   // original pointers active here
         fix16_t gapH = fix16_ssub(predictedPlayer.q16horiz, sim->q16horiz);
