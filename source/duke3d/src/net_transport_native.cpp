@@ -144,7 +144,12 @@ public:
             // match is LAN-only is enforced at the ICE layer instead -- a Local Only
             // match offers no STUN, so only same-network candidate pairs can ever
             // complete, no matter who can see the signaling.
-            relays_ = { "wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net" };
+            // Match the browser relay set (netconfig.ts) so >=2 shared relays
+            // survive an outage -- discovery needs a common rendezvous, and native
+            // GnuTLS currently only completes on some public relays (primal.net does).
+            relays_ = { "wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net",
+                        "wss://offchain.pub", "wss://nostr.bitcoiner.social",
+                        "wss://nostr-pub.wellorder.net", "wss://nostr.mom", "wss://purplepag.es" };
         }
 
         myDeviceId_ = "native-" + toHex(randomBytes(8));
@@ -158,7 +163,7 @@ public:
         // Headless auto-start via env (the interactive menu uses net_native_host/join).
         const char *role = getenv("NN_ROLE");
         if (role && std::string(role) == "host")
-            hostMatch(0, envOr("NN_NAME", "Duke Match"), minPlayers_, myName_, 0);
+            hostMatch(envOr("NN_PUBLIC", "0") == "1" ? 1 : 0, envOr("NN_NAME", "Duke Match"), minPlayers_, myName_, 0);
         else if (role && std::string(role) == "guest")
         {
             std::string key = envOr("NN_KEY", ""), hid = envOr("NN_HOSTID", "");
@@ -201,6 +206,7 @@ public:
             inbound_.push_back(std::move(sli));
         }
         ensureSignaling();
+        announceLobby(); // list on the PUBLIC lobby at once (best-effort; presenceLoop refreshes once the relay is open)
         // menus.cpp copies the invite to the system clipboard right after hostMatch
         // returns; the full string is also on stdout ([nnet] INVITE / [nnet] KEY).
         setStatus("Hosting - invite copied to clipboard (KEY in terminal for native peers).");
@@ -517,11 +523,16 @@ private:
         // Wait briefly for the relay to open, then announce presence until connected.
         for (int t = 0; t < 3000 && nostr_->openRelayCount() == 0 && running_; t += 50)
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        int lobbyTick = 0; // refresh the public lobby advert every ~15 iterations (~15s, browser TTL 60s)
         while (running_)
         {
             try
             {
                 nostr_->publishEphemeral(SIGNALING_KIND, roomKey_, buildPresenceMsg(myDeviceId_, myName_, isHost_));
+                // Public host: re-announce on the lobby channel so the browser row
+                // stays fresh (it refreshes every ANNOUNCE_INTERVAL_MS=15s).
+                if (isHost_ && isPublic_ && (lobbyTick++ % 15) == 0)
+                    announceLobby();
                 if (!isHost_)
                 {
                     std::string h;
@@ -604,7 +615,7 @@ private:
         // extract the fields we need, then release before touching other locks.
         std::string type, joinName, joinGrpDigest, denyReason, denyGrpLabel;
         bool denyGrpPaid = false;
-        int yourSlot = -1, hostSlot = 0;
+        int yourSlot = -1, hostSlot = 0, rttId = -1;
         {
             std::lock_guard<std::mutex> lk(sigMtx_);
             sjson_reset_context(sigCtx_);
@@ -636,6 +647,7 @@ private:
             }
             yourSlot = sjson_get_int(root, "yourSlot", -1);
             hostSlot = sjson_get_int(root, "hostSlot", 0);
+            rttId    = sjson_get_int(root, "id", -1); // rtt_ping echo id
             const char *jn = sjson_get_string(root, "name", nullptr);
             if (jn)
                 joinName = jn;
@@ -714,7 +726,12 @@ private:
             // when the host GRP is shareable). Native cannot stream it yet: refuse
             // cleanly so the guest shows an error instead of waiting forever.
             pm_->sendControl(peer, "{\"t\":\"grp_deny\",\"reason\":\"the native host cannot share its GRP yet\"}");
-        // rtt_ping/pong + kick: later refinement; not needed to establish a game.
+        else if (type == "rtt_ping")
+            // Echo the browser's RTT probe (duke-net.ts pings every 2s). Without this the
+            // browser roster shows this peer's ping as '?' and a local-only host never
+            // measures our RTT (so it can't seat/boot us). id round-trips verbatim.
+            pm_->sendControl(peer, "{\"t\":\"rtt_pong\",\"id\":" + std::to_string(rttId) + "}");
+        // kick: later refinement; not needed to establish a game.
     }
 
     void guestHandleJoinDeny(const std::string &reason, bool hostPaid, const std::string &hostLabel)
@@ -892,6 +909,49 @@ private:
         if (!grpFp_.valid)
             return "{\"crc\":0}"; // truthy for parseInvite; browser hosts deny on digest
         return grpFingerprintJson(grpFp_, [](const std::string &s) { return jsonStr(s); });
+    }
+
+    // PUBLIC-lobby MatchInfo -- MUST carry the SAME fields the browser lobby
+    // pipeline reads (match.ts info()/subscribe). Two are load-bearing: `status`
+    // is mandatory (a row without "open"/"playing" is filtered out and never
+    // rendered) and `ts` MUST be milliseconds (browser TTL = now - ts, Date.now()).
+    // publishReplaceable AES-GCM-encrypts this under PUBLIC_LOBBY_KEY exactly like
+    // the browser, so the browser can decrypt+list it.
+    std::string matchInfoJson()
+    {
+        int players;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            players = (int)deviceToToken_.size() + 1; // +1: the host itself
+        }
+        const char *status = inGame_.load() ? "playing" : "open";
+        return std::string("{\"v\":1")
+             + ",\"matchId\":"    + jsonStr(matchId_)
+             + ",\"name\":"       + jsonStr(matchName_)
+             + ",\"hostId\":"     + jsonStr(myDeviceId_)
+             + ",\"roomKey\":"    + jsonStr(roomKey_)
+             + ",\"maxPlayers\":" + std::to_string(maxPlayers_)
+             + ",\"players\":"    + std::to_string(players)
+             + ",\"status\":\""   + status + "\""
+             + ",\"grp\":"        + grpJson()
+             + ",\"pingHint\":null"
+             + ",\"localOnly\":"  + (localOnly_ ? "true" : "false")
+             + ",\"ts\":"         + std::to_string(nowMs())
+             + "}";
+    }
+
+    // Announce this host on the PUBLIC lobby (kind 30078, d-tag = matchId) so the
+    // browser lists it. Only when public AND the GRP fingerprint is valid: an
+    // invalid grp emits {"crc":0}, and the browser lobby renderer dereferences
+    // grp.mainGrp.crc and would throw, breaking the whole list. No-op for private
+    // (invite-only) matches -- those are reached by the invite code, not the list.
+    void announceLobby()
+    {
+        if (!isPublic_ || !grpFp_.valid)
+            return;
+        nostr_->publishReplaceable(LOBBY_KIND, PUBLIC_LOBBY_KEY, matchId_, matchInfoJson());
+        printf("[nnet] lobby announce (public) matchId=%s\n", matchId_.c_str());
+        fflush(stdout);
     }
 
     // ICE policy IS the local/internet boundary (signaling is always public Nostr):

@@ -24,6 +24,13 @@ namespace nn {
 static const int SIGNALING_KIND = 20079; // ephemeral
 static const int LOBBY_KIND = 30078;     // replaceable
 
+// Fixed PUBLIC Duke lobby channel key -- MUST byte-match netconfig.ts:169. Every
+// client derives the SAME Nostr identity from it, so public hosts all announce
+// under one author (keyed per-match by the d-tag = matchId); the browser lists
+// matches by subscribing to LOBBY_KIND under that author. Content stays AES-GCM
+// encrypted under this key, so only Duke clients can read the lobby.
+static const char *PUBLIC_LOBBY_KEY = "MqBAIxP3Lwawq+18BL1KSjAdlTxfVtoERfmgszaEKnc=";
+
 inline int64_t nowMs() { return (int64_t)nowSec() * 1000; }
 
 inline std::string buildSdpMsg(const std::string &from, const std::string &to, const std::string &sdp, bool isOffer)
