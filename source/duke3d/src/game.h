@@ -420,6 +420,10 @@ void G_HandleMirror(int32_t x, int32_t y, int32_t z, fix16_t a, fix16_t horiz, i
 void G_DrawRooms(int32_t playerNum,int32_t smoothratio);
 void G_DrawTXDigiNumZ(int32_t starttile,int32_t x,int32_t y,int32_t n,int32_t s,int32_t pal,int32_t cs,int32_t x1,int32_t y1,int32_t x2,int32_t y2,int32_t z);
 EDUKE32_NORETURN void G_GameExit(const char *msg = nullptr);
+// Window close button (X): immediate clean quit from anywhere (in-game loop and
+// the title/attract loop). Skips the interactive exit screens; still runs the
+// atexit net shutdown. Callers: game.cpp main loop, demo.cpp G_PlaybackDemo.
+EDUKE32_NORETURN void G_CloseWindowQuit(void);
 void G_GameQuit(void);
 void G_GetCrosshairColor(void);
 void G_HandleLocalKeys(void);

@@ -981,6 +981,12 @@ nextdemo_nomenu:
         if (!Demo_IsProfiling())
             gameHandleEvents();
 
+        // Window close button (X) at the title/attract screen: this loop runs
+        // instead of the main game loop here, so honor the quit request the same
+        // way (otherwise the SDL_QUIT is swallowed and X does nothing at the menu).
+        if (quitevent)
+            G_CloseWindowQuit();
+
         if (g_player[myconnectindex].ps->gm == MODE_GAME)
         {
             // user wants to play a game, quit showing demo!

@@ -369,6 +369,17 @@ void G_GameExit(const char *msg)
     app_exit(EXIT_SUCCESS);
 }
 
+// Window close button (X): quit the process immediately and cleanly from
+// anywhere. g_quickExit skips the interactive bonus/order screens; G_GameExit ->
+// app_exit runs atexit(net_transport_shutdown) so relay/peer sockets close.
+// Previously X only injected Escape (opening the menu), and even the menu-quit
+// path could stall ~180s on the stream-mode peer quit handshake.
+void G_CloseWindowQuit(void)
+{
+    g_quickExit = 1;
+    G_GameExit(nullptr);
+}
+
 
 #ifdef YAX_DEBUG
 // ugh...
@@ -7184,18 +7195,7 @@ MAIN_LOOP_RESTART:
     do //main loop
     {
         if (gameHandleEvents() && quitevent)
-        {
-            // Window close button (X): quit the process immediately and cleanly.
-            // Previously this only injected Escape (merely opening the menu), so
-            // clicking X never actually closed the window; and in stream-mode MP
-            // the menu-quit path additionally stalls up to ~180s on the peer quit
-            // handshake ("Didn't get quit packet in time"). g_quickExit skips the
-            // interactive bonus/order screens that would otherwise wait for input,
-            // and G_GameExit -> app_exit runs atexit(net_transport_shutdown), so the
-            // relay/peer sockets still close cleanly.
-            g_quickExit = 1;
-            G_GameExit(NULL);
-        }
+            G_CloseWindowQuit();   // window X: clean immediate quit (see game.h)
 
         // NOTE: the native WebRTC host launch lives in M_DisplayMenus (menus.cpp), NOT here.
         // At the menu the engine runs the attract-mode loop (G_PlaybackDemo), which calls
