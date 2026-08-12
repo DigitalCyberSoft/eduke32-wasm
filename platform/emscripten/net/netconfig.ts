@@ -47,6 +47,11 @@ function localRelayWanted(): boolean {
 // mostr/data.haus/nostr.net/noswhere) — breadth adds noise, not reliability;
 // 5 healthy relays already survive any single outage. Re-probe before editing:
 // /tmp/relayprobe.mjs <urls...> (sends a REQ, expects EOSE).
+// 2026-08-11: broadened after a self-inflicted IP rate-limit (the keeper's blind
+// retry loop hammered the first 5 relays' WRITE path for hours; TCP/read stayed
+// up but publishing an invite silently failed). Added two relays the keeper never
+// touched (re-probed live: both answer NIP-01) so a single relay's per-IP write
+// limit can't block hosting. If ANY relay accepts the publish, the invite lives.
 export const NOSTR_RELAYS: readonly string[] = [
   ...(localRelayWanted() ? [LOCAL_RELAY] : []),
   "wss://nos.lol",
@@ -54,6 +59,8 @@ export const NOSTR_RELAYS: readonly string[] = [
   "wss://offchain.pub",
   "wss://nostr.bitcoiner.social",
   "wss://nostr-pub.wellorder.net",
+  "wss://nostr.mom",
+  "wss://purplepag.es",
 ];
 
 /** Public STUN (zero-config). Multiple servers + Cloudflare's so a single outage

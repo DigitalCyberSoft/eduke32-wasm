@@ -687,6 +687,19 @@ void P_MoveToRandomSpawnPoint(int playerNum)
         }
     }
 
+    // Never index past the starts the map actually defines (OOB guard).
+    if ((unsigned)i >= (unsigned)g_playerSpawnCnt)
+        i = (g_playerSpawnCnt > 0) ? (i % g_playerSpawnCnt) : 0;
+
+    // COOP keeps the squad TOGETHER at the LEVEL START. Story maps rarely
+    // cluster their player-start markers, so i = playerNum scattered the bots
+    // across the level ("the bot didn't spawn next to me", user 2026-08-12).
+    // Row 0 is player 0's start -- every coop seat spawns there and separates
+    // on the first tic via clipmove (coop friendly fire is off, so no
+    // telefrag): the classic "everyone starts together" cooperative feel.
+    if ((g_gametypeFlags[ud.coop] & GAMETYPE_COOP) && g_playerSpawnCnt > 0)
+        i = 0;
+
 #ifdef __EMSCRIPTEN__
     {
         extern int32_t g_netForensics;
@@ -943,16 +956,31 @@ void P_ResetWeapons(int playerNum)
     p.ammo_amount[PISTOL_WEAPON] = min<int16_t>(p.max_ammo_amount[PISTOL_WEAPON], 48);
 
 #ifdef NETDUKE32
-    // ARENA LOADOUT: multiplayer spawns carry a shotgun. Pistol-only DM was
-    // measured unplayable (a kill needs ~17 pistol hits; bots managed 2 body
-    // hits in 10 minutes -- and humans fared little better). Deterministic:
-    // every sim runs this same reset for every spawn.
     if (numplayers > 1)
     {
-        p.gotweapon |= (1 << SHOTGUN_WEAPON);
-        p.ammo_amount[SHOTGUN_WEAPON] = min<int16_t>(p.max_ammo_amount[SHOTGUN_WEAPON], 20);
-        p.curr_weapon = SHOTGUN_WEAPON;
-        p.kickback_pic = PWEAPON(playerNum, p.curr_weapon, TotalTime);
+        if (g_gametypeFlags[ud.coop] & GAMETYPE_COOP)
+        {
+            // COOP = REGULAR STORY MODE: the classic loaded-pistol start,
+            // stated EXPLICITLY. The base reset above already grants the pistol,
+            // but the DM branch reassigns curr_weapon, so coop must own its own
+            // selection + ammo too -- otherwise the seat came up empty-handed
+            // (user 2026-08-12: "spawned in coop but didn't have a pistol").
+            p.gotweapon  |= (1 << PISTOL_WEAPON);
+            p.curr_weapon = PISTOL_WEAPON;
+            p.ammo_amount[PISTOL_WEAPON] = max<int16_t>(p.ammo_amount[PISTOL_WEAPON],
+                                                        min<int16_t>(p.max_ammo_amount[PISTOL_WEAPON], 48));
+            p.kickback_pic = PWEAPON(playerNum, p.curr_weapon, TotalTime);
+        }
+        else
+        {
+            // DEATHMATCH/TDM arena loadout: spawn with a shotgun. Pistol-only DM
+            // was measured unplayable (a kill needs ~17 pistol hits; bots
+            // managed 2 body hits in 10 minutes). Deterministic across sims.
+            p.gotweapon |= (1 << SHOTGUN_WEAPON);
+            p.ammo_amount[SHOTGUN_WEAPON] = min<int16_t>(p.max_ammo_amount[SHOTGUN_WEAPON], 20);
+            p.curr_weapon = SHOTGUN_WEAPON;
+            p.kickback_pic = PWEAPON(playerNum, p.curr_weapon, TotalTime);
+        }
     }
 #endif
 
@@ -1546,7 +1574,12 @@ void G_NewGame(int volumeNum, int levelNum, int skillNum)
     for (int i=0; i < (MAXVOLUMES*MAXLEVELS); i++)
         G_FreeMapState(i);
 
-    if (ud.m_coop != 1)
+    // Grant player 0 the classic loaded-pistol start on a NEW GAME -- COOP
+    // INCLUDED. Stock gated this on non-coop (ud.m_coop != 1), which is exactly
+    // why the coop host spawned weaponless (user 2026-08-12: "still no pistol on
+    // coop"). G_NewGame runs ONCE per new game, not per level, so coop weapon
+    // carryover between levels is unaffected; DM/TDM still override to the
+    // shotgun in P_ResetWeapons afterward.
     {
         for (int weaponNum = 0; weaponNum < MAX_WEAPONS; weaponNum++)
         {
@@ -1586,6 +1619,18 @@ static int16_t s_entryRow[MAXPLAYERS];
 static void G_AssignSpreadRows(void)
 {
     int const cnt = g_playerSpawnCnt;
+    // COOP enters as a SQUAD at the level start (row 0). The spread below is a
+    // deathmatch behavior -- it scatters seats across the map's player-start
+    // markers, which put the bot at the second start instead of beside the
+    // human ("the cpu didn't start next to me, it started at the second spawn
+    // point", user 2026-08-12). This is the INITIAL-entry twin of the coop
+    // row-0 respawn in P_MoveToRandomSpawnPoint.
+    if (g_gametypeFlags[ud.coop] & GAMETYPE_COOP)
+    {
+        for (int i = 0; i < MAXPLAYERS; i++)
+            s_entryRow[i] = 0;
+        return;
+    }
     for (int i = 0; i < MAXPLAYERS; i++)
         s_entryRow[i] = (int16_t)(cnt > 0 ? i % cnt : 0);
     if (cnt < 3)

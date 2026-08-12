@@ -79,7 +79,9 @@ enum GametypeFlags_t {
     GAMETYPE_ACCESSATSTART          = 0x00004000,
     GAMETYPE_PRESERVEINVENTORYDEATH = 0x00008000,
     GAMETYPE_TDM                    = 0x00010000,
-    GAMETYPE_TDMSPAWN               = 0x00020000
+    GAMETYPE_TDMSPAWN               = 0x00020000,
+    GAMETYPE_LMS                    = 0x00040000,  // Last Man Standing: limited lives, elimination, last-alive wins the round
+    GAMETYPE_NORESPAWN              = 0x00080000   // Co-op survival: no mid-level respawn; you revive only on the NEXT level
 };
 
 // logo control

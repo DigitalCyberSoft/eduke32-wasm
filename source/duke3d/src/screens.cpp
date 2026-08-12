@@ -1331,6 +1331,18 @@ void G_DisplayRest(int32_t smoothratio)
 
     G_PrintFPS();
 
+#if defined(NETDUKE32)
+    // Net-debug HUD (multiplayer): build tag + packet/stream counters + how
+    // many tics stale each remote player's last update is. Screenshot this in
+    // the real session -- big 'age' numbers = updates not arriving (transport),
+    // which localhost headless can never reproduce.
+    if (numplayers > 1)
+    {
+        extern const char *Net_DebugHudStr(void);
+        printext256(2, 2, 31, -1, Net_DebugHudStr(), 0);
+    }
+#endif
+
     // JBF 20040124: display level stats in screen corner
     if (ud.overhead_on != 2 && ud.levelstats && VM_OnEvent(EVENT_DISPLAYLEVELSTATS, g_player[screenpeek].ps->i, screenpeek) == 0)
     {

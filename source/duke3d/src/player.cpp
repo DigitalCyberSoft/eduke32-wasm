@@ -368,6 +368,11 @@ static int32_t safeldist(int32_t spriteNum, const void *pSprite)
 // flags:
 //  1: do sprite center adjustment (cen-=(8<<8)) for GREENSLIME or ROTATEGUN
 //  2: do auto getangle only if not RECON (if clear, do unconditionally)
+// DIAGNOSTIC (2026-08-12): the local player's last auto-aim target picnum, or
+// -1 if the shot went straight. Surfaced on the NETDBG HUD (aa=) so a host who
+// reports "my shots fire ~5 deg right" can see whether Auto Aim is grabbing an
+// off-crosshair enemy. Written only for myconnectindex.
+int32_t g_dbgAutoAimPic = -1;
 static int GetAutoAimAng(int spriteNum, int playerNum, int projecTile, int zAdjust, int aimFlags,
                                const vec3_t *startPos, int projVel, int32_t *pZvel, int *pAng)
 {
@@ -399,6 +404,8 @@ static int GetAutoAimAng(int spriteNum, int playerNum, int projecTile, int zAdju
             *pAng = getangle(pSprite->x-startPos->x, pSprite->y-startPos->y);
     }
 
+    if (playerNum == myconnectindex)
+        g_dbgAutoAimPic = (returnSprite >= 0) ? sprite[returnSprite].picnum : -1;
     return returnSprite;
 }
 
@@ -2104,6 +2111,57 @@ static void P_FireWeapon(int playerNum)
         if ((++s_shotN & 7) == 0)
             EM_ASM({ console.log('[shot] p=' + $0 + ' weap=' + $1 + ' horiz=' + $2 + ' n=' + $3); },
                    playerNum, pPlayer->curr_weapon, fix16_to_int(pPlayer->q16horiz), s_shotN);
+    }
+#endif
+
+#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+    // ── CLIENT-SIDE HITSCAN (user 2026-08-10: "the hitscan should be client
+    // side, not host side ... the problem is where you are calculating it") ──
+    // MEASURED ROOT: the guest never computes its own hit -- weapons are host-
+    // authoritative and the host re-fires the guest's shot using aim it rebuilt
+    // from the avel stream. For a mouse-aiming human that rebuilt angle drifts
+    // from what the player actually sees, so the shot misses on the host and the
+    // bot takes nothing (a localbot guest, which aims purely via avel, hits fine
+    // -- proving it's mouse-aim reconstruction, not the weapon). Fix: the guest
+    // does its OWN hitscan from its EXACT q16ang/q16horiz against its LOCAL world
+    // (favor-the-shooter, the Q3 model; no lag comp needed at 1ms) and reports
+    // each player hit; the host applies it verbatim (Net_ApplyHitReport). Runs
+    // ONLY on the guest for its OWN player and ONLY for hitscan weapons.
+    {
+        extern int32_t g_netStreamMode, g_netForensics;
+        extern void Net_ClientReportHit(int victimSeat, int damage, int weaponPic);
+        int const shoots = PWEAPON(playerNum, pPlayer->curr_weapon, Shoots);
+        if (g_netStreamMode && numplayers > 1 && myconnectindex != connecthead
+            && playerNum == myconnectindex && (unsigned)pPlayer->cursectnum < (unsigned)numsectors
+            && (shoots == SHOTSPARK1 || shoots == SHOTGUN || shoots == CHAINGUN))
+        {
+            int const pellets = clamp((int)PWEAPON(playerNum, pPlayer->curr_weapon, ShotsPerBurst), 1, 16);
+            int const ang0    = fix16_to_int(pPlayer->q16ang) & 2047;
+            int const horiz   = fix16_to_int(pPlayer->q16horiz);
+            int       reported = 0;
+            for (int pel = 0; pel < pellets; pel++)
+            {
+                int const aSpread = (pellets > 1) ? ((int)(krand() % 129) - 64) : 0;   // shotgun cone
+                int const zSpread = (pellets > 1) ? ((int)(krand() % 4097) - 2048) : 0;
+                int const a       = (ang0 + aSpread) & 2047;
+                hitdata_t h;
+                hitscan(&pPlayer->pos, pPlayer->cursectnum, sintable[(a + 512) & 2047], sintable[a & 2047],
+                        ((100 - horiz) << 5) + zSpread, &h, CLIPMASK1);
+                if (h.sprite >= 0 && (unsigned)h.sprite < MAXSPRITES && sprite[h.sprite].picnum == APLAYER)
+                {
+                    int const victim = P_Get(h.sprite);
+                    if (victim != playerNum && (unsigned)victim < MAXPLAYERS)
+                    {
+                        int const dmg = G_DefaultActorHealthForTile(shoots) + (krand() % 6);
+                        Net_ClientReportHit(victim, dmg, SHOTSPARK1);
+                        reported++;
+                    }
+                }
+            }
+            if (g_netForensics && reported)
+                EM_ASM({ console.log('[chscan] guest client-hitscan reported ' + $0 + '/' + $1 + ' pellets on players'); },
+                       reported, pellets);
+        }
     }
 #endif
 
@@ -5158,15 +5216,19 @@ void P_ProcessInput(int playerNum)
     auto const pSprite = &sprite[pPlayer->i];
 
 #ifdef NETDUKE32
-    // ARENA RULE: the pistol never runs dry in multiplayer. CPU players have
-    // no item-seeking, so they burned their 48 rounds and clicked an empty
-    // gun forever (measured: 0 frags in 4 minutes of 5-bot DM); humans get
-    // the same floor so a fight is always possible. Runs identically in
-    // every sim -- pure function of replicated state, no divergence.
-    if (numplayers > 1 && pPlayer->ammo_amount[PISTOL_WEAPON] < 12)
-        pPlayer->ammo_amount[PISTOL_WEAPON] = 12;
-    if (numplayers > 1 && pPlayer->ammo_amount[SHOTGUN_WEAPON] < 6)
-        pPlayer->ammo_amount[SHOTGUN_WEAPON] = 6;
+    // ARENA RULE (DEATHMATCH/TDM only): the pistol never runs dry. CPU players
+    // have no item-seeking, so they burned their 48 rounds and clicked an empty
+    // gun forever (measured: 0 frags in 4 minutes of 5-bot DM); humans get the
+    // same floor so a fight is always possible. COOP is story mode -- normal
+    // ammo economy, and no phantom shotgun ammo for a gun you don't carry (user
+    // 2026-08-12). Runs identically in every sim -- no divergence.
+    if (numplayers > 1 && !(g_gametypeFlags[ud.coop] & GAMETYPE_COOP))
+    {
+        if (pPlayer->ammo_amount[PISTOL_WEAPON] < 12)
+            pPlayer->ammo_amount[PISTOL_WEAPON] = 12;
+        if (pPlayer->ammo_amount[SHOTGUN_WEAPON] < 6)
+            pPlayer->ammo_amount[SHOTGUN_WEAPON] = 6;
+    }
 #endif
 
     ++pPlayer->player_par;

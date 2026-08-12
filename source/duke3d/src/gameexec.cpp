@@ -1208,6 +1208,7 @@ static int32_t VM_ResetPlayer(int const playerNum, int32_t vmFlags, int32_t cons
             Net_SpawnPlayer(playerNum);
         }
         else if (numplayers > 1)
+        {
             // Lockstep/stream MP (g_netServer is the dormant client/server
             // macro, FALSE here): without this branch a dead MP player was
             // NEVER reset -- the CON resetplayer landed in a no-op and every
@@ -1216,7 +1217,22 @@ static int32_t VM_ResetPlayer(int const playerNum, int32_t vmFlags, int32_t cons
             // live: "I am the only player in the match"). Every peer runs
             // this same opcode at the same consumed tic, so the reset is
             // deterministic like any sim step.
-            P_ResetMultiPlayer(playerNum);
+            // LAST MAN STANDING: the host spends a life and refuses the respawn
+            // when the seat is out of lives (elimination). Guests pass through
+            // (Net_LmsAllowRespawn returns 1 off-host) and mirror the host's
+            // streamed dead state. Non-LMS gametypes always reset (unchanged).
+            extern int Net_LmsAllowRespawn(int playerNum);
+            // NO-RESPAWN CO-OP: a death is permanent for the level -- refuse the
+            // reset so the player stays down until the NEXT level's entry spawn
+            // revives the whole squad (user 2026-08-12: "coop without respawn --
+            // you need to make it to the next level to get the respawn"). LMS
+            // still spends a life here; every other gametype always resets.
+            bool const allowRespawn =
+                !(g_gametypeFlags[ud.coop] & GAMETYPE_NORESPAWN)
+                && (!(g_gametypeFlags[ud.coop] & GAMETYPE_LMS) || Net_LmsAllowRespawn(playerNum));
+            if (allowRespawn)
+                P_ResetMultiPlayer(playerNum);
+        }
 #endif
     }
 

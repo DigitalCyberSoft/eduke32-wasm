@@ -36,12 +36,12 @@ extern "C" {
 char    g_volumeNames[MAXVOLUMES][33] = { "L.A. Meltdown", "Lunar Apocalypse", "Shrapnel City" };
 char    g_skillNames[MAXSKILLS][33] = { "Piece Of Cake", "Let's Rock", "Come Get Some", "Damn I'm Good" };
 char    g_gametypeNames[MAXGAMETYPES][33]
-= { "DukeMatch (Spawn)", "Cooperative Play", "DukeMatch (No Spawn)", "Team DM (Spawn)", "Team DM (No Spawn)" };
+= { "DukeMatch (Spawn)", "Cooperative Play", "DukeMatch (No Spawn)", "Team DM (Spawn)", "Team DM (No Spawn)", "Last Man Standing", "Co-op No Respawn" };
 #else
 char    g_volumeNames[MAXVOLUMES][33];
 char    g_skillNames[MAXSKILLS][33];
 char    g_gametypeNames[MAXGAMETYPES][33]
-= { "Deathmatch (Spawn)", "Cooperative Play", "Deathmatch (No Spawn)", "Team DM (Spawn)", "Team DM (No Spawn)" };
+= { "Deathmatch (Spawn)", "Cooperative Play", "Deathmatch (No Spawn)", "Team DM (Spawn)", "Team DM (No Spawn)", "Last Man Standing", "Co-op No Respawn" };
 #endif
 
 int32_t g_volumeFlags[MAXVOLUMES];
@@ -88,6 +88,30 @@ int32_t g_gametypeFlags[MAXGAMETYPES] =
     GAMETYPE_ACCESSATSTART |
     GAMETYPE_TDM |
     GAMETYPE_TDMSPAWN,
+
+    // [5] Last Man Standing: Deathmatch rules + limited lives / elimination
+    // (enforced in the respawn path, gated on GAMETYPE_LMS).
+    GAMETYPE_FRAGBAR |
+    GAMETYPE_SCORESHEET |
+    GAMETYPE_DMSWITCHES |
+    GAMETYPE_ITEMRESPAWN |
+    GAMETYPE_ACCESSATSTART |
+    GAMETYPE_LMS,
+
+    // [6] Co-op (No Respawn): identical to Cooperative Play but a death is
+    // permanent for the level -- no mid-level respawn (gated on
+    // GAMETYPE_NORESPAWN in VM_ResetPlayer); the next level revives everyone.
+    GAMETYPE_COOP |
+    GAMETYPE_WEAPSTAY |
+    GAMETYPE_COOPSPAWN |
+    GAMETYPE_ACCESSCARDSPRITES |
+    GAMETYPE_COOPVIEW |
+    GAMETYPE_COOPSOUND |
+    GAMETYPE_OTHERPLAYERSINMAP |
+    GAMETYPE_PLAYERSFRIENDLY |
+    GAMETYPE_FIXEDRESPAWN |
+    GAMETYPE_PRESERVEINVENTORYDEATH |
+    GAMETYPE_NORESPAWN,
 };
 
 int32_t g_frameStackSize = DRAWFRAME_DEFAULT_STACK_SIZE;
@@ -99,7 +123,7 @@ int32_t g_itemRespawnTime    = 768;
 
 int32_t g_morterRadius       = 2500;
 int32_t g_numFreezeBounces   = 3;
-int32_t g_gametypeCnt       = 5;
+int32_t g_gametypeCnt       = 7;   // + Last Man Standing + Co-op No Respawn
 int32_t g_volumeCnt         = 3;
 int32_t g_pipebombRadius     = 2500;
 int32_t g_playerFriction     = 0xCFD0;

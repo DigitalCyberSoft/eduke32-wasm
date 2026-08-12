@@ -215,7 +215,8 @@ void Net_SeatBots(int minPlayers, int skill); // host: fill seats up to the floo
 input_t Net_BotInput(void);       // bot input for the LOCAL peer (test mode)
 void Net_SendStateSnap(int k);    // host: in-place RNG+player correction to one guest
 int  Net_CorrectDivergence(int k);// host: correction ladder (soft snaps -> snapshot heal)
-void Net_ApplyPendingStateSnap(void); // guest: consume stashed snap at its stamped tic
+void Net_ApplyPendingStateSnap(void);
+void Net_SmoothRemoteSeats(void); // guest: consume stashed snap at its stamped tic
 
 //OLDNET_EXTERN PredictBackup_t predictBackup[MOVEFIFOSIZ];
 
@@ -261,6 +262,7 @@ enum DukePacket_t
     PACKET_TYPE_STATE_SNAP,   // host -> diverged guest: in-place RNG+player correction (no reload)
     PACKET_TYPE_SPRITE_STREAM, // host -> guest: continuous authoritative sprite deltas (stream mode)
     PACKET_TYPE_SECTOR_STREAM, // host -> guest: sector ceiling/floor heights (doors are host-owned)
+    PACKET_TYPE_HIT_REPORT,    // guest -> host: CLIENT-AUTHORITATIVE hitscan damage the guest dealt locally
     PACKET_END, // Should remain last in list.
 };
 

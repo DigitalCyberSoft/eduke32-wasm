@@ -84,6 +84,14 @@ int32_t inputchecked = 0;
 
 char quitevent=0, appactive=1, novideo=0;
 
+// After a focus change (alt+tab), re-entering relative-mouse mode / pointer lock
+// can deliver a spurious large motion delta that permanently offsets the aim
+// (user 2026-08-12: "if I alt+tab out ... the center of the screen drifts from
+// the aiming center"). Swallow this many motion events after refocus so the aim
+// stays put. In relative mode g_mousePos is a per-frame delta, so a single
+// leaked jump becomes a permanent view rotation -- hence the discard.
+static int s_mouseRefocusSkip = 0;
+
 // video
 static SDL_Surface *sdl_surface/*=NULL*/;
 
@@ -2369,6 +2377,11 @@ int32_t handleevents_sdlcommon(SDL_Event *ev)
             //  <VER> is 1.3 for PK, 1.2 for tueidj
             if (appactive && g_mouseGrabbed)
             {
+                if (s_mouseRefocusSkip > 0)   // discard the post-alt+tab re-lock jump
+                {
+                    s_mouseRefocusSkip--;
+                    break;
+                }
 # if SDL_MAJOR_VERSION < 2
                 if (ev->motion.x != xdim >> 1 || ev->motion.y != ydim >> 1)
 # endif
@@ -2763,6 +2776,12 @@ int32_t handleevents_pollsdl(void)
                         appactive = (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED);
                         if (g_mouseGrabbed && g_mouseEnabled)
                             grabmouse_low(appactive);
+                        // Re-sync the mouse across the focus change: drop any
+                        // accumulated delta and swallow the next few motion
+                        // events (the pointer-lock re-acquisition jump) so the
+                        // aim center doesn't drift after alt+tab.
+                        g_mousePos.x = g_mousePos.y = 0;
+                        s_mouseRefocusSkip = 3;
 #ifdef _WIN32
                         windowsHandleFocusChange(appactive);
 #endif

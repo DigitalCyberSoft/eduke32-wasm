@@ -113,8 +113,13 @@ int32_t I_MenuDown(void)
 int32_t I_MenuLeft(void) { return CONTROL_GetUserInput(nullptr)->dir == dir_Left || BUTTON(gamefunc_Turn_Left) || BUTTON(gamefunc_Strafe_Left); }
 int32_t I_MenuRight(void) { return CONTROL_GetUserInput(nullptr)->dir == dir_Right || BUTTON(gamefunc_Turn_Right) || BUTTON(gamefunc_Strafe_Right); }
 
-int32_t I_SliderLeft(void) { return I_MenuLeft() || /*MOUSEACTIVECONDITIONAL*/(MOUSE_GetButtons() & M_WHEELDOWN); }
-int32_t I_SliderRight(void) { return I_MenuRight() || /*MOUSEACTIVECONDITIONAL*/(MOUSE_GetButtons() & M_WHEELUP); }
+// The mouse wheel used to double as slider adjust (wheel over a focused slider
+// changed its value). That fights the wheel-scrolls-the-menu behavior the user
+// wants (2026-08-12: "the scrollwheel shouldn't change slider values ... I'm
+// only trying to scroll the menu"), so the wheel is OFF here -- sliders adjust
+// with Left/Right only, and the wheel is free to scroll the entry list.
+int32_t I_SliderLeft(void) { return I_MenuLeft(); }
+int32_t I_SliderRight(void) { return I_MenuRight(); }
 
 int32_t I_PanelUp(void) { return I_MenuUp() || I_MenuLeft() || KB_KeyPressed(sc_PgUp); }
 int32_t I_PanelDown(void) { return I_MenuDown() || I_MenuRight() || KB_KeyPressed(sc_PgDn); }

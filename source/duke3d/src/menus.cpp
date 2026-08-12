@@ -1799,17 +1799,22 @@ void netmenu_send_snapshot_to(int seatMask, int slot, int plc, int isJoin)
 // ud.monsters_off, game.cpp:3538). No gametype picker yet -> hardcode DM (coop 0,
 // global.cpp:44). Net_SendNewGame also broadcasts the SEAT MASK (oldnet.cpp) so
 // guests learn the authoritative session roster.
-static int32_t s_netMinPlayers = 8; // host-chosen match-size FLOOR (1..8): CPU
+static int32_t s_netMinPlayers = 2; // host-chosen match-size FLOOR (1..8): CPU
                                     // players fill only the seats humans leave
                                     // empty, and yield them as humans join.
-                                    // FULL-ARENA default (live directive, told
-                                    // twice: "you need more bots... 2 people is
-                                    // not enough") -- discovery can strand a
-                                    // small human count, so every match ships
-                                    // with all 8 seats fighting from tic 0.
-static int32_t s_netBotSkill = 2;   // host-chosen CPU skill (0..2); default Hard
-                                    // (2 -- the old "1" was actually Medium, whose
-                                    // wobble read as "shit job at aiming", live)
+                                    // Default 2 (live directive 2026-08-12 "make
+                                    // the default min players 2"): a lone human
+                                    // host fills to a 1-on-1 vs one CPU, and the
+                                    // host raises the floor in the menu for a
+                                    // fuller arena. Test/keeper hosts still set
+                                    // their own floor via Web_SetMinPlayers, so
+                                    // this default only affects menu-hosted games.
+static int32_t s_netBotSkill = 2;   // host-chosen CPU skill (0..3), indexes the
+                                    // Duke skill names: 0 Piece Of Cake / 1 Let's
+                                    // Rock / 2 Come Get Some / 3 Damn I'm Good.
+                                    // Default 2 = "Come Get Some" -- the tuned hard
+                                    // tier (Let's Rock's wobble read as "shit job
+                                    // at aiming", live).
 
 #ifdef __EMSCRIPTEN__
 // Test-harness knob: lean fills for probe/keeper hosts ("4 is enough, and you
@@ -1818,6 +1823,14 @@ static int32_t s_netBotSkill = 2;   // host-chosen CPU skill (0..2); default Har
 extern "C" void Web_SetMinPlayers(int n)
 {
     s_netMinPlayers = clamp(n, 1, MAXPLAYERS);
+}
+// Test-harness knob: force the hosted-match gametype without driving the menu
+// widget (0 Deathmatch / 1 Cooperative / 2 DM-no-spawn / 3-4 Team DM / 5 Last
+// Man Standing). netmenu_relaunch reads ud.m_coop; the human host picks the same
+// field via ME_NET_CFG_GAMETYPE. Lets a headless arena verify each mode.
+extern "C" void Web_SetGametype(int gt)
+{
+    ud.m_coop = clamp(gt, 0, g_gametypeCnt - 1);
 }
 #endif
 
@@ -1832,9 +1845,27 @@ static void netmenu_relaunch(int vol, int lev)
         Net_SeatBots(s_netMinPlayers, s_netBotSkill);
     ud.multimode            = numplayers;
     g_mostConcurrentPlayers = ud.multimode;
-    ud.m_coop               = 0;   // gametype 0 = Deathmatch (spawn)
-    ud.m_monsters_off       = 1;   // no monsters in deathmatch
-    ud.m_player_skill       = 0;
+    // GAME TYPE is now the host's menu pick (ME_NET_CFG_GAMETYPE -> ud.m_coop),
+    // propagated to guests via Net_SendNewGame. Monsters are DERIVED: on in
+    // Cooperative, off in every deathmatch/TDM variant (the guest twin of this
+    // derive lives in the NEW_GAME handler, oldnet.cpp -- monsters_off is NOT a
+    // networked field, so both peers must compute it from the gametype).
+    ud.m_coop               = clamp(ud.m_coop, 0, g_gametypeCnt - 1);
+    ud.m_monsters_off       = (g_gametypeFlags[ud.m_coop] & GAMETYPE_COOP) ? 0 : 1;
+    // Coop is REGULAR STORY MODE: killed monsters stay dead (user 2026-08-12
+    // "coop ... should not be respawning monsters"). This field is otherwise
+    // inherited from whatever a prior single-player session left -- a skill-4
+    // game or the menu toggle could carry respawn=1 straight into coop. Force
+    // it off for every menu-hosted match; premap.cpp copies it to respawn_monsters.
+    ud.m_respawn_monsters   = 0;
+    // FRIENDLY FIRE OFF in coop. A_IncurDamage's PLAYERSFRIENDLY nullify is
+    // GATED on ud.ffire==0, but ffire defaults to 1 (cmdline.cpp) and nothing
+    // here cleared it -- so a coop bot's shot still killed a teammate (user
+    // 2026-08-12: "the bot targeted me and killed me"). DM keeps ffire on
+    // (no teammates to protect); coop turns it off so allies can't hurt allies.
+    if (g_gametypeFlags[ud.m_coop] & GAMETYPE_COOP)
+        ud.m_ffire = 0;
+    ud.m_player_skill       = (g_gametypeFlags[ud.m_coop] & GAMETYPE_COOP) ? 2 : 0;   // coop needs a real skill for monsters
     if (numplayers > 1)
     {
         // Guests enter locally (legacy path). The launch-via-snapshot attempt
@@ -1887,8 +1918,19 @@ static MenuOption_t MEO_NET_CFG_LOCALONLY = MAKE_MENUOPTION( &MF_Bluefont, &MEOS
 static MenuEntry_t ME_NET_CFG_LOCALONLY = MAKE_MENUENTRY( "Local Only", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_LOCALONLY, Option );
 static MenuRangeInt32_t MEO_NET_CFG_BOTS = MAKE_MENURANGE( &s_netMinPlayers, &MF_Bluefont, 1, 8, 0, 8, DisplayTypeInteger|EnforceIntervals );
 static MenuEntry_t ME_NET_CFG_BOTS = MAKE_MENUENTRY( "Min Players", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_BOTS, RangeInt32 );
-static char const *MEOSN_NET_BOTSKILL[] = { "Easy", "Medium", "Hard", };
-static MenuOptionSet_t MEOS_NET_BOTSKILL = MAKE_MENUOPTIONSET( MEOSN_NET_BOTSKILL, NULL, 0x7 );
+// CPU skill labels mirror the game's OWN skill names (user: "the CPU skills
+// should match the regular game levels: piece of cake, lets rock, come get
+// some, damn i'm good"). The classic four are the compiled-in default; at menu
+// init (Menu_Init) each slot is refreshed from g_skillNames so a CON that
+// renames skills is followed exactly. Four FIXED tiers -> the bot brain tunes
+// 0..3 (oldnet.cpp) regardless of how many *player* skills a CON defines.
+static char const *MEOSN_NET_BOTSKILL[4] = { "Piece Of Cake", "Let's Rock", "Come Get Some", "Damn I'm Good" };
+// features 0x2: Enter cycles to the next value; binary search over the identity
+// map. It must NOT set 0x4 -- that bit forces Menu_FindOptionLinearSearch, which
+// reads optionValues[] (NULL for an identity map) and made every value miss ->
+// the entry rendered the "CVAR" placeholder and only ever toggled cvar/first.
+// 0x2 mirrors the Off/On toggles above, which work.
+static MenuOptionSet_t MEOS_NET_BOTSKILL = MAKE_MENUOPTIONSET( MEOSN_NET_BOTSKILL, NULL, 0x2 );
 static MenuOption_t MEO_NET_CFG_BOTSKILL = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_NET_BOTSKILL, &s_netBotSkill );
 static MenuEntry_t ME_NET_CFG_BOTSKILL = MAKE_MENUENTRY( "CPU Skill", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_BOTSKILL, Option );
 // Episode selector: shares the init-populated episode name/value arrays but NOT the
@@ -1903,10 +1945,15 @@ static MenuEntry_t ME_NET_CFG_EPISODE = MAKE_MENUENTRY( "Episode", &MF_Redfont, 
 // MENU_NETOPTIONS pattern); bound to ud.m_level_number.
 static MenuOption_t MEO_NET_CFG_LEVEL = MAKE_MENUOPTION( &MF_Bluefont, NULL, &ud.m_level_number );
 static MenuEntry_t ME_NET_CFG_LEVEL = MAKE_MENUENTRY( "Level", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_LEVEL, Option );
+// Game Type picker (user "add a menu type: deathmatch, last man standing, coop").
+// Reuses the option set populated from g_gametypeNames at init (MEOSN_NetGametypes);
+// bound to ud.m_coop, which netmenu_relaunch now propagates instead of hardcoding.
+static MenuOption_t MEO_NET_CFG_GAMETYPE = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_NETOPTIONS_GAMETYPE, &ud.m_coop );
+static MenuEntry_t ME_NET_CFG_GAMETYPE = MAKE_MENUENTRY( "Game Type", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_GAMETYPE, Option );
 static MenuLink_t MEO_NET_CFG_START = { MENU_NET_LOBBY, MA_Advance, };
 static MenuEntry_t ME_NET_CFG_START = MAKE_MENUENTRY( "Start", &MF_Redfont, &MEF_VideoSetup_Apply, &MEO_NET_CFG_START, Link );
 static MenuEntry_t *MEL_NET_HOSTCFG[] = {
-    &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_EPISODE, &ME_NET_CFG_LEVEL, &ME_NET_CFG_SHARE, &ME_NET_CFG_LOCALONLY, &ME_NET_CFG_BOTS, &ME_NET_CFG_BOTSKILL, &ME_NET_CFG_START,
+    &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_GAMETYPE, &ME_NET_CFG_EPISODE, &ME_NET_CFG_LEVEL, &ME_NET_CFG_SHARE, &ME_NET_CFG_LOCALONLY, &ME_NET_CFG_BOTS, &ME_NET_CFG_BOTSKILL, &ME_NET_CFG_START,
 };
 
 // CHANGE MAP (host, in-game): same Episode/Level pickers; Warp relaunches every
@@ -2825,6 +2872,14 @@ void Menu_Init(void)
     MEOS_NETOPTIONS_MONSTERS.numOptions = g_maxDefinedSkill + 1;
     MEOSN_NetSkills[g_maxDefinedSkill] = MenuSkillNone;
     MMF_Top_Skill.pos.y = (58 + (4 - g_maxDefinedSkill)*6)<<16;
+
+    // The host's "CPU Skill" picker reads the same labels as the regular
+    // difficulty select (user: "the CPU skills should match the regular game
+    // levels"). Four fixed tiers map onto the bot brain's 0..3 tuning; a skill
+    // slot the CON leaves unnamed keeps its classic compiled-in fallback.
+    for (i = 0; i < 4; ++i)
+        if (i < g_maxDefinedSkill && g_skillNames[i][0])
+            MEOSN_NET_BOTSKILL[i] = g_skillNames[i];
 
     // If no skills defined, skill menu will be skipped and default skill is used.
     if (!g_maxDefinedSkill)
@@ -8792,6 +8847,30 @@ static void Menu_RunInput(Menu_t *cm)
                     S_PlaySound(KICK_HIT);
 
                     currentry = Menu_RunInput_Menu_Movement(menu, MM_Down);
+                }
+                // Mouse wheel scrolls a standard (non-List) menu -- one entry per
+                // notch, and it CLAMPS at the ends instead of wrapping (user
+                // 2026-08-12: "scroll in the direction defined then stop"). It
+                // moves the selection, so scrollPos keeps it in view; a menu
+                // taller than its window scrolls. It does NOT change slider or
+                // option values -- I_Slider* no longer read the wheel. List
+                // menus keep their page-of-6 wheel jump in the block below.
+                else if (cm->type != List && (MOUSE_GetButtons() & (M_WHEELUP | M_WHEELDOWN)))
+                {
+                    int const up = (MOUSE_GetButtons() & M_WHEELUP) != 0;
+                    MOUSE_ClearButton(M_WHEELUP);
+                    MOUSE_ClearButton(M_WHEELDOWN);
+
+                    int e = menu->currentEntry;
+                    do { e += up ? -1 : 1; }
+                    while (e >= 0 && e < menu->numEntries && !Menu_IsEntryActive(menu->entrylist[e]));
+
+                    if (e >= 0 && e < menu->numEntries)   // an active entry that way -- else already at an end, stop
+                    {
+                        menu->currentEntry = e;
+                        S_PlaySound(KICK_HIT);
+                        currentry = Menu_RunInput_Menu_MovementVerify(menu);
+                    }
                 }
                 else if (KB_KeyPressed(sc_PgUp) || MOUSE_GetButtons() & M_WHEELUP)
                 {

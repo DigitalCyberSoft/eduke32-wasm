@@ -89,7 +89,8 @@ static int Net_EnterText(int /*x*/, int /*y*/, char * /*t*/, int /*dalen*/, int 
 // and difficulty are host-decided by construction. Sync-safe: inputs travel,
 // the sim stays identical everywhere.
 int32_t g_netBotMask;        // slots that are CPU seats (host-authoritative)
-int32_t g_netBotSkill = 2;   // 0 easy / 1 medium / 2 hard (host-side only).
+int32_t g_netBotSkill = 2;   // CPU skill 0..3, indexes the Duke skill names
+                             // (0 Piece Of Cake .. 3 Damn I'm Good); host-side only.
                              // Default HARD: medium's wobble read as "an
                              // absolute shit job at aiming" (live report).
 int32_t g_netMinPlayers = 5; // host's match-size floor: bots fill up to this
@@ -120,9 +121,55 @@ static void oldnet_sendpacket(int other, unsigned char *bufptr, int len)
             reliable = 0;
             break;
 
+        // THE OPENARENA SNAPSHOT MODEL. STATE_SNAP is an ABSOLUTE, self-
+        // contained repaint of every player's position/score every 10 tics;
+        // SECTOR_STREAM is absolute door/floor heights re-sent each pass. Both
+        // self-heal on the NEXT send, so they belong on the UNRELIABLE channel
+        // exactly like Q3/OpenArena snapshots. Sending them reliable-ordered
+        // (the old default) meant any single lost or delayed packet
+        // HEAD-OF-LINE-BLOCKED the entire state stream: on a real WebRTC link
+        // with jitter/loss (or an ICE hiccup -- observed live) every remote
+        // player FROZE until the retransmit landed, then snapped. Localhost
+        // (no loss) never showed it, so it survived every client-side
+        // smoothing rewrite -- the smoother can't help when the targets stop
+        // arriving. Unreliable = a dropped snapshot is simply skipped and the
+        // next one (33ms later) carries current truth.
+        case PACKET_TYPE_STATE_SNAP:
+        case PACKET_TYPE_SECTOR_STREAM:
+            if (g_netStreamMode)
+            {
+                channel  = NET_CHAN_MOVE;
+                reliable = 0;
+            }
+            else                        // legacy lockstep: the snap carries RNG
+            {                           // correction that MUST arrive in order
+                channel  = NET_CHAN_REL;
+                reliable = 1;
+            }
+            break;
+
+        // SPRITE_STREAM stays reliable-ordered for now: its records are
+        // absolute and self-heal via the keyframe sweep, BUT it also carries
+        // DELETE records (a picked-up item, a destroyed prop) that must not be
+        // lost or the guest keeps a ghost forever. The proper fix is to split
+        // it -- kinematic/position records unreliable, delete/identity records
+        // reliable -- which is the Q3 "unreliable snapshot + reliable
+        // reliable-commands" split. Tracked as the next step; decoupling
+        // STATE_SNAP above already frees PLAYER motion from this channel.
+
         case PACKET_TYPE_USER_MAP:
         case PACKET_TYPE_LOAD_GAME:
             channel  = NET_CHAN_BULK;   // potentially large: isolated bulk channel
+            reliable = 1;
+            break;
+
+        case PACKET_TYPE_HIT_REPORT:
+            // Client-authoritative damage: SPARSE (a few per shot, not per-tic)
+            // and gameplay-critical -- a lost report is lost damage, the exact
+            // bug this fixes. Reliable. It rides guest->host, where NET_CHAN_REL
+            // carries only sparse control (votes/chat), so there is no head-of-
+            // line coupling with the heavy host->guest SPRITE_STREAM.
+            channel  = NET_CHAN_REL;
             reliable = 1;
             break;
 
@@ -524,6 +571,8 @@ static int32_t  s_pendingSnapTic;
 // Stream-mode machinery (defined after Net_ApplyPendingStateSnap).
 static void Net_StreamAuthoritativeState(void);
 static void Net_ApplySpriteStream(const char *buf, int len);
+static void Net_ClientPickupScan(void);   // guest client-authoritative item pickup
+static void Net_ApplyHitReport(int attacker, int victim, int dmg, int weaponPic);  // host: apply a guest's reported hit
 static void Net_ApplySectorStream(const char *buf, int len);
 // NEW_GAME delivery hardening: a real browser can still be BOOTING the wasm
 // when the host launches (live: join_ok -> launch within 1s; the guest's
@@ -554,7 +603,12 @@ static inline uint32_t Bot_Rnd(void)
 static int8_t  s_botStrafeDir[MAXPLAYERS];
 static int16_t s_botWanderAng[MAXPLAYERS];
 static int16_t s_botThinkHold[MAXPLAYERS];   // reaction: tics until retarget allowed
-static int8_t  s_botTarget[MAXPLAYERS];
+static int8_t  s_botTarget[MAXPLAYERS];    // PLAYER index the bot is fighting (DM/TDM). -1 none.
+// COOP target is a MONSTER, i.e. a SPRITE index -- which overflows the int8
+// player target above (MAXSPRITES >> 127), so it needs its own int16 slot. In
+// Cooperative the bot is player-BLIND (never targets or revenge-attacks a human
+// teammate, user 2026-08-12) and fights this enemy sprite instead. -1 = none.
+static int16_t s_botMonTgt[MAXPLAYERS];
 // Waypoint-free navigation: stuck detection + wall-bounce + door press.
 static vec2_t  s_botLastPos[MAXPLAYERS];
 static int16_t s_botStuckTics[MAXPLAYERS];
@@ -655,6 +709,9 @@ static int16_t s_botGoalItem[MAXPLAYERS];    // sprite index of the item errand
 static int16_t s_botItemShun[MAXPLAYERS];    // last item that refused pickup (full hp etc.)
 static int16_t s_botPrevSect[MAXPLAYERS];    // sector this room was entered FROM
 static int16_t s_botSightTics[MAXPLAYERS];   // tics since the target was last actually seen
+static int8_t  s_botPending[MAXPLAYERS];     // candidate being NOTICED (pre-lock awareness)
+static int16_t s_botSeeStreak[MAXPLAYERS];   // tics the pending candidate has held LOS
+static int16_t s_botLastWacked[MAXPLAYERS];  // last wackedbyactor sprite seen (new wound -> retaliate)
 static int32_t s_botJumps[MAXPLAYERS];       // telemetry: total jump presses (the user meter)
 static int8_t  s_botGoalSeen[MAXPLAYERS];    // walk line to errand: 0 unknown, 1 clear, -1 blocked
 static int8_t  s_botNavSeen[MAXPLAYERS];     // walk line to chase waypoint, same encoding
@@ -662,6 +719,19 @@ static int16_t s_botJumpCool[MAXPLAYERS];    // hard floor between jumps (water 
 static int16_t s_botLaneAng[MAXPLAYERS];     // furniture-field lane heading
 static int16_t s_botLaneHold[MAXPLAYERS];    // tics left committed to the lane
 static uint8_t s_botThreadFails[MAXPLAYERS]; // stuck trips while goal line was "clear"
+// IMPOSSIBLE-EXIT memory (user 2026-08-12: "stop it trying to go to impossible
+// to reach exits"). The explore planner scores portals by staleness, and a
+// sector the bot CAN'T reach is never stamped -> it stays the stalest thing in
+// the room and gets re-picked forever. Two defenses: (1) a per-errand progress
+// watch abandons a goal that stops closing (see the upkeep block) in ~3s
+// instead of the 13s timeout; (2) this small per-bot ring remembers the target
+// sectors those abandonments hit, so the planner steers to a DIFFERENT door for
+// a while. Ring, not a full [MAXSECTORS] table: a room has a handful of exits.
+#define BOT_DEAD_N 8
+static int16_t s_botDeadSect[MAXPLAYERS][BOT_DEAD_N]; // recently-unreachable target sectors
+static int16_t s_botDeadCool[MAXPLAYERS][BOT_DEAD_N]; // tics of avoidance left (0 = slot free)
+static int32_t s_botGoalNear[MAXPLAYERS];    // closest we have come to the current goal
+static int16_t s_botGoalStall[MAXPLAYERS];   // tics since that closest approach improved
 
 // Probe the straight WALK line to (tx,ty): can the feet take the direct path?
 // Follow-until-clear steering hangs off this -- goal-directed turning is only
@@ -718,18 +788,23 @@ static int Bot_LineWalkFrom(int16_t sect, int32_t x, int32_t y, int32_t z,
     if (klabs(h.xyz.x - x) + klabs(h.xyz.y - y) + 384 < wd)
         return 0;
     int32_t const dx = tx - x, dy = ty - y;
-    int const steps = min(16, (int)(min(wd, 4096) >> 8));
+    // Sample FINELY -- ~every 64 units -- so a STAIRCASE (small steps close
+    // together) is walked step by step instead of read as one tall wall by a
+    // coarse sample that straddles several steps. Per-step limit is the
+    // player's real autostep (20<<8, premap.cpp:738); anything taller in a
+    // single 64-unit sample is a true wall.
+    int const steps = clamp((int)(wd >> 6), 1, 48);
     int16_t cs = sect;
     int32_t lastF = getflorzofslope(cs, x, y);
     for (int i = 1; i <= steps; i++)
     {
-        int32_t const sx = x + (int32_t)(((int64_t)dx * (i << 8)) / max(wd, 1));
-        int32_t const sy = y + (int32_t)(((int64_t)dy * (i << 8)) / max(wd, 1));
+        int32_t const sx = x + (int32_t)(((int64_t)dx * i) / steps);
+        int32_t const sy = y + (int32_t)(((int64_t)dy * i) / steps);
         updatesector(sx, sy, &cs);
         if (cs < 0)
             return 0;
         int32_t const f = getflorzofslope(cs, sx, sy);
-        if (lastF - f > (18 << 8))      // z grows down: a step UP too tall
+        if (lastF - f > (20 << 8))      // z grows down: a step UP beyond autostep
             return 0;
         lastF = f;
     }
@@ -738,6 +813,36 @@ static int Bot_LineWalkFrom(int16_t sect, int32_t x, int32_t y, int32_t z,
 static int Bot_LineWalkable(DukePlayer_t *ps, int32_t tx, int32_t ty)
 {
     return Bot_LineWalkFrom(ps->cursectnum, ps->pos.x, ps->pos.y, ps->pos.z, tx, ty);
+}
+
+// Floor-only climb check for nav-mesh edges (no wall ray -- Nvg_SegBlocked
+// handles walls). Walks (x0,y0)->(x1,y1) at ~64-unit resolution; every
+// step-up must be within the player's autostep, so a flight of STAIRS
+// connects the cells it spans while a wall/cliff does not.
+static int Bot_FineClimb(int16_t sect0, int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+{
+    if ((unsigned)sect0 >= (unsigned)numsectors)
+        return 0;
+    int32_t const dx = x1 - x0, dy = y1 - y0;
+    int32_t const wd = klabs(dx) + klabs(dy);
+    if (wd < 32)
+        return 1;
+    int const steps = clamp((int)(wd >> 6), 1, 16);
+    int16_t cs = sect0;
+    int32_t lastF = getflorzofslope(cs, x0, y0);
+    for (int i = 1; i <= steps; i++)
+    {
+        int32_t const sx = x0 + (int32_t)(((int64_t)dx * i) / steps);
+        int32_t const sy = y0 + (int32_t)(((int64_t)dy * i) / steps);
+        updatesector(sx, sy, &cs);
+        if (cs < 0)
+            return 0;
+        int32_t const f = getflorzofslope(cs, sx, sy);
+        if (lastF - f > (20 << 8))
+            return 0;
+        lastF = f;
+    }
+    return 1;
 }
 
 // ── OpenArena-style navigation, take two: FLOOR COVERAGE, not a skeleton
@@ -860,10 +965,17 @@ static void Bot_NavBuild(void)
                     && Nvg_SegBlocked(s_nvgSect[u], cx, cy, ux, uy))
                     continue;
                 int32_t const fB = getflorzofslope(s_nvgSect[u], ux, uy);
-                // z grows down: climbing means destination floor SMALLER.
-                if (fA - fB <= (18 << 8))
+                // z grows down: climbing means destination floor SMALLER. A
+                // single step within autostep connects trivially; a larger
+                // rise is only passable if it is a STAIRCASE -- Bot_FineClimb
+                // walks it at ~64-unit resolution and each step must be within
+                // autostep (so a flight of stairs connects, a wall does not).
+                int32_t const riseAB = fA - fB, riseBA = fB - fA;
+                if (riseAB <= (20 << 8)
+                    || (riseAB <= (200 << 8) && Bot_FineClimb(s_nvgSect[t], cx, cy, ux, uy)))
                     s_nvgPass[t] |= (uint8_t)(d == 0 ? 1 : 4);      // t -> u
-                if (fB - fA <= (18 << 8))
+                if (riseBA <= (20 << 8)
+                    || (riseBA <= (200 << 8) && Bot_FineClimb(s_nvgSect[u], ux, uy, cx, cy)))
                     s_nvgPass[u] |= (uint8_t)(d == 0 ? 2 : 8);      // u -> t
             }
         }
@@ -1068,6 +1180,92 @@ static int Bot_SectorIsDoor(int s)
     return 0;
 }
 
+// --- impossible-exit ring (see the s_botDead* declarations) -------------------
+// Mark a target sector the bot just failed to reach; it will be avoided by the
+// explore planner until the cooldown decays (or the bot actually enters it,
+// which proves it reachable and clears the mark). LRU-evicts the coolest slot.
+static void Bot_MarkDeadExit(int k, int sect)
+{
+    if ((unsigned)sect >= (unsigned)numsectors)
+        return;
+    int slot = -1, lru = 0;
+    for (int i = 0; i < BOT_DEAD_N; i++)
+    {
+        if (s_botDeadSect[k][i] == sect && s_botDeadCool[k][i] > 0) { slot = i; break; }
+        if (s_botDeadCool[k][i] < s_botDeadCool[k][lru]) lru = i;
+    }
+    if (slot < 0) slot = lru;
+    s_botDeadSect[k][slot] = (int16_t)sect;
+    s_botDeadCool[k][slot] = 2400;   // ~80s at 30Hz; clear-on-entry cuts it short
+}
+static int Bot_DeadExitActive(int k, int sect)
+{
+    for (int i = 0; i < BOT_DEAD_N; i++)
+        if (s_botDeadSect[k][i] == sect && s_botDeadCool[k][i] > 0)
+            return 1;
+    return 0;
+}
+static void Bot_ClearDeadExit(int k, int sect)
+{
+    for (int i = 0; i < BOT_DEAD_N; i++)
+        if (s_botDeadSect[k][i] == sect)
+            s_botDeadCool[k][i] = 0;
+}
+
+// COOP target-find: the nearest enemy MONSTER in line of sight. In Cooperative
+// the bot fights monsters and NEVER its human teammates (user 2026-08-12: "it
+// should be trying to kill monsters, not players ... never revenge attack
+// another player"). Brief pursuit memory holds the last enemy through short
+// occlusion, mirroring the DM player-chase. Returns a sprite index, or -1.
+static int Bot_AcquireMonster(int k, DukePlayer_t *ps)
+{
+    int best = -1;
+    int32_t bestd = INT32_MAX;
+    for (int i = headspritestat[STAT_ACTOR]; i >= 0; i = nextspritestat[i])
+    {
+        auto const &s = sprite[i];
+        if (s.extra <= 0 || (s.cstat & 32768) || !A_CheckEnemySprite(&s)
+            || (unsigned)s.sectnum >= (unsigned)numsectors)
+            continue;
+        int32_t const d = klabs(s.x - ps->pos.x) + klabs(s.y - ps->pos.y) + (klabs(s.z - ps->pos.z) >> 2);
+        if (d >= bestd)
+            continue;
+        if (!cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum, s.x, s.y, s.z - (8 << 8), s.sectnum))
+            continue;
+        bestd = d; best = i;
+    }
+    if (best < 0)   // pursuit memory: keep the last enemy briefly through occlusion
+    {
+        int const m = s_botMonTgt[k];
+        if ((unsigned)m < MAXSPRITES && sprite[m].extra > 0 && A_CheckEnemySprite(&sprite[m])
+            && s_botSightTics[k] < 130)
+            best = m;
+    }
+    return best;
+}
+
+// Nearest HUMAN teammate (a connected, non-CPU, living player) to bot k. In
+// coop the bot escorts the humans -- it navigates toward the nearest one when
+// idle instead of exploring the whole level (user 2026-08-12: "navigate nearby
+// the player until it sees an enemy"). Returns a player index, or -1.
+static int Bot_NearestHuman(int k, DukePlayer_t *ps)
+{
+    int best = -1;
+    int32_t bestd = INT32_MAX;
+    extern int32_t g_netBotMask;
+    for (int i = 0; i < MAXPLAYERS; i++)
+    {
+        if (i == k || (g_netBotMask & (1 << i)) || !g_player[i].connected || g_player[i].ps == NULL)
+            continue;
+        auto const hp = g_player[i].ps;
+        if ((unsigned)hp->i >= MAXSPRITES || sprite[hp->i].extra <= 0 || hp->dead_flag)
+            continue;
+        int32_t const d = klabs(hp->pos.x - ps->pos.x) + klabs(hp->pos.y - ps->pos.y);
+        if (d < bestd) { bestd = d; best = i; }
+    }
+    return best;
+}
+
 // Pick the exit: score every portal of the current sector by the staleness of
 // what's behind it. The entry portal is the freshest by construction and gets
 // a further 16x haircut -- it is chosen only when it is the ONLY way out.
@@ -1114,6 +1312,17 @@ static int Bot_PlanExplore(int k, DukePlayer_t *ps)
         // one can still win, and follow-until-clear steering earns the rest.
         if (!Bot_LineWalkable(ps, mx, my))
             score >>= 6;
+        // A door we recently could not get through drops to the noise floor, so
+        // a DIFFERENT exit wins -- but it is a demotion, not a veto, so the sole
+        // way out of a room can still be taken rather than trapping the bot.
+        if (Bot_DeadExitActive(k, ns))
+            score >>= 8;
+        // Doors are ROAMING WAYPOINTS (user 2026-08-12): a modest bump so the
+        // bot actively routes through them (they lead to fresh rooms) now that
+        // it opens them on approach -- not so large it fixates or overrides a
+        // much staler open exit.
+        if (isDoor && !Bot_DeadExitActive(k, ns))
+            score += 400;
         score += (int32_t)(Bot_Rnd() & 255);        // tiebreak: twin bots split up
         if (score > bestScore)
             { bestScore = score; bestW = w; bestNs = ns; bestDoor = isDoor; bestCrouch = crouch; }
@@ -1284,6 +1493,7 @@ static input_t Bot_GetInput(int k)
         s_botSpawnRoam[k] = 0;
         s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
         s_botGoal[k]      = 0;      // spawned somewhere new: fresh errand
+        s_botMonTgt[k]    = -1;     // no coop monster lock across a respawn
         s_botGoalItem[k]  = -1;
         s_botItemShun[k]  = -1;
         s_botPrevSect[k]  = -1;     // teleported in -- no entry door to shun
@@ -1295,15 +1505,34 @@ static input_t Bot_GetInput(int k)
         s_botTrapTics[k]   = 0;
         s_botRouteLen[k]   = 0;             // routes don't survive teleports
         s_botRouteCool[k]  = 0;
+        for (int di = 0; di < BOT_DEAD_N; di++) // a teleport changes reachability:
+            s_botDeadCool[k][di] = 0;           // forget which exits were impossible
     }
 
-    int const skill = clamp(g_netBotSkill, 0, 2);
-    // Skill knobs: turn cap (ang units/tic), fire gate (max aim-off to shoot),
-    // aim wobble amplitude, reaction hold (tics between retarget decisions).
-    static int const turnCap[3]  = { 40, 72, 116 };
-    static int const fireGate[3] = { 56, 96, 160 };
-    static int const wobble[3]   = { 96, 48, 16 };
-    static int const holdMax[3]  = { 30, 16, 6 };
+    int const skill = clamp(g_netBotSkill, 0, 3);
+    // COOP: the bot is a teammate. It fights MONSTERS and is blind to human
+    // players -- no player target, no player revenge (user 2026-08-12: a coop
+    // bot "should never try to revenge attack another player"). Everything
+    // player-targeting below is gated on !botCoop; the coop branch hunts the
+    // nearest enemy sprite instead.
+    bool const botCoop = (g_gametypeFlags[ud.coop] & GAMETYPE_COOP) != 0;
+    // Skill knobs, one column per Duke difficulty the host picked:
+    //   0 Piece Of Cake / 1 Let's Rock / 2 Come Get Some / 3 Damn I'm Good.
+    // turn cap (ang units/tic), fire gate (max aim-off to shoot), aim wobble
+    // amplitude, reaction hold (tics between retarget decisions). Come Get Some
+    // (2) is the tuned "hard" default; Damn I'm Good (3) is the new hardest
+    // tier -- snappiest tracking, widest fire gate, least wobble, fastest hold.
+    static int const turnCap[4]  = { 40, 64, 84, 104 };  // CGS 104->84 (v39: bots snap
+                                                          // onto a strafing player slower --
+                                                          // "the bot killed me far easier");
+                                                          // DIG restores the 104 snap.
+    static int const fireGate[4] = { 56, 96, 160, 200 };
+    static int const wobble[4]   = { 96, 48, 24, 12 };   // CGS 16->24; DIG 12
+    static int const holdMax[4]  = { 30, 16, 6, 4 };
+    // LOS reaction delay: a newly-seen player must hold line of sight this
+    // many tics before the bot locks on -- until then it keeps roaming (user:
+    // "spend more time roaming and not notice players by LOS so quickly").
+    static int const reactTics[4] = { 60, 42, 26, 16 };  // ~2.0 / 1.4 / 0.87 / 0.53 s
 
     // Crossing into a new sector invalidates the plotted portal: re-plan now.
     // It also feeds the room memory: stamp where we are, remember where we
@@ -1315,6 +1544,7 @@ static input_t Bot_GetInput(int k)
         s_botThinkHold[k] = 0;
         s_botVisitT[k][ps->cursectnum] = movefifoplc;
         s_botThreadFails[k] = 0;    // real progress: the field is behind us
+        Bot_ClearDeadExit(k, ps->cursectnum);   // reached it -> it was reachable
         if (s_botGoal[k] == 1)
             s_botGoal[k] = 0;       // new room reached: pick its far exit fresh
     }
@@ -1322,11 +1552,147 @@ static input_t Bot_GetInput(int k)
         s_botVisitT[k][ps->cursectnum] = movefifoplc;   // lingering ages a room too
     if (s_botJumpCool[k] > 0)
         s_botJumpCool[k]--;
+    for (int di = 0; di < BOT_DEAD_N; di++)      // age out impossible-exit avoidance
+        if (s_botDeadCool[k][di] > 0)
+            s_botDeadCool[k][di]--;
+
+    // RETALIATION (user 2026-08-10: "if a bot is hit, it should change its
+    // targets to lock onto the new target"). Runs EVERY tic, ahead of the
+    // reaction-gated think block, so a wound re-locks instantly instead of
+    // waiting out the roam cadence. A NEW wound is a change in wackedbyactor to
+    // a live player that isn't already the target -- so repeated hits from the
+    // same attacker don't thrash, but a fresh attacker steals the lock.
+    {
+        int const wa = ps->wackedbyactor;
+        if (botCoop)
+        {
+            // Coop retaliation targets a MONSTER attacker only. A hit from a
+            // human teammate (stray shot, splash) NEVER makes the bot turn on a
+            // player -- it stays on monsters and roaming.
+            if ((unsigned)wa < MAXSPRITES && wa != s_botLastWacked[k] && wa != s_botMonTgt[k]
+                && sprite[wa].extra > 0 && A_CheckEnemySprite(&sprite[wa]))
+            {
+                s_botMonTgt[k]     = (int16_t)wa;   // lock the monster that hit us
+                s_botTargetHold[k] = 0;
+                s_botSightTics[k]  = 0;
+                s_botNoHitTics[k]  = 0;
+                s_botLastTDist[k]  = INT32_MAX;
+                s_botSpawnRoam[k]  = 0;
+                s_botThinkHold[k]  = (int16_t)(holdMax[skill] + (Bot_Rnd() % holdMax[skill]));
+            }
+            if ((unsigned)wa < MAXSPRITES)
+                s_botLastWacked[k] = (int16_t)wa;
+        }
+        else if ((unsigned)wa < MAXSPRITES && sprite[wa].picnum == APLAYER
+            && (unsigned)sprite[wa].yvel < MAXPLAYERS && sprite[wa].yvel != k)
+        {
+            int const atk = sprite[wa].yvel;
+            if (wa != s_botLastWacked[k] && atk != s_botTarget[k]
+                && g_player[atk].connected && g_player[atk].ps != NULL
+                && (unsigned)g_player[atk].ps->i < MAXSPRITES
+                && sprite[g_player[atk].ps->i].extra > 0)
+            {
+                s_botTarget[k]     = (int8_t)atk;   // hard-lock onto the attacker NOW
+                s_botTargetHold[k] = 0;
+                s_botSightTics[k]  = 0;             // treat as freshly sighted
+                s_botNoHitTics[k]  = 0;
+                s_botLastTDist[k]  = INT32_MAX;
+                s_botPending[k]    = -1;            // cancel any half-built acquisition
+                s_botSpawnRoam[k]  = 0;            // stop dispersing -- fight back
+                s_botThinkHold[k]  = (int16_t)(holdMax[skill] + (Bot_Rnd() % holdMax[skill]));
+            }
+            s_botLastWacked[k] = (int16_t)wa;
+        }
+    }
 
     // Reacquire target only when the hold expires (reaction time).
     if (--s_botThinkHold[k] <= 0)
     {
         s_botThinkHold[k] = (int16_t)(holdMax[skill] + (Bot_Rnd() % holdMax[skill]));
+        if (botCoop)
+        {
+            // COOP acquisition: hunt the nearest visible MONSTER, plot a mesh
+            // route to it, and drop the room errand so the fight is prosecuted.
+            // No monster in sight -> patrol via the explore planner (players are
+            // never hunted). This whole branch is player-blind by construction.
+            int const mon = Bot_AcquireMonster(k, ps);
+            s_botMonTgt[k] = (int16_t)mon;
+            s_botTarget[k] = -1;              // never a player target in coop
+            s_botNavOn[k]  = 0;
+            if (mon >= 0)
+            {
+                Bot_NavEnsure();
+                int const from = Nvg_Snap(ps->pos.x, ps->pos.y);
+                int const to   = Nvg_Snap(sprite[mon].x, sprite[mon].y);
+                static int16_t txx[4], tyy[4];
+                if (from >= 0 && to >= 0
+                    && (from == to || Bot_NvgPath(from, to, txx, tyy, 4) > 0))
+                {
+                    s_botNavOn[k]   = 1;
+                    s_botNavSeen[k] = 0;
+                    s_botNavX[k]    = sprite[mon].x;
+                    s_botNavY[k]    = sprite[mon].y;
+                }
+                s_botGoal[k] = 0;            // a monster to fight: drop the errand
+            }
+            else
+            {
+                // No monster in sight: ESCORT the humans -- but only APPROACH
+                // DIRECTLY when the bot can actually reach the nearest human
+                // (line of sight, i.e. the same room). If the human is in
+                // ANOTHER room, the bot ROAMS via the explore planner, which
+                // threads portals to find them, instead of beelining into the
+                // wall between the rooms (user 2026-08-12: "if the bot isn't in
+                // the same room ... go into roam mode to find that player,
+                // rather than trying to go directly to them").
+                int const human = Bot_NearestHuman(k, ps);
+                bool reachable = false;
+                if (human >= 0)
+                    reachable = cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
+                                       g_player[human].ps->pos.x, g_player[human].ps->pos.y,
+                                       g_player[human].ps->pos.z, g_player[human].ps->cursectnum);
+                if (reachable)
+                {
+                    // FORMATION SLOT: a bit BEHIND and to one side of the player,
+                    // NOT their exact position -- the bot escorts without
+                    // crowding the player's face (user 2026-08-12: "it should be
+                    // following either behind me or to the side ... getting in my
+                    // face"). The slot rides with the player's facing; twin bots
+                    // take opposite sides. Head to it only when out of position;
+                    // once in the slot, hold station (no explore-away drift).
+                    auto const     hp   = g_player[human].ps;
+                    int const      pang = fix16_to_int(hp->q16ang) & 2047;
+                    int32_t const  fdx  = sintable[(pang + 512) & 2047];  // player forward x
+                    int32_t const  fdy  = sintable[pang & 2047];          // player forward y
+                    int const      back = 1100;                           // trail this far behind
+                    int const      side = 512 * ((k & 1) ? 1 : -1);       // offset to one side
+                    int32_t const  fx   = hp->pos.x - ((fdx * back) >> 14) + ((fdy * side) >> 14);
+                    int32_t const  fy   = hp->pos.y - ((fdy * back) >> 14) - ((fdx * side) >> 14);
+                    int32_t const  fd   = klabs(fx - ps->pos.x) + klabs(fy - ps->pos.y);
+                    if (fd > 900)   // out of formation: move into the follow slot
+                    {
+                        s_botGoalX[k]      = fx;
+                        s_botGoalY[k]      = fy;
+                        s_botGoalSect[k]   = hp->cursectnum;
+                        s_botGoal[k]       = 1;
+                        s_botGoalDoor[k]   = 0;
+                        s_botGoalCrouch[k] = 0;
+                        s_botGoalTics[k]   = 0;
+                        s_botGoalItem[k]   = -1;
+                        s_botGoalSeen[k]   = 0;
+                    }
+                    else
+                        s_botGoal[k] = 0;   // in the slot: hold station near the player
+                }
+                else if (s_botGoal[k] == 0 && !Bot_PlanExplore(k, ps))    // other room / none: ROAM to find
+                    s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
+            }
+            if ((Bot_Rnd() & 3) == 0)
+                s_botStrafeDir[k] = (Bot_Rnd() & 1) ? 1 : -1;
+            if (s_botTurnPref[k] == 0 || (Bot_Rnd() & 63) == 0)
+                s_botTurnPref[k] = (Bot_Rnd() & 1) ? 1 : -1;
+        }
+        else {
         // Fruitless-fixation breaker: ~10s on one target with no kill means it
         // is not actually reachable (measured pathology: every bot pinned on
         // the rooftop-spawn host, pistols eating the ledge wall forever while
@@ -1378,6 +1744,18 @@ static input_t Bot_GetInput(int k)
         if (best < 0 && s_botTarget[k] >= 0 && s_botTarget[k] != avoid
             && s_botSightTics[k] < 130)
             best = s_botTarget[k];      // pursuit memory: chase the last sighting briefly
+        // REACTION / AWARENESS: don't lock onto a NEWLY-seen player the instant
+        // LOS opens -- it must hold sight for reactTics (tracked per-tic below)
+        // first, so the bot keeps roaming a beat before it notices. Revenge
+        // (just been shot) and the already-held target skip this.
+        if (best >= 0 && best != revenge && best != s_botTarget[k])
+        {
+            if (s_botPending[k] != best) { s_botPending[k] = (int8_t)best; s_botSeeStreak[k] = 0; }
+            if (s_botSeeStreak[k] < reactTics[skill])
+                best = (s_botTarget[k] >= 0 && s_botSightTics[k] < 130) ? s_botTarget[k] : -1;
+            else
+                s_botPending[k] = -1;   // awareness met: promote to a real lock
+        }
         if (best != s_botTarget[k])
         {
             s_botTargetHold[k] = 0;
@@ -1386,13 +1764,27 @@ static input_t Bot_GetInput(int k)
             s_botSightTics[k]  = 0;
         }
         s_botTarget[k] = (int8_t)best;
-        // Plot the route: first portal toward the target, recomputed each
-        // think (and forced on every sector crossing below).
+        // Plot the route: ROUTABLE means the MESH says so. The old portal
+        // BFS ignored feet (+64px door sills passed its cstat-only filter)
+        // and handed out unreachable waypoints -- the last wall-standers
+        // were bots frozen at exactly those spots (both user screenshots).
         s_botNavOn[k] = 0;
-        if (best >= 0 && g_player[best].ps != NULL
-            && Bot_NavFirstHop(ps->cursectnum, g_player[best].ps->cursectnum,
-                               &s_botNavX[k], &s_botNavY[k]))
-            { s_botNavOn[k] = 1; s_botNavSeen[k] = 0; }
+        if (best >= 0 && g_player[best].ps != NULL)
+        {
+            auto const tps = g_player[best].ps;
+            Bot_NavEnsure();
+            int const from = Nvg_Snap(ps->pos.x, ps->pos.y);
+            int const to   = Nvg_Snap(tps->pos.x, tps->pos.y);
+            static int16_t txx[4], tyy[4];
+            if (from >= 0 && to >= 0
+                && (from == to || Bot_NvgPath(from, to, txx, tyy, 4) > 0))
+            {
+                s_botNavOn[k]   = 1;
+                s_botNavSeen[k] = 0;
+                s_botNavX[k]    = tps->pos.x;   // the resolver meshes the walk
+                s_botNavY[k]    = tps->pos.y;
+            }
+        }
         if (best >= 0 && (bestSeen || s_botNavOn[k]))
             s_botGoal[k] = 0;           // a fight we can PROSECUTE: drop the errand
         else if (s_botGoal[k] == 0)
@@ -1407,12 +1799,15 @@ static input_t Bot_GetInput(int k)
             // wall-hump class stays dead.
             int const huntRoll = (heardd < 10000) ? (int)(Bot_Rnd() & 1)
                                                   : ((Bot_Rnd() & 3) == 0);
-            if (heard >= 0 && huntRoll
-                && Bot_NavFirstHop(ps->cursectnum, g_player[heard].ps->cursectnum,
-                                   &s_botGoalX[k], &s_botGoalY[k]))
+            if (heard >= 0 && huntRoll && g_player[heard].ps != NULL)
             {
+                // Hunt errand straight at the heard player's AREA; the mesh
+                // resolver walks it, and unroutable just times out instead
+                // of freezing at a doorway it cannot climb.
+                s_botGoalX[k]      = g_player[heard].ps->pos.x;
+                s_botGoalY[k]      = g_player[heard].ps->pos.y;
                 s_botGoal[k]       = 1;
-                s_botGoalSect[k]   = -1;
+                s_botGoalSect[k]   = g_player[heard].ps->cursectnum;
                 s_botGoalDoor[k]   = 0;
                 s_botGoalCrouch[k] = 0;
                 s_botGoalTics[k]   = 0;
@@ -1430,6 +1825,7 @@ static input_t Bot_GetInput(int k)
             s_botStrafeDir[k] = (Bot_Rnd() & 1) ? 1 : -1;
         if (s_botTurnPref[k] == 0 || (Bot_Rnd() & 63) == 0)
             s_botTurnPref[k] = (Bot_Rnd() & 1) ? 1 : -1;
+        }   // end DM (player-target) acquisition branch
     }
 
     // Stuck detection: intending to move but the feet aren't (walls, doors,
@@ -1582,7 +1978,23 @@ static input_t Bot_GetInput(int k)
     if (s_botGoal[k] != 0)
     {
         int32_t const goalDist = klabs(s_botGoalX[k] - ps->pos.x) + klabs(s_botGoalY[k] - ps->pos.y);
-        if (++s_botGoalTics[k] > 390)
+        // PROGRESS WATCH: an explore/hunt errand that stops closing on its goal
+        // is an impossible exit -- across a pit, up a ledge, behind a locked
+        // door. Abandon in ~3s (and remember the sector) instead of waiting out
+        // the 13s timeout below; the staleness gradient would otherwise lure the
+        // bot straight back to the one door it can't take.
+        if (s_botGoalTics[k] == 0)
+            { s_botGoalNear[k] = goalDist; s_botGoalStall[k] = 0; }
+        else if (goalDist + 256 < s_botGoalNear[k])
+            { s_botGoalNear[k] = goalDist; s_botGoalStall[k] = 0; }   // real approach
+        else if (s_botGoal[k] == 1 && (unsigned)s_botGoalSect[k] < (unsigned)numsectors
+                 && ++s_botGoalStall[k] > 96)
+        {
+            Bot_MarkDeadExit(k, s_botGoalSect[k]);
+            s_botVisitT[k][s_botGoalSect[k]] = movefifoplc;   // reset its staleness too
+            s_botGoal[k] = 0;
+        }
+        if (s_botGoal[k] != 0 && ++s_botGoalTics[k] > 390)
         {
             // 15s on one errand is a locked door / unreachable shelf: mark it
             // satisfied so the gradient stops wanting it, and move on. EVERY
@@ -1627,17 +2039,60 @@ static input_t Bot_GetInput(int k)
         s_botTargetHold[k]++;
     int const t = (s_botSpawnRoam[k] > 0) ? -1 : s_botTarget[k];
     auto const tp = (t >= 0 && g_player[t].connected && g_player[t].ps != NULL) ? g_player[t].ps : NULL;
-    bool const seesTarget = (tp != NULL && (unsigned)tp->cursectnum < (unsigned)numsectors
+    // Unified target COORDINATES: a player (DM/TDM) or a monster sprite (coop).
+    // Every aim/face/fire computation below reads tgX/tgY/tgZ/tgSect instead of
+    // tp-> so one path serves both modes; hasTgt means "there is a target". The
+    // fire-solution hit test keys on whatever the ray actually strikes
+    // (ray.sprite), so the target's own sprite index is not needed here.
+    int32_t tgX = 0, tgY = 0, tgZ = 0;
+    int tgSect = -1;
+    bool hasTgt = false;
+    if (botCoop)
+    {
+        int const ms = s_botMonTgt[k];
+        if (s_botSpawnRoam[k] <= 0 && (unsigned)ms < MAXSPRITES && sprite[ms].extra > 0
+            && A_CheckEnemySprite(&sprite[ms]) && (unsigned)sprite[ms].sectnum < (unsigned)numsectors)
+        {
+            hasTgt = true;
+            tgX = sprite[ms].x; tgY = sprite[ms].y; tgZ = sprite[ms].z - (8 << 8);
+            tgSect = sprite[ms].sectnum;
+        }
+        else
+            s_botMonTgt[k] = -1;   // dead / gone: forget it
+    }
+    else if (tp != NULL)
+    {
+        hasTgt = true;
+        tgX = tp->pos.x; tgY = tp->pos.y; tgZ = tp->pos.z; tgSect = tp->cursectnum;
+    }
+    bool const seesTarget = (hasTgt && (unsigned)tgSect < (unsigned)numsectors
                              && cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
-                                       tp->pos.x, tp->pos.y, tp->pos.z, tp->cursectnum));
+                                       tgX, tgY, tgZ, tgSect));
     // Pursuit-memory clock: acquisition is sight-gated, so how long ago the
-    // target was SEEN decides when the chase is called off (think block).
-    if (s_botTarget[k] >= 0)
+    // target was SEEN decides when the chase is called off (think block). Ticks
+    // for the coop monster target too, feeding Bot_AcquireMonster's memory.
+    if (s_botTarget[k] >= 0 || (botCoop && s_botMonTgt[k] >= 0))
     {
         if (seesTarget)
             s_botSightTics[k] = 0;
         else if (s_botSightTics[k] < 30000)
             s_botSightTics[k]++;
+    }
+    // Awareness build-up for a PENDING (not-yet-locked) candidate: it must
+    // hold line of sight for reactTics before the acquisition block promotes
+    // it. Lose sight -> awareness resets, so the bot only reacts to players
+    // it has actually watched for a beat.
+    if (s_botPending[k] >= 0 && s_botPending[k] < MAXPLAYERS && s_botPending[k] != k)
+    {
+        auto const pend = g_player[s_botPending[k]].ps;
+        if (pend != NULL && (unsigned)pend->i < MAXSPRITES && sprite[pend->i].extra > 0
+            && !pend->dead_flag && (unsigned)pend->cursectnum < (unsigned)numsectors
+            && cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
+                      pend->pos.x, pend->pos.y, pend->pos.z, pend->cursectnum))
+        {
+            if (s_botSeeStreak[k] < 30000) s_botSeeStreak[k]++;
+        }
+        else { s_botSeeStreak[k] = 0; s_botPending[k] = -1; }
     }
 
     // "Can SEE" is not "can HIT": cansee() threads through masked walls
@@ -1657,9 +2112,12 @@ static input_t Bot_GetInput(int k)
         int32_t const vy = sintable[fireAng & 2047];
         hitdata_t ray = {};
         hitscan(&ps->pos, ps->cursectnum, vx, vy, (100 - fireHoriz) << 5, &ray, CLIPMASK1);
-        int32_t const distT  = klabs(tp->pos.x - ps->pos.x) + klabs(tp->pos.y - ps->pos.y);
+        int32_t const distT  = klabs(tgX - ps->pos.x) + klabs(tgY - ps->pos.y);
         int32_t const rayLen = klabs(ray.xyz.x - ps->pos.x) + klabs(ray.xyz.y - ps->pos.y);
-        if (ray.sprite >= 0 && sprite[ray.sprite].picnum == APLAYER)
+        // Fire solution lands on a valid victim: a player in DM, ANY enemy
+        // monster in coop (the shot damages whatever monster it hits).
+        if (ray.sprite >= 0 && (botCoop ? A_CheckEnemySprite(&sprite[ray.sprite])
+                                        : sprite[ray.sprite].picnum == APLAYER))
             canHit = true;
         else if (rayLen + 256 < distT)
             canHit = false;   // ray died SHORT of the target: fence/wall between
@@ -1676,8 +2134,8 @@ static input_t Bot_GetInput(int k)
             // proximity was WRONG here -- a clean near-miss ends on a wall far
             // BEHIND the target and must still count as hittable (v1 gated on
             // it and bots stopped firing entirely: 16 discharges in 3 min).
-            int64_t cross = (int64_t)(tp->pos.x - ps->pos.x) * vy
-                          - (int64_t)(tp->pos.y - ps->pos.y) * vx;
+            int64_t cross = (int64_t)(tgX - ps->pos.x) * vy
+                          - (int64_t)(tgY - ps->pos.y) * vx;
             if (cross < 0) cross = -cross;
             canHit = (int32_t)(cross >> 14) < 1024;
         }
@@ -1717,7 +2175,7 @@ static input_t Bot_GetInput(int k)
         s_botLaneHold[k]--;
         wantAng = s_botLaneAng[k];      // committed to the open lane
     }
-    else if (tp != NULL && (canHit || seesTarget || s_botNavOn[k]))
+    else if (hasTgt && (canHit || seesTarget || s_botNavOn[k]))
     {
         // Toward the target when the shot can land; along the ROUTE (first
         // portal midpoint) when it cannot -- homing at an unhittable target
@@ -1728,8 +2186,8 @@ static input_t Bot_GetInput(int k)
             // only while the walk line is open, else hold the follow heading.
             int32_t nx2 = s_botNavX[k], ny2 = s_botNavY[k];
             int guided2 = 0;
-            if ((unsigned)tp->cursectnum < (unsigned)numsectors)
-                guided2 = Bot_Waypoint(k, ps, tp->pos.x, tp->pos.y, tp->cursectnum, &nx2, &ny2);
+            if ((unsigned)tgSect < (unsigned)numsectors)
+                guided2 = Bot_Waypoint(k, ps, tgX, tgY, tgSect, &nx2, &ny2);
             if (s_botWpDoor[k] && (movefifoplc & 7) == 0
                 && klabs(nx2 - ps->pos.x) + klabs(ny2 - ps->pos.y) < 1600)
                 in.bits |= BIT(SK_OPEN);
@@ -1754,7 +2212,7 @@ static input_t Bot_GetInput(int k)
         }
         else
         {
-            wantAng = getangle(tp->pos.x - ps->pos.x, tp->pos.y - ps->pos.y);
+            wantAng = getangle(tgX - ps->pos.x, tgY - ps->pos.y);
             if (!seesTarget)
                 wantAng = (wantAng + (int)(Bot_Rnd() % 129) - 64) & 2047;
         }
@@ -1799,20 +2257,49 @@ static input_t Bot_GetInput(int k)
     else
         wantAng = s_botWanderAng[k];
 
-    int diff = (((wantAng - fix16_to_int(ps->q16ang)) + 1024) & 2047) - 1024;
+    // AIM / MOVE DECOUPLING (user directive 2026-08-10): keep the MOVEMENT
+    // heading (wantAng: nav route / roam / circle), but FACE the target when
+    // the bot is engaging one it can SEE -- so it tracks-and-shoots while it
+    // keeps moving around the same way, instead of turning to walk straight at
+    // the enemy. During recovery (trap / bounce / lane) aim stays on the move
+    // heading: the bot needs to look where it is escaping to. Movement is
+    // rotated by moveAng at the exit block (not by facing), so facing is now
+    // free to point at the aim target without dragging the body with it.
+    int const moveAng = wantAng;
+    // FACE THE ENEMY WHENEVER FIGHTING (user 2026-08-10: "face that person while
+    // moving at all times"). No longer suppressed by the trap/bounce/lane
+    // recovery states -- during a fight the body still escapes on moveAng, but
+    // the HEAD stays locked on the target. "Recently seen" (s_botSightTics small)
+    // holds the track through brief occlusion (strafing behind a pillar) and
+    // through the wall-follow, and releases only once the target has been out of
+    // sight long enough (~3s) that this is navigation, not combat.
+    bool const engaging = (hasTgt && (seesTarget || canHit || s_botSightTics[k] < 90));
+    int const aimAng = engaging
+                       ? getangle(tgX - ps->pos.x, tgY - ps->pos.y)
+                       : moveAng;
+    int diff = (((aimAng - fix16_to_int(ps->q16ang)) + 1024) & 2047) - 1024;
     // Tracking: SMALL wobble while the target is visible (the old +-48 at
     // default skill was +-8 degrees of permanent miss -- "the bots can't aim",
     // live-reported), and double the turn rate when far off so they snap on.
     // Medium wobble halved 8->4: 48 honest canHit discharges converted only 2
     // sprite terminations in 5 minutes -- +-8 ang units is +-1.4 degrees of
     // permanent miss at range even with the shotgun cone.
-    static int const trackWobble[3] = { 20, 4, 2 };
-    int const aimErr = seesTarget ? (int)(Bot_Rnd() % (2 * trackWobble[skill] + 1)) - trackWobble[skill]
+    static int const trackWobble[4] = { 22, 8, 12, 6 };  // v39: CGS 5->12 (~+-2 deg of
+                                                       // permanent miss). Bots melted the
+                                                       // player with near-perfect tracking
+                                                       // once facing was made continuous;
+                                                       // loosen so a fight is survivable.
+                                                       // DIG 6: tightest track, the deadly tier.
+    // Coop aim is a notch WORSE than deathmatch (user 2026-08-12: "its targeting
+    // should be slightly worse than deathmatch") -- the bot is a helper, not a
+    // threat, so widen the tracking wobble ~+10 units (~+1.8 deg of jitter).
+    int const twob = trackWobble[skill] + (botCoop ? 10 : 0);
+    int const aimErr = seesTarget ? (int)(Bot_Rnd() % (2 * twob + 1)) - twob
                                   : (int)(Bot_Rnd() % (2 * wobble[skill] + 1)) - wobble[skill];
     int const cap = (seesTarget && klabs(diff) > turnCap[skill]) ? turnCap[skill] * 2 : turnCap[skill];
     in.q16avel = fix16_from_int(clamp(diff + aimErr, -cap, cap));
 
-    int32_t const dist2d = (tp != NULL) ? klabs(tp->pos.x - ps->pos.x) + klabs(tp->pos.y - ps->pos.y) : INT32_MAX;
+    int32_t const dist2d = hasTgt ? klabs(tgX - ps->pos.x) + klabs(tgY - ps->pos.y) : INT32_MAX;
 
     // VERTICAL AIM via the sim's OWN aim keys: raw q16horz deltas fought the
     // auto-centering and OSCILLATED (measured: shot-time horiz swinging
@@ -1824,7 +2311,7 @@ static input_t Bot_GetInput(int k)
         int const curHoriz = fix16_to_int(ps->q16horiz);
         if (seesTarget && dist2d > 256)
         {
-            int32_t const dz = tp->pos.z - ps->pos.z;   // eye-to-eye; z grows down
+            int32_t const dz = tgZ - ps->pos.z;   // eye-to-eye; z grows down
             int const wantHoriz = clamp(100 - (int)(((int64_t)dz * 16) / max(dist2d, 256)), 60, 140);
             if (curHoriz < wantHoriz - 6)
                 in.bits |= BIT(SK_AIM_UP);
@@ -1834,39 +2321,39 @@ static input_t Bot_GetInput(int k)
         else if (klabs(curHoriz - 100) > 10)
             in.bits |= BIT(SK_CENTER_VIEW);
     }
-    if (canHit && dist2d <= 2048)
+    // MOVEMENT AS A WORLD VELOCITY VECTOR (decoupled from facing). Pick a
+    // forward magnitude along the MOVE heading and a strafe magnitude
+    // perpendicular to the AIM, then compose them into world vel directly.
+    // Forward-along-move + strafe-around-aim is exactly "keep moving the same
+    // way, but orbit/track the enemy you're looking at" (user directive).
+    int fwdSpd = 0, strSpd = 0;   // strSpd signed: >0 left, <0 right
+    bool run = false;
+    // Magnitudes trimmed ~15% (user: "move slightly too fast"). 80 was full
+    // human run; 68 is a hair under.
+    if (canHit && dist2d <= 2048)        { fwdSpd = 20; strSpd = s_botStrafeDir[k] * 40; }         // knife: orbit
+    else if (canHit && dist2d <= 8192)   { fwdSpd = 48; strSpd = s_botStrafeDir[k] * 28; run = true; } // press
+    else if (s_botBounceHold[k] > 0 && klabs(diff) > 150) { fwdSpd = 34; }                          // wall half-stride
+    else                                 { fwdSpd = 68; run = true; }                               // roam
+    // (No added weave: the user asked to keep the SAME movement and only
+    // redirect the FACING. The existing canHit circle-strafe already orbits
+    // -- now correctly around the AIM -- and roam/nav keep their straight
+    // heading; the aim just tracks the target independently.)
+    if (run)    in.bits    |= BIT(SK_RUN);
+    if (fwdSpd) in.extbits |= BIT(EK_MOVE_FORWARD);
+    if (strSpd) in.extbits |= BIT(strSpd > 0 ? EK_STRAFE_LEFT : EK_STRAFE_RIGHT);
+    if (fwdSpd || strSpd)
     {
-        // Knife-fight range: circle-strafe with forward pressure.
-        in.svel = (int16_t)(s_botStrafeDir[k] * 48);
-        in.fvel = 24;
-        in.extbits |= BIT(s_botStrafeDir[k] > 0 ? EK_STRAFE_LEFT : EK_STRAFE_RIGHT);
-        in.extbits |= BIT(EK_MOVE_FORWARD);
-    }
-    else if (canHit && dist2d <= 8192)
-    {
-        // Mid-range with a shot: PRESS THE FIGHT -- approach with a strafe
-        // slant instead of standing off. Passive engagement read as "the
-        // bots are broken" from the player's side of the barrel.
-        in.fvel = 56;
-        in.svel = (int16_t)(s_botStrafeDir[k] * 32);
-        in.bits |= BIT(SK_RUN);
-        in.extbits |= BIT(EK_MOVE_FORWARD);
-        in.extbits |= BIT(s_botStrafeDir[k] > 0 ? EK_STRAFE_LEFT : EK_STRAFE_RIGHT);
-    }
-    else if (s_botBounceHold[k] > 0 && klabs(diff) > 150)
-    {
-        // Mid-bounce with the nose still in the wall: keep HALF stride
-        // through the rotation -- a statue-turn reads as wedged to anyone
-        // watching, and the slide along the wall is the wall-follow anyway.
-        in.fvel = 40;
-        in.extbits |= BIT(EK_MOVE_FORWARD);
-    }
-    else
-    {
-        // Roam/chase at full stride (RUN makes cross-map travel worthwhile).
-        in.fvel = 80;
-        in.bits |= BIT(SK_RUN);
-        in.extbits |= BIT(EK_MOVE_FORWARD);
+        int const ma = moveAng & 2047;                                   // body goes here
+        int const sa = (aimAng + (strSpd >= 0 ? 512 : 1536)) & 2047;     // strafe ±90° off aim
+        int const s  = klabs(strSpd);
+        // world vx/vy at angle A, magnitude M: mulscale9(M, sin[A+2560]) / [A+2048]
+        // -- the exact convention dukeFillInputForTic uses (game.cpp:6590).
+        int32_t const vx = mulscale9(fwdSpd, sintable[(ma + 2560) & 2047])
+                         + mulscale9(s,      sintable[(sa + 2560) & 2047]);
+        int32_t const vy = mulscale9(fwdSpd, sintable[(ma + 2048) & 2047])
+                         + mulscale9(s,      sintable[(sa + 2048) & 2047]);
+        in.fvel = (int16_t)clamp(vx, -0x7ff0, 0x7ff0);
+        in.svel = (int16_t)clamp(vy, -0x7ff0, 0x7ff0);
     }
 
     // Fire discipline: the gate uses TRUE aim error (wobble is steering noise,
@@ -1952,6 +2439,28 @@ static input_t Bot_GetInput(int k)
         }
     }
 
+    // PROACTIVE DOOR OPENING, EVERY MODE (user 2026-08-12: "the bot needs the
+    // ability to open doors in all modes, and doors should be a waypoint for
+    // roaming"). Probe the FACING direction -- which tracks the move heading
+    // while roaming -- for a door sector or a switch-tagged wall within reach,
+    // and tap OPEN. The bot now opens doors ON APPROACH along its route instead
+    // of only after bumping into them (the stuck path), so a closed door is a
+    // passable waypoint rather than a wall. Rate-limited to a tap, not a hold.
+    if ((movefifoplc & 7) == 0 && (unsigned)ps->cursectnum < (unsigned)numsectors)
+    {
+        int const da = fix16_to_int(ps->q16ang) & 2047;
+        hitdata_t dh = {};
+        hitscan(&ps->pos, ps->cursectnum, sintable[(da + 512) & 2047], sintable[da & 2047], 0, &dh, CLIPMASK0);
+        if (dh.wall >= 0)
+        {
+            int32_t const dd  = klabs(dh.xyz.x - ps->pos.x) + klabs(dh.xyz.y - ps->pos.y);
+            int const     dns = wall[dh.wall].nextsector;
+            if (dd < 1536 && (((unsigned)dns < (unsigned)numsectors && Bot_SectorIsDoor(dns))
+                              || wall[dh.wall].lotag > 0))
+                in.bits |= BIT(SK_OPEN);
+        }
+    }
+
     int gate = fireGate[skill];
     if (dist2d > 8192)  gate >>= 1;
     if (dist2d > 20000) gate >>= 1;
@@ -1969,21 +2478,21 @@ static input_t Bot_GetInput(int k)
     }
 
     // WORLD-SPACE VELOCITIES: P_ProcessInput consumes input.fvel/svel as
-    // vel.x/vel.y DIRECTLY (player.cpp ~5903; the human sampler pre-rotates
-    // stick input into world components before storing them). The brain
-    // computes LOCAL forward/strafe -- unrotated, every emitted step was due
-    // EAST regardless of facing ([sim1]: vy==0 in every sample, vx huge,
-    // pinned at the first east-blocking wall; the user's "jumping up and
-    // down, zero x/y movement" bots). Rotate by the bot's facing on the way
-    // out; the localbot seat is untouched (its input rides the real sampler).
-    if (in.fvel || in.svel)
-    {
-        int const wa = fix16_to_int(ps->q16ang) & 2047;
-        int32_t const wc = sintable[(wa + 512) & 2047], ws = sintable[wa & 2047];
-        int32_t const fwd = in.fvel, str = in.svel;
-        in.fvel = (int16_t)clamp((int32_t)((fwd * wc - str * ws) >> 14), -127, 127);
-        in.svel = (int16_t)clamp((int32_t)((fwd * ws + str * wc) >> 14), -127, 127);
-    }
+    // vel.x/vel.y DIRECTLY (player.cpp ~5903). The brain computes LOCAL
+    // forward/strafe; it MUST be rotated into world components EXACTLY as the
+    // human sampler does (game.cpp dukeFillInputForTic), or two things break:
+    //   (1) unrotated -> every step goes due EAST (the old bug), and
+    //   (2) rotated with the wrong SHIFT -> the bot crawls. mulscale9 (>>9)
+    //       against a 2^14 sine table is a 32x gain; the old >>14 was
+    //       unit-preserving (NO gain) and the +/-127 clamp is a LOCAL-scale
+    //       bound -- together they pinned bots at ~1/20-1/32 of human running
+    //       speed ("bots barely move, apart from rotating"). Use mulscale9 and
+    //       the human's exact angle offsets; do NOT re-clamp (local fvel is
+    //       already <= keyMove, and the world result fits int16). This is a
+    //       HOST-side bug: every peer sees the same crawling bots.
+    // (No exit rotation: the movement block above already emits WORLD-space
+    // fvel/svel composed from moveAng + aimAng directly, decoupled from
+    // facing. P_ProcessInput consumes them as vel.x/vel.y unchanged.)
 
     // Single-bot decision trace (forensics only): the room-escape failure has
     // survived four steering rewrites while the LOCALBOT-piloted seat crosses
@@ -2023,6 +2532,22 @@ static input_t Bot_GetInput(int k)
         }
     }
 
+    // Decoupling proof (forensics): when engaging with a move heading that
+    // differs from the aim, `face` should track `aimAng` while `mvdir` (the
+    // world direction of the emitted velocity) tracks `moveAng` -- i.e. the
+    // bot looks at the target while the body keeps going its own way.
+    {
+        extern int32_t g_netForensics;
+        if (g_netForensics && k == 1 && (movefifoplc % 26) == 0)
+        {
+            int const face  = fix16_to_int(ps->q16ang) & 2047;
+            int const mvdir = (in.fvel || in.svel) ? getangle(in.fvel, in.svel) : -1;
+            EM_ASM({ console.log('[aim] plc=' + $0 + ' eng=' + $1 + ' aimAng=' + $2
+                     + ' moveAng=' + $3 + ' face=' + $4 + ' mvdir=' + $5); },
+                   movefifoplc, (int)engaging, aimAng, moveAng, face, mvdir);
+        }
+    }
+
     if (in.bits & BIT(SK_JUMP))
         s_botJumps[k]++;
 
@@ -2045,8 +2570,17 @@ input_t Net_BotInput(void)
 void Net_SeatBots(int minPlayers, int skill)
 {
     g_netBotMask    = 0;
-    g_netBotSkill   = clamp(skill, 0, 2);
+    g_netBotSkill   = clamp(skill, 0, 3);
     g_netMinPlayers = clamp(minPlayers, 1, 8);
+    // Clear every seat's combat lock up front -- including myconnectindex, which
+    // the seating loop below skips. The local-bot test path (g_netLocalBot) runs
+    // the brain for the host's own seat, and the static-0 default would read as
+    // "targeting sprite 0" for a tic before the first respawn reset.
+    for (int k = 0; k < MAXPLAYERS; k++)
+    {
+        s_botTarget[k] = -1;
+        s_botMonTgt[k] = -1;
+    }
     if (myconnectindex != connecthead)
         return;
     // At menu time the host's OWN connected flag may still be 0 -- without
@@ -2068,6 +2602,13 @@ void Net_SeatBots(int minPlayers, int skill)
         g_player[k].connected = 1;
         g_netBotMask |= (1 << k);
         Bsprintf(g_player[k].user_name, "CPU-%d", seated + 1);
+        // Team DM: split CPU seats across the two teams so the mode is playable
+        // (all-team-0 + friendly-fire-off = nobody can damage anyone). Spawn
+        // applies the team palette from pteam (premap.cpp). DM/Coop leave it 0.
+        {
+            extern int32_t g_gametypeFlags[];
+            g_player[k].pteam = (g_gametypeFlags[ud.m_coop] & GAMETYPE_TDM) ? (seated & 1) : 0;
+        }
         seated++;
     }
     if (seated)
@@ -2085,6 +2626,95 @@ void Net_SeatBots(int minPlayers, int skill)
         EM_ASM({ console.log('[bot] SeatBots: seated NOTHING (min=' + $0 + ' me=' + $1 + ' head=' + $2 + ')'); },
                g_netMinPlayers, myconnectindex, connecthead);
 #endif
+}
+
+// ── LAST MAN STANDING (GAMETYPE_LMS) ────────────────────────────────────────
+// Host-authoritative limited lives + elimination + last-standing round win.
+// Gated on GTFLAGS(GAMETYPE_LMS) at every call site, so DM/Coop/TDM are wholly
+// unaffected. "Eliminated" = the respawn is refused, so the player's death is
+// permanent for the round; the sprite stream carries that dead state to guests
+// exactly like any other death (no new wire fields). Guests never decide lives.
+#define LMS_LIVES 3   // respawns per round; 0 left -> eliminated on next death
+int8_t  g_lmsLives[MAXPLAYERS];
+static int8_t  s_lmsInit;
+static int16_t s_lmsCooldown;   // tics to wait after a round reset before re-checking
+extern int32_t g_netForensics;  // (defined in game.cpp) — LMS forensics logging below
+
+void Net_LmsInit(void)
+{
+    for (int i = 0; i < MAXPLAYERS; i++)
+        g_lmsLives[i] = LMS_LIVES;
+    s_lmsInit    = 1;
+    s_lmsCooldown = 260;   // ~8s grace at match start so nobody "wins" before spawns settle
+#ifdef __EMSCRIPTEN__
+    if (g_netForensics)
+        EM_ASM({ console.log('[lms] init lives=' + $0); }, LMS_LIVES);
+#endif
+}
+
+// Respawn gate (from VM_ResetPlayer). 1 = allow the respawn and spend a life;
+// 0 = keep the player eliminated. Host authoritative; guests always pass (they
+// mirror the host's streamed dead state).
+int Net_LmsAllowRespawn(int playerNum)
+{
+    if (!s_lmsInit) Net_LmsInit();
+    if (myconnectindex != connecthead || (unsigned)playerNum >= MAXPLAYERS)
+        return 1;
+    if (g_lmsLives[playerNum] <= 0)
+    {
+#ifdef __EMSCRIPTEN__
+        if (g_netForensics) EM_ASM({ console.log('[lms] ELIMINATED p=' + $0); }, playerNum);
+#endif
+        return 0;
+    }
+    g_lmsLives[playerNum]--;
+#ifdef __EMSCRIPTEN__
+    if (g_netForensics) EM_ASM({ console.log('[lms] p=' + $0 + ' respawn, lives left=' + $1); }, playerNum, g_lmsLives[playerNum]);
+#endif
+    return 1;
+}
+
+// Per-tic host check: a seat is "still in the round" if it has lives left OR is
+// currently alive. When <=1 remain, announce the survivor and start a new round
+// (refill lives + resurrect everyone). Cooldown-gated so a fresh round doesn't
+// instantly re-trigger while respawns are still settling.
+void Net_LmsTick(void)
+{
+    if (myconnectindex != connecthead)
+        return;
+    if (!s_lmsInit) Net_LmsInit();   // first LMS tic of this match (browser is fresh each cycle)
+    if (s_lmsCooldown > 0) { s_lmsCooldown--; return; }
+    int inRound = 0, last = -1, seats = 0;
+    for (int i = 0; i < MAXPLAYERS; i++)
+    {
+        auto const p = g_player[i].ps;
+        if (!g_player[i].connected || p == NULL)
+            continue;
+        seats++;
+        int const alive = ((unsigned)p->i < MAXSPRITES && sprite[p->i].extra > 0 && !p->dead_flag);
+        if (g_lmsLives[i] > 0 || alive) { inRound++; last = i; }
+    }
+    if (seats >= 2 && inRound <= 1)
+    {
+#ifdef __EMSCRIPTEN__
+        if (g_netForensics) EM_ASM({ console.log('[lms] ROUND WIN p=' + $0 + ' seats=' + $1); }, last, seats);
+#endif
+        if (last >= 0 && g_player[last].ps != NULL)
+        {
+            Bsnprintf(apStrings[QUOTE_RESERVED], MAXQUOTELEN, "%s WINS THE ROUND", g_player[last].user_name);
+            P_DoQuote(QUOTE_RESERVED, g_player[last].ps);
+        }
+        for (int i = 0; i < MAXPLAYERS; i++)
+        {
+            auto const p = g_player[i].ps;
+            if (!g_player[i].connected || p == NULL)
+                continue;
+            g_lmsLives[i] = LMS_LIVES;
+            if ((unsigned)p->i < MAXSPRITES && (sprite[p->i].extra <= 0 || p->dead_flag))
+                P_ResetMultiPlayer(i);   // resurrect the eliminated for the new round
+        }
+        s_lmsCooldown = 260;
+    }
 }
 
 static void Net_ResetProtocolState(void)
@@ -2447,9 +3077,18 @@ void Net_HandleInput(void)
                 fix16_t da = fix16_ssub(predictedPlayer.q16ang, wa);
                 while (da > F16(1024))  da = fix16_ssub(da, F16(2048));
                 while (da < -F16(1024)) da = fix16_sadd(da, F16(2048));
-                staged.q16avel = fix16_clamp(da, -F16(512), F16(512));
-                staged.q16horz = fix16_clamp(fix16_ssub(predictedPlayer.q16horiz, wh),
-                                             -F16(127), F16(127));
+                // LOCALBOT seats keep the brain's OWN turn command: the
+                // closed loop tracks the predicted VIEW, which only a mouse
+                // moves -- it silently discarded every bot avel, so a guest
+                // localbot could never turn (probe cameras walked into the
+                // first wall and pushed forever; measured in frame bursts).
+                extern int32_t g_netLocalBot;
+                if (!g_netLocalBot)
+                {
+                    staged.q16avel = fix16_clamp(da, -F16(512), F16(512));
+                    staged.q16horz = fix16_clamp(fix16_ssub(predictedPlayer.q16horiz, wh),
+                                                 -F16(127), F16(127));
+                }
             }
             {
                 extern int32_t g_testFire, g_testDrive;   // hit-registration harness
@@ -3218,7 +3857,19 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 }
                 ud.multimode            = numplayers;
                 g_mostConcurrentPlayers = ud.multimode;
-                ud.m_monsters_off       = 1;   // match the host's deathmatch setup
+                // GAME TYPE arrived in this packet (ud.m_coop, read above). Derive
+                // monsters the SAME way the host does (menus.cpp netmenu_relaunch):
+                // on for Cooperative, off for every DM/TDM variant. monsters_off is
+                // not networked, so this MUST mirror the host or a coop guest gets
+                // an empty level while the host has monsters.
+                {
+                    extern int32_t g_gametypeFlags[];
+                    ud.m_monsters_off   = (g_gametypeFlags[ud.m_coop] & GAMETYPE_COOP) ? 0 : 1;
+                    ud.m_player_skill   = (g_gametypeFlags[ud.m_coop] & GAMETYPE_COOP) ? 2 : 0;
+                    ud.m_respawn_monsters = 0;   // mirror the host: coop is story mode, no respawn
+                    if (g_gametypeFlags[ud.m_coop] & GAMETYPE_COOP)
+                        ud.m_ffire = 0;          // mirror the host: no friendly fire in coop
+                }
                 if (flags & NEWGAME_VIA_SNAPSHOT)
                 {
                     // LAUNCH VIA SNAPSHOT: do NOT enter locally. The host
@@ -3272,8 +3923,28 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 }
                 break;
             }
+            case PACKET_TYPE_HIT_REPORT:
+            {
+                // CLIENT-AUTHORITATIVE HITSCAN (guest -> host). The sender is
+                // 'other', so a guest can only ever report its OWN hits -- the
+                // host trusts the shooter for damage IT dealt, not the identity.
+                // Bounds/sanity gate everything; a report from a non-guest seat
+                // (unseated, or a bot slot spoofed) is ignored.
+                if (myconnectindex != connecthead || !g_player[other].connected
+                    || (g_netBotMask & (1 << other)))
+                    break;
+                int const victim = (uint8_t)packbuf[1];
+                int const dmg    = (int)((uint8_t)packbuf[2] | ((uint8_t)packbuf[3] << 8));
+                int const wpic   = (int)((uint8_t)packbuf[4] | ((uint8_t)packbuf[5] << 8));
+                if ((unsigned)victim >= MAXPLAYERS || !g_player[victim].connected
+                    || victim == other || dmg <= 0 || dmg > 1000)
+                    break;
+                Net_ApplyHitReport(other, victim, dmg, wpic);
+                break;
+            }
             case PACKET_TYPE_STATE_SNAP:
             {
+                { extern int32_t g_netDbgPackN; g_netDbgPackN++; }
                 // Host pushed an in-place correction. TIC-STAMPED: stash it and
                 // apply at EXACTLY the stamped consume count (see
                 // Net_ApplyPendingStateSnap, run at the top of every consumed
@@ -3300,6 +3971,19 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
 #endif
                     break;   // stale on arrival (we consumed past it) or malformed
                 }
+                // UNORDERED-CHANNEL GUARD: STATE_SNAP now rides the unreliable
+                // UNORDERED channel (the OpenArena snapshot model), so an OLDER
+                // snapshot can arrive AFTER a newer one. Drop a straggler so it
+                // never paints stale positions over fresh ones -- but only a
+                // RECENT backward step; a large jump back is a new match / tic
+                // reset / wrap and must pass through.
+                {
+                    static int32_t s_lastAcceptedSnapTic = INT32_MIN;
+                    if (g_netStreamMode && snapTic <= s_lastAcceptedSnapTic
+                        && (uint32_t)(s_lastAcceptedSnapTic - snapTic) < 600u)
+                        break;
+                    s_lastAcceptedSnapTic = snapTic;
+                }
                 Bmemcpy(s_pendingSnap, packbuf, len);
                 s_pendingSnapLen = len;
                 s_pendingSnapTic = snapTic;
@@ -3325,6 +4009,7 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 if (g_player[myconnectindex].ps == NULL
                     || !(g_player[myconnectindex].ps->gm & MODE_GAME))
                     break;
+                { extern int32_t g_netDbgSprN; g_netDbgSprN++; }
                 Net_ApplySpriteStream((const char *)packbuf, packbufleng);
                 break;
             }
@@ -4627,6 +5312,239 @@ void Net_SendStateSnap(int k)
 // the stamp, both sims have executed exactly the same tics, so the host's
 // captured state is bit-appropriate NOW -- positions, velocities and RNG land
 // with zero offset and the sims evolve identically from here.
+// ── Remote-seat smoothing (stream mode, guest side) ─────────────────────────
+// Packs are TARGETS, not teleports. Hard-applying pos/opos at every 3Hz pack
+// was a structural sawtooth: the local replay drifts for ~333ms, then the
+// remote snaps to host truth -- no remote player could ever WALK A STRAIGHT
+// LINE on a guest's screen (the user's exact words), on any build, no matter
+// what the bot brain did, and a 15s-cadence parity probe could never see it.
+// Each consumed tic pulls remotes 5/16 of the way to target (converges ~90%
+// in 6 tics, well inside the pack interval), slews facing at a bounded rate,
+// and reserves the hard snap for teleport-scale error (respawns, warps).
+static vec3_t  s_rsPos[MAXPLAYERS], s_rsSpr[MAXPLAYERS];
+static vec3_t  s_rsVel[MAXPLAYERS];
+static fix16_t s_rsAng[MAXPLAYERS], s_rsHoriz[MAXPLAYERS];
+static int16_t s_rsSect[MAXPLAYERS];
+static int8_t  s_rsHave[MAXPLAYERS];
+static int32_t s_rsLastTic[MAXPLAYERS];   // tic a remote seat last got a pack
+// On-screen net-debug counters (drawn by G_DisplayRest for MP): the USER's
+// real session is the only place the "bots barely move" repros, and localhost
+// headless can't see it -- so measure transport delivery where it lives.
+int32_t g_netDbgPackN = 0, g_netDbgSprN = 0, g_netDbgHitN = 0;
+// ── CLIENT-AUTHORITATIVE HITSCAN ────────────────────────────────────────────
+// User directive (2026-08-10): "the hitscan should be client side, not host
+// side ... the lag is 1ms, so the problem is not lag, it's where you are
+// calculating it." Correct diagnosis: at ~1ms the guest's local world matches
+// the host's, but the host reproduces the guest's AIM only by integrating the
+// avel it received (a lossy copy), so the host's authoritative re-fire points
+// a hair off and MISSES a shot the guest saw connect -- then the sprite stream
+// reverts the guest's honest local hit. Net effect: "I shot the bot and it
+// barely took damage." Fix: the guest is the authority for damage IT deals.
+// A_IncurDamage (actors.cpp) calls Net_ClientReportHit when a guest's own shot
+// lands locally; the host applies it verbatim and drops the phantom damage it
+// would have computed from the same shot (no double-count, no wrong-aim miss).
+
+// GUEST -> HOST: report a hit this client resolved locally. victimSeat is the
+// player/bot index; damage/weaponPic come straight from the actor hit tracker.
+void Net_ClientReportHit(int victimSeat, int damage, int weaponPic)
+{
+    if (!g_netStreamMode || numplayers < 2 || myconnectindex == connecthead)
+        return;
+    if ((unsigned)victimSeat >= MAXPLAYERS || damage <= 0)
+        return;
+    uint8_t buf[6];
+    buf[0] = PACKET_TYPE_HIT_REPORT;
+    buf[1] = (uint8_t)victimSeat;
+    buf[2] = (uint8_t)(damage & 0xff);
+    buf[3] = (uint8_t)((damage >> 8) & 0xff);
+    buf[4] = (uint8_t)(weaponPic & 0xff);
+    buf[5] = (uint8_t)((weaponPic >> 8) & 0xff);
+    oldnet_sendpacket(connecthead, buf, 6);
+    { extern int32_t g_netDbgHitN; g_netDbgHitN++; }   // guest tally: reports SENT
+#ifdef __EMSCRIPTEN__
+    if (g_netForensics)
+        EM_ASM({ console.log('[hitrep] SENT victim=' + $0 + ' dmg=' + $1 + ' pic=' + $2); },
+               victimSeat, damage, weaponPic);
+#endif
+}
+
+// HOST: apply a guest-reported hit to the victim's authoritative health. The
+// victim's own P_ProcessInput detects extra<=0 and runs P_FragPlayer, which
+// credits the frag from frag_ps -- so setting extra/wackedbyactor/frag_ps here
+// is the whole job. wackedbyactor also drives bot retaliation (Bot_GetInput).
+static void Net_ApplyHitReport(int attacker, int victim, int dmg, int weaponPic)
+{
+    (void)weaponPic;
+    if ((unsigned)victim >= MAXPLAYERS || (unsigned)attacker >= MAXPLAYERS)
+        return;
+    auto const vp = g_player[victim].ps;
+    if (vp == NULL || (unsigned)vp->i >= MAXSPRITES)
+        return;
+    if (sprite[vp->i].extra <= 0)
+        return;                                  // already dead this frame
+    auto const ap = g_player[attacker].ps;
+    int const as = (ap != NULL && (unsigned)ap->i < MAXSPRITES) ? ap->i : -1;
+    // FRIENDLY FIRE: this client-hitscan path bypasses A_IncurDamage, so it must
+    // enforce the same rule -- with ffire off, a teammate (coop, or same-team
+    // TDM) takes no damage from a reported hit. Coop forces ffire off
+    // (netmenu_relaunch), so a guest's stray shot can't kill an ally either.
+    if (ud.ffire == 0 && attacker != victim && ap != NULL)
+    {
+        extern int32_t g_gametypeFlags[];
+        if ((g_gametypeFlags[ud.coop] & GAMETYPE_PLAYERSFRIENDLY)
+            || ((g_gametypeFlags[ud.coop] & GAMETYPE_TDM) && ap->team == vp->team))
+            return;
+    }
+    sprite[vp->i].extra -= dmg;
+    if (sprite[vp->i].extra < 0)
+        sprite[vp->i].extra = 0;
+    if (as >= 0)
+        vp->wackedbyactor = (int16_t)as;         // -> bot revenge + death attribution
+    if (attacker != victim)
+        vp->frag_ps = (uint8_t)attacker;         // P_FragPlayer credits this on death
+    { extern int32_t g_netDbgHitN; g_netDbgHitN++; }   // host tally: reports APPLIED
+#ifdef __EMSCRIPTEN__
+    if (g_netForensics)
+        EM_ASM({ console.log('[hitapply] atk=' + $0 + ' victim=' + $1 + ' dmg=' + $2 + ' hp=' + $3); },
+               attacker, victim, dmg, sprite[vp->i].extra);
+#endif
+}
+
+const char *Net_DebugHudStr(void)
+{
+    static char buf[160];
+    int a[4] = { -1, -1, -1, -1 };
+    int n = 0;
+    for (int i = 0; i < MAXPLAYERS && n < 4; i++)
+        if (i != myconnectindex && g_player[i].connected && s_rsHave[i])
+            a[n++] = movefifoplc - s_rsLastTic[i];
+    extern int32_t g_netDbgHitN;
+    extern int32_t g_dbgAutoAimPic;
+    // AIM DIAGNOSTIC (la, aa): la = your look_ang (view-vs-shot yaw; nonzero
+    // means the crosshair is offset from where the gun fires); aa = the picnum
+    // Auto Aim last locked your shot onto (-1 = went straight). If you fire at a
+    // wall and aa jumps to an enemy tile, Auto Aim is grabbing an off-crosshair
+    // monster -> Options>Game Setup>Auto Aim: Off. If la is nonzero, it's a
+    // look-angle offset instead.
+    int const la = (g_player[myconnectindex].ps != NULL) ? g_player[myconnectindex].ps->look_ang : 0;
+    // gt: gametype index (0=DM, 1=Coop, 2=DM-nospawn, 3/4=TDM); ff: friendly
+    // fire. hits: client-authoritative hit reports (guest=sent, host=applied).
+    Bsnprintf(buf, sizeof(buf), "NETDBG v53  pkts=%d strm=%d hits=%d  gt=%d ff=%d sk=%d  la=%d aa=%d  age=%d,%d,%d,%d  plc=%d%s",
+              g_netDbgPackN, g_netDbgSprN, g_netDbgHitN, ud.coop, ud.ffire, g_netBotSkill, la, g_dbgAutoAimPic,
+              a[0], a[1], a[2], a[3], movefifoplc,
+              (myconnectindex == connecthead) ? "  [HOST]" : "  [GUEST]");
+    return buf;
+}
+
+void Net_SmoothRemoteSeats(void)
+{
+    if (!g_netStreamMode || numplayers < 2 || myconnectindex == connecthead)
+        return;
+    Net_ClientPickupScan();   // guest grabs its own pickups (height-tolerant), per tic
+    for (int i2 = 0; i2 < MAXPLAYERS; i2++)
+    {
+        if (!s_rsHave[i2] || i2 == myconnectindex)
+            continue;
+        auto const ps = g_player[i2].ps;
+        if (ps == NULL || (unsigned)ps->i >= MAXSPRITES)
+            { s_rsHave[i2] = 0; continue; }
+        // VELOCITY CARRIES THE MOTION. With remote inputs zeroed
+        // (snapshot-driven seats), P_ProcessInput integrates ps->vel through
+        // the clipper this tic -- full host speed, wall-aware. It must be the
+        // ONLY thing that moves them: v26 also applied a 5/16 positional pull,
+        // so the remote moved TWICE per tic and overshot every target, then
+        // the next pull reversed -- the "severe regression" (an oscillation a
+        // 256-tic net-displacement probe averages away, so metrics missed it).
+        ps->vel = s_rsVel[i2];
+        int32_t const ex = s_rsPos[i2].x - ps->pos.x;
+        int32_t const ey = s_rsPos[i2].y - ps->pos.y;
+        int32_t const ez = s_rsPos[i2].z - ps->pos.z;
+        int32_t const em = klabs(ex) + klabs(ey);
+        if (em > 2048)
+        {
+            // Teleport scale (respawn/warp): converge instantly, no ghost glide.
+            ps->pos = s_rsPos[i2];
+            ps->opos = ps->pos;
+            ps->bobpos.x = ps->pos.x; ps->bobpos.y = ps->pos.y;
+            vec3_t sp2 = s_rsSpr[i2];
+            setsprite(ps->i, &sp2);
+            actor[ps->i].bpos = sp2;
+            ps->q16ang = ps->oq16ang = s_rsAng[i2];
+            ps->q16horiz = ps->oq16horiz = s_rsHoriz[i2];
+            if ((unsigned)s_rsSect[i2] < (unsigned)numsectors)
+                ps->cursectnum = s_rsSect[i2];
+            continue;
+        }
+        // OVERSHOOT GUARD: when the position error points AGAINST the held
+        // velocity, the host has slowed/stopped/turned and we have glided
+        // past -- drop the held velocity so the remote settles instead of
+        // sailing on for the rest of the pack interval. This is what makes a
+        // stop look like a stop instead of a skid-and-return.
+        if ((int64_t)ex * ps->vel.x + (int64_t)ey * ps->vel.y < 0)
+            ps->vel.x = ps->vel.y = 0;
+        // DRIFT CORRECTION ONLY: velocity did the moving; nudge just the
+        // accumulated error, gently and clamped, past a deadband -- never a
+        // second full displacement.
+        if (em + (klabs(ez) >> 2) > 128)
+        {
+            int32_t const cx = clamp(ex >> 3, -48, 48);
+            int32_t const cy = clamp(ey >> 3, -48, 48);
+            int32_t const cz = clamp(ez >> 3, -96, 96);
+            ps->pos.x += cx; ps->pos.y += cy; ps->pos.z += cz;
+            ps->opos.x += cx; ps->opos.y += cy; ps->opos.z += cz;
+            ps->bobpos.x += cx; ps->bobpos.y += cy;
+        }
+        // SYNC THE RENDERED SPRITE TO ps->pos EVERY TIC. This is THE fix for
+        // "the bots are not running/moving, apart from rotating a bit": the
+        // sprite position was only setsprite'd INSIDE the drift block, so
+        // whenever velocity-carry tracked well (error < deadband, drift
+        // skipped) the sprite FROZE while ps->pos kept advancing (the probe
+        // saw motion, the screen did not). Facing slews below every tic ->
+        // "rotating a bit". Now the body follows the position every tic; bpos
+        // holds the pre-move sprite pos so the render lerp stays smooth.
+        {
+            int32_t const oxx = sprite[ps->i].x, oyy = sprite[ps->i].y, ozz = sprite[ps->i].z;
+            vec3_t spp = { ps->pos.x, ps->pos.y,
+                           ps->pos.z + (s_rsSpr[i2].z - s_rsPos[i2].z) };
+            setsprite(ps->i, &spp);
+            actor[ps->i].bpos.x = oxx; actor[ps->i].bpos.y = oyy; actor[ps->i].bpos.z = ozz;
+            int16_t cs2 = ps->cursectnum;
+            updatesector(ps->pos.x, ps->pos.y, &cs2);
+            if (cs2 >= 0)
+                ps->cursectnum = cs2;
+            else if ((unsigned)s_rsSect[i2] < (unsigned)numsectors)
+                ps->cursectnum = s_rsSect[i2];
+        }
+        // Per-tic motion trace (forensics): the JITTER meter the net-displacement
+        // probe is blind to. Sign reversals in dx/dy between consecutive samples
+        // = oscillation. First remote seat only, every 2nd tic.
+        {
+            extern int32_t g_netForensics;
+            // Log POSITION and SPRITE together: after the fix the sprite must
+            // track the position tic for tic. Every remote seat, every 4th tic.
+            if (g_netForensics && (movefifoplc & 3) == 0)
+                EM_ASM({ console.log('[rsmot] plc=' + $0 + ' seat=' + $1 + ' px=' + $2 + ' py=' + $3
+                         + ' sx=' + $4 + ' sy=' + $5); },
+                       movefifoplc, i2, ps->pos.x, ps->pos.y,
+                       sprite[ps->i].x, sprite[ps->i].y);
+        }
+        // Facing: bounded slew, never a head-jerk (the F16(32) deadband let
+        // remote heads sit visibly wrong, then snap 3x a second).
+        fix16_t dA = fix16_ssub(s_rsAng[i2], ps->q16ang);
+        while (dA > F16(1024))  dA = fix16_ssub(dA, F16(2048));
+        while (dA < -F16(1024)) dA = fix16_sadd(dA, F16(2048));
+        fix16_t const stepA = fix16_clamp(dA, -F16(20), F16(20));
+        ps->q16ang = ps->oq16ang = fix16_sadd(ps->q16ang, stepA);
+        while (ps->q16ang < 0)          ps->q16ang = fix16_sadd(ps->q16ang, F16(2048));
+        while (ps->q16ang >= F16(2048)) ps->q16ang = fix16_ssub(ps->q16ang, F16(2048));
+        ps->oq16ang = ps->q16ang;
+        fix16_t const dH = fix16_ssub(s_rsHoriz[i2], ps->q16horiz);
+        ps->q16horiz = ps->oq16horiz = fix16_sadd(ps->q16horiz, fix16_clamp(dH, -F16(8), F16(8)));
+        if ((unsigned)ps->i < MAXSPRITES)
+            sprite[ps->i].ang = fix16_to_int(ps->q16ang) & 2047;
+    }
+}
+
 void Net_ApplyPendingStateSnap(void)
 {
     if (s_pendingSnapLen == 0 || numplayers < 2)
@@ -4704,6 +5622,34 @@ void Net_ApplyPendingStateSnap(void)
         // live "host keeps correcting my movement". Legacy lockstep mode
         // keeps the full tic-aligned correction.
         bool applyPos = true;
+        if (!self && g_netStreamMode)
+        {
+            // REMOTE seats: pack becomes the smoothing TARGET (applied over
+            // the next few tics by Net_SmoothRemoteSeats). Health/score/death
+            // stay instant below -- status syncs once; motion glides.
+            s_rsPos[slot]   = pp;
+            s_rsSpr[slot]   = sp;
+            s_rsAng[slot]   = snapAng;
+            s_rsHoriz[slot] = snapHoriz;
+            s_rsSect[slot]  = cursect;
+            s_rsVel[slot]   = vel;
+            s_rsHave[slot]  = 1;
+            s_rsLastTic[slot] = movefifoplc;
+            ps->vel = vel;              // and held per-tic by the smoother
+            {
+                extern int32_t g_netForensics;
+                if (g_netForensics && (e == 0))
+                    EM_ASM({ console.log('[rserr] plc=' + $0 + ' seat=' + $1 + ' err=' + $2); },
+                           movefifoplc, slot,
+                           klabs(ps->pos.x - pp.x) + klabs(ps->pos.y - pp.y));
+            }
+            if ((unsigned)ps->i < MAXSPRITES)
+                sprite[ps->i].extra = sprExtra;
+            ps->frag        = frag;
+            ps->fraggedself = fragged;
+            ps->dead_flag   = dead;
+            continue;
+        }
         if (self && g_netStreamMode)
         {
             // XY only: teleporters and respawns always move laterally, while
@@ -5121,6 +6067,120 @@ static void Net_StreamAuthoritativeState(void)
 #endif
 }
 
+// CLIENT-SIDE PICKUP CREDIT (guest). Items are host-owned and the host
+// streams a DELETE when one is taken -- but the player pack carries NO
+// weapon/inventory state, so a guest that walked onto an item watched it
+// vanish without ever getting it (user: "weapon pickup ... needs to be client
+// side credited"). When a pickup is deleted right on top of MY player, grant
+// it here. Amounts follow the stock pickup values; exact parity is not
+// critical -- getting the weapon in hand is the point.
+static void Net_GrantPickup(DukePlayer_t *ps, int picnum)
+{
+    int const spid = ps->i;
+    switch (tileGetMapping(picnum))
+    {
+        case FIRSTGUNSPRITE__:   P_AddWeapon(ps, CHAINGUN_WEAPON, 1);   P_AddAmmo(ps, CHAINGUN_WEAPON, 50);   break;
+        case CHAINGUNSPRITE__:   P_AddWeapon(ps, CHAINGUN_WEAPON, 1);   P_AddAmmo(ps, CHAINGUN_WEAPON, 50);   break;
+        case SHOTGUNSPRITE__:    P_AddWeapon(ps, SHOTGUN_WEAPON, 1);    P_AddAmmo(ps, SHOTGUN_WEAPON, 10);    break;
+        case RPGSPRITE__:        P_AddWeapon(ps, RPG_WEAPON, 1);        P_AddAmmo(ps, RPG_WEAPON, 5);         break;
+        case DEVISTATORSPRITE__: P_AddWeapon(ps, DEVISTATOR_WEAPON, 1); P_AddAmmo(ps, DEVISTATOR_WEAPON, 30); break;
+        case FREEZESPRITE__:     P_AddWeapon(ps, FREEZE_WEAPON, 1);     P_AddAmmo(ps, FREEZE_WEAPON, 99);     break;
+        case SHRINKERSPRITE__:   P_AddWeapon(ps, SHRINKER_WEAPON, 1);   P_AddAmmo(ps, SHRINKER_WEAPON, 5);    break;
+        case GROWSPRITEICON__:   P_AddWeapon(ps, GROW_WEAPON, 1);       P_AddAmmo(ps, GROW_WEAPON, 5);        break;
+        case TRIPBOMBSPRITE__:   P_AddWeapon(ps, TRIPBOMB_WEAPON, 1);   P_AddAmmo(ps, TRIPBOMB_WEAPON, 3);    break;
+        case HEAVYHBOMB__:       P_AddWeapon(ps, HANDBOMB_WEAPON, 1);   P_AddAmmo(ps, HANDBOMB_WEAPON, 1);    break;
+
+        case AMMO__:             P_AddAmmo(ps, PISTOL_WEAPON, 48);      break;
+        case SHOTGUNAMMO__:      P_AddAmmo(ps, SHOTGUN_WEAPON, 10);     break;
+        case BATTERYAMMO__:      P_AddAmmo(ps, CHAINGUN_WEAPON, 50);    break;
+        case AMMOLOTS__:         P_AddAmmo(ps, CHAINGUN_WEAPON, 50);    break;
+        case RPGAMMO__:          P_AddAmmo(ps, RPG_WEAPON, 5);          break;
+        case HBOMBAMMO__:        P_AddAmmo(ps, HANDBOMB_WEAPON, 1);     break;
+        case CRYSTALAMMO__:      P_AddAmmo(ps, SHRINKER_WEAPON, 5);     break;
+        case DEVISTATORAMMO__:   P_AddAmmo(ps, DEVISTATOR_WEAPON, 30);  break;
+        case FREEZEAMMO__:       P_AddAmmo(ps, FREEZE_WEAPON, 49);      break;
+        case GROWAMMO__:         P_AddAmmo(ps, GROW_WEAPON, 20);        break;
+
+        case ATOMICHEALTH__:     sprite[spid].extra = min<int>(sprite[spid].extra + 50, 200); break;
+        case SIXPAK__:           sprite[spid].extra = min<int>(max<int>(sprite[spid].extra, 0) + 30, 100); break;
+        case COLA__:             sprite[spid].extra = min<int>(max<int>(sprite[spid].extra, 0) + 10, 100); break;
+        case SHIELD__:           ps->inv_amount[GET_SHIELD]   = min<int>(ps->inv_amount[GET_SHIELD] + 100, 100); break;
+        case FIRSTAID__:         ps->inv_amount[GET_FIRSTAID] = 100;  break;
+        case STEROIDS__:         ps->inv_amount[GET_STEROIDS] = 400;  break;
+        case JETPACK__:          ps->inv_amount[GET_JETPACK]  = 1600; break;
+        case HOLODUKE__:         ps->inv_amount[GET_HOLODUKE] = 1600; break;
+        case HEATSENSOR__:       ps->inv_amount[GET_HEATS]    = 1200; break;
+        case BOOTS__:            ps->inv_amount[GET_BOOTS]    = 200;  break;
+        case AIRTANK__:          ps->inv_amount[GET_SCUBA]    = 6400; break;
+        default: break;
+    }
+}
+// A locally-grabbed item is suppressed (kept deleted) until this plc, so the
+// host's continued streaming of it -- the host may still think it's there,
+// e.g. a BFG risen out of its reach on a platform -- does not un-delete it.
+static int32_t s_itemConsumedUntil[MAXSPRITES];
+static int16_t s_itemConsumedPic[MAXSPRITES];
+
+static void Net_ClientCreditPickup(int idx)
+{
+    if (!g_netStreamMode || numplayers < 2 || myconnectindex == connecthead)
+        return;                                // host runs the real pickup itself
+    auto const ps = g_player[myconnectindex].ps;
+    if (ps == NULL || (unsigned)ps->i >= MAXSPRITES || ps->dead_flag
+        || !Bot_IsPickup(sprite[idx].picnum))
+        return;
+    int32_t const d = klabs(sprite[idx].x - ps->pos.x) + klabs(sprite[idx].y - ps->pos.y);
+    if (d > 1536)
+        return;                                // not near it: someone else took it
+    Net_GrantPickup(ps, sprite[idx].picnum);
+}
+
+// CLIENT-AUTHORITATIVE pickup (guest). Waiting for the host to DELETE an item
+// cannot work when the host disagrees it was collected -- the user's BFG that
+// rises on a platform: the host thinks it is out of reach (height), never
+// registers the pickup, so the guest that walked onto it (on its own screen)
+// never gets it. So the guest grabs its OWN pickups by HORIZONTAL proximity,
+// tolerant of the vertical disagreement, and suppresses the item locally so
+// the host's continued stream of it does not resurrect it before it respawns.
+static void Net_ClientPickupScan(void)
+{
+    if (!g_netStreamMode || numplayers < 2 || myconnectindex == connecthead)
+        return;
+    auto const ps = g_player[myconnectindex].ps;
+    if (ps == NULL || (unsigned)ps->i >= MAXSPRITES || ps->dead_flag
+        || (unsigned)ps->cursectnum >= (unsigned)numsectors)
+        return;
+    int16_t sects[24]; int ns = 0;
+    sects[ns++] = ps->cursectnum;
+    int const wend = sector[ps->cursectnum].wallptr + sector[ps->cursectnum].wallnum;
+    for (int w = sector[ps->cursectnum].wallptr; w < wend && ns < 24; w++)
+    {
+        int const nx = wall[w].nextsector;
+        if (nx < 0 || (unsigned)nx >= (unsigned)numsectors) continue;
+        int dup = 0; for (int q = 0; q < ns; q++) if (sects[q] == nx) { dup = 1; break; }
+        if (!dup) sects[ns++] = (int16_t)nx;
+    }
+    for (int q = 0; q < ns; q++)
+        for (int jj = headspritesect[sects[q]]; jj >= 0; )
+        {
+            int const nextjj = nextspritesect[jj];
+            if ((unsigned)jj < MAXSPRITES && Bot_IsPickup(sprite[jj].picnum)
+                && !(sprite[jj].cstat & 32768))
+            {
+                int32_t const dh = klabs(sprite[jj].x - ps->pos.x) + klabs(sprite[jj].y - ps->pos.y);
+                // Horizontal grab; VERY tolerant vertically (a full lift of
+                // travel) so the rising-platform height gap never blocks it.
+                if (dh <= 896 && klabs(sprite[jj].z - ps->pos.z) <= (200 << 8))
+                {
+                    Net_GrantPickup(ps, sprite[jj].picnum);
+                    s_itemConsumedUntil[jj] = movefifoplc + 360;   // ~12s hide
+                    s_itemConsumedPic[jj]   = sprite[jj].picnum;
+                    A_DeleteSprite(jj);
+                }
+            }
+            jj = nextjj;
+        }
+}
 static void Net_ApplySpriteStream(const char *buf, int len)
 {
     if (len < 2)
@@ -5155,6 +6215,19 @@ static void Net_ApplySpriteStream(const char *buf, int len)
         if (Net_IsPlayerSprite(idx))
             continue;                      // the player pack owns those
         if ((flags & NET_SPRF_DELETE) || stat == 0xFFFFu)
+        {
+            if (sprite[idx].statnum < MAXSTATUS)
+            {
+                Net_ClientCreditPickup(idx);   // guest grabs its own pickups before they vanish
+                A_DeleteSprite(idx);
+            }
+            s_itemConsumedUntil[idx] = 0;      // gone on the host too: stop suppressing
+            continue;
+        }
+        // A pickup this guest already grabbed (client-authoritative): the host
+        // may keep streaming it (it still thinks it's there -- the rising BFG),
+        // so keep it hidden locally until the suppression window expires.
+        if (s_itemConsumedUntil[idx] > movefifoplc && picnum == s_itemConsumedPic[idx])
         {
             if (sprite[idx].statnum < MAXSTATUS)
                 A_DeleteSprite(idx);

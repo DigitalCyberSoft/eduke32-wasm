@@ -1380,6 +1380,13 @@ int A_IncurDamage(int const spriteNum)
 
         int const playerNum = P_GetP(pSprite);
 
+        // NOTE: client-authoritative hit REPORTING moved to P_FireWeapon
+        // (player.cpp) -- the guest never reaches A_IncurDamage for its own
+        // shots (weapons are host-authoritative; the guest exits the fire path),
+        // so a hook here was dead code. The guest now does an explicit hitscan at
+        // fire time and reports directly. Only the host-side retaliation stamp
+        // below remains here.
+
 #ifndef EDUKE32_STANDALONE
         if (!FURY && pActor->htowner >= 0 && (sprite[pActor->htowner].picnum == APLAYER))
         {
@@ -1398,6 +1405,22 @@ int A_IncurDamage(int const spriteNum)
         }
 #endif
         pSprite->extra -= pActor->htextra;
+
+#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+        // BOT RETALIATION on ANY hit (user 2026-08-10): stock stamps
+        // wackedbyactor only on death, so a bot never knew who was chipping at
+        // it. For a surviving BOT victim on the host, record the attacking
+        // player NOW so Bot_GetInput re-locks onto it. Host-authoritative bullets
+        // only (bot/host shooters); guest bullets stamp it via Net_ApplyHitReport.
+        {
+            extern int32_t g_netBotMask;
+            if (myconnectindex == connecthead && numplayers > 1
+                && (g_netBotMask & (1 << playerNum)) && pSprite->extra > 0
+                && (unsigned)pActor->htowner < MAXSPRITES
+                && sprite[pActor->htowner].picnum == APLAYER)
+                g_player[playerNum].ps->wackedbyactor = (int16_t)pActor->htowner;
+        }
+#endif
 
 #if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
         // Bot-combat forensics: the REAL player-damage application (bullet

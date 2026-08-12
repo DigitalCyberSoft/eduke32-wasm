@@ -7439,6 +7439,7 @@ int G_DoMoveThings(void)
     if (numplayers > 1)
     {
         Net_ApplyPendingStateSnap();  // tic-aligned soft snap (oldnet.cpp)
+        Net_SmoothRemoteSeats();      // remote seats glide to pack targets
         // Seats and drops must ALSO bind to the tic being consumed, not the
         // frame: a catching-up joiner consumes dozens of tics per G_MoveLoop
         // pass, so its frame-top boundary processing excised the yielded bot
@@ -7451,6 +7452,33 @@ int G_DoMoveThings(void)
     }
     for (bssize_t TRAVERSE_CONNECT(i))
         Bmemcpy(&g_player[i].input, &inputfifo[numplayers > 1 ? (movefifoplc & (MOVEFIFOSIZ - 1)) : 0][i], sizeof(input_t));
+#ifdef NETDUKE32
+    // STREAM MODE, guest side: remote players are SNAPSHOT-DRIVEN, never
+    // input-simulated (the OpenArena client rule). Replaying their movement
+    // inputs through local physics made a second authority that fought the
+    // state packs over every remote body -- at walls they deadlocked into
+    // the user's screenshots: a bot pinned in place, "being pushed into the
+    // wall", while the host's copy had long since slid past. Zero the motion
+    // components; keep the buttons (fire/jump visuals are honest cosmetics).
+    // Velocity arrives with each pack, so P_ProcessInput still glides them
+    // through the clipper -- wall-respecting dead reckoning -- and the
+    // smoother's soft pull plus bounded facing slew do the rest.
+    {
+        extern int32_t g_netStreamMode;
+        if (g_netStreamMode && numplayers > 1 && myconnectindex != connecthead)
+        {
+            for (bssize_t TRAVERSE_CONNECT(i))
+            {
+                if (i == myconnectindex)
+                    continue;
+                g_player[i].input.fvel    = 0;
+                g_player[i].input.svel    = 0;
+                g_player[i].input.q16avel = 0;
+                g_player[i].input.q16horz = 0;
+            }
+        }
+    }
+#endif
     if (numplayers > 1)
         movefifoplc++;
 
@@ -7532,6 +7560,25 @@ int G_DoMoveThings(void)
 
     if (ud.pause_on == 0)
         G_MoveWorld();
+
+#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+    // LAST MAN STANDING round manager (host-only, per authoritative tic). Counts
+    // survivors and, on <=1 remaining, announces the winner and starts a fresh
+    // round. No-op unless the gametype is LMS.
+    if (numplayers > 1)
+    {
+        extern int32_t g_netForensics;
+        static int s_lmsProbe;
+        if (g_netForensics && (++s_lmsProbe % 260) == 1)
+            EM_ASM({ console.log('[lmsprobe] coop=' + $0 + ' cnt=' + $1 + ' lmsflag=' + $2); },
+                   ud.coop, g_gametypeCnt, (g_gametypeFlags[ud.coop] & GAMETYPE_LMS) ? 1 : 0);
+        if (g_gametypeFlags[ud.coop] & GAMETYPE_LMS)
+        {
+            extern void Net_LmsTick(void);
+            Net_LmsTick();
+        }
+    }
+#endif
 
 #ifdef NETDUKE32
     // Reconcile prediction against the tic that just became authoritative:
