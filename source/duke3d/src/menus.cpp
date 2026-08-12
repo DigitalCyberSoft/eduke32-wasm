@@ -2877,9 +2877,13 @@ void Menu_Init(void)
     // difficulty select (user: "the CPU skills should match the regular game
     // levels"). Four fixed tiers map onto the bot brain's 0..3 tuning; a skill
     // slot the CON leaves unnamed keeps its classic compiled-in fallback.
+    // (MEOSN_NET_BOTSKILL lives in the Emscripten net-menu block, so this mirror
+    // is Emscripten-only too -- a native build has no CPU-skill picker.)
+#ifdef __EMSCRIPTEN__
     for (i = 0; i < 4; ++i)
         if (i < g_maxDefinedSkill && g_skillNames[i][0])
             MEOSN_NET_BOTSKILL[i] = g_skillNames[i];
+#endif
 
     // If no skills defined, skill menu will be skipped and default skill is used.
     if (!g_maxDefinedSkill)

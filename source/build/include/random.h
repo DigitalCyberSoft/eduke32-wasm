@@ -19,10 +19,14 @@
 int32_t randomseed;
 uint32_t wrandomseed = 1;
 int32_t g_krandCalls;
+// The actor movers set g_krandSpriteCtx unconditionally (actors.cpp/sector.cpp),
+// so it must be declared in EVERY build config, not just NETDUKE32 -- otherwise
+// a native compile hits "not declared in this scope". The RNG trace that reads
+// it stays NETDUKE32-only below.
+int32_t g_krandSpriteCtx = -1;   // sprite the actor movers are processing
 #if defined(NETDUKE32) && !KRANDDEBUG
 const char *g_krandSiteRing[8];
 int16_t g_krandSiteSpr[8];
-int32_t g_krandSpriteCtx = -1;   // sprite the actor movers are processing
 int32_t krand_traced(const char *site)
 {
     if (g_krandCalls < 8)
@@ -43,10 +47,10 @@ extern uint32_t wrandomseed;
 // mismatch at a tic names "extra RNG consumer" directly, and a count that
 // flakes between stamps exposes frame-rate callers polluting the sim stream.
 extern int32_t g_krandCalls;
+extern int32_t g_krandSpriteCtx;         // set by the actor movers per sprite (all configs)
 #if defined(NETDUKE32) && !KRANDDEBUG
 extern const char *g_krandSiteRing[8];   // this tic's first call sites
 extern int16_t g_krandSiteSpr[8];        // ...and the sprite each was processing
-extern int32_t g_krandSpriteCtx;         // set by the actor movers per sprite
 #endif
 #endif
 

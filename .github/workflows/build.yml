@@ -1,0 +1,135 @@
+name: Build & Release (web + native)
+
+# Web build is the fork's shippable product (WASM, runs on any browser on
+# Mac/Windows/Linux). Native jobs ATTEMPT the desktop build on each platform's
+# own runner -- they are non-blocking (continue-on-error) while the netcode is
+# ported off Emscripten (the whole stream-mode multiplayer is currently
+# #ifdef __EMSCRIPTEN__), so they document the port and go green once it lands.
+#
+# Push a tag like v0.1.0 to cut a Release with the web bundle attached; every
+# push to the integration branch just builds + uploads artifacts.
+
+on:
+  push:
+    branches: [integration-merge, wasm]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create Releases
+
+jobs:
+  # ---- WASM / web build (the working product) ---------------------------------
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.5
+          actions-cache-folder: emsdk-cache
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build multiplayer transport bundle
+        working-directory: platform/emscripten
+        run: npm ci && npm test && npm run build:net
+      - name: Build WASM (software renderer, NetDuke32 multiplayer)
+        run: make PLATFORM=EMSCRIPTEN EM_SINGLE_FILE=0 NETDUKE32=1 -j"$(nproc)"
+      - name: Assemble web bundle
+        run: |
+          mkdir -p eduke32-wasm-web
+          cp eduke32.js eduke32.wasm eduke32.data eduke32-wasm-web/
+          cp platform/emscripten/index.html eduke32-wasm-web/index.html
+          cp platform/emscripten/eduke32-net.js eduke32-wasm-web/eduke32-net.js
+          cp platform/emscripten/grp-manifest.json eduke32-wasm-web/grp-manifest.json 2>/dev/null || true
+          BUILD_ID="${{ github.run_number }}-$(git rev-parse --short HEAD)"
+          sed -i "s/__BUILD_ID__/${BUILD_ID}/g" eduke32-wasm-web/index.html
+          zip -r eduke32-wasm-web.zip eduke32-wasm-web
+      - name: Upload web bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eduke32-wasm-web
+          path: eduke32-wasm-web.zip
+
+  # ---- Native desktop builds (attempted; port in progress) --------------------
+  native:
+    name: native (${{ matrix.name }})
+    continue-on-error: true          # non-blocking while the netcode is de-Emscriptenified
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  name: linux }
+          - { os: macos-latest,   name: macos }
+          - { os: windows-latest, name: windows }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deps (Linux)
+        if: matrix.name == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential libsdl2-dev libsdl2-mixer-dev libgtk-3-dev flac libvorbis-dev
+
+      - name: Deps (macOS)
+        if: matrix.name == 'macos'
+        run: brew install sdl2 sdl2_mixer flac libvorbis
+
+      - name: Set up MSYS2 (Windows)
+        if: matrix.name == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-SDL2_mixer mingw-w64-x86_64-flac make
+
+      - name: Build native (Linux/macOS)
+        if: matrix.name != 'windows'
+        run: make NETDUKE32=1 USE_LIBVPX=0 RENDERTYPE=SDL SDL_TARGET=2 -j2
+
+      - name: Build native (Windows / MSYS2)
+        if: matrix.name == 'windows'
+        shell: msys2 {0}
+        run: make NETDUKE32=1 USE_LIBVPX=0 -j2
+
+      - name: Package native binary
+        if: success()
+        run: |
+          mkdir -p eduke32-native-${{ matrix.name }}
+          cp eduke32* eduke32-native-${{ matrix.name }}/ 2>/dev/null || true
+          ls -la eduke32-native-${{ matrix.name }}/
+
+      - name: Upload native artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eduke32-native-${{ matrix.name }}
+          path: eduke32-native-${{ matrix.name }}
+
+  # ---- Release (on a v* tag): attach whatever built --------------------------
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [web]                     # native is best-effort; don't block the release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true
+          body: |
+            eduke32-wasm ${{ github.ref_name }}
+
+            **Web build** (`eduke32-wasm-web.zip`): the browser/WASM Duke3D with
+            serverless WebRTC+Nostr P2P multiplayer -- runs on macOS/Windows/Linux
+            via any browser. Also live on GitHub Pages.
+
+            Native desktop binaries are attached only if the native jobs succeeded;
+            the netcode port off Emscripten is in progress (see build.yml).
