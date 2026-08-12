@@ -240,43 +240,47 @@ private:
             std::lock_guard<std::mutex> lk(sendMtx_);
             q.swap(sendQ_);
         }
-        for (auto &m : q)
-        {
-            if (!wsSendAll(c, m))
+        size_t i = 0;
+        for (; i < q.size(); ++i)
+            if (!wsSendAll(c, q[i]))
             {
                 dropped = true;
-                // Re-queue the unsent tail so a reconnect can retry it.
-                std::lock_guard<std::mutex> lk(sendMtx_);
-                sendQ_.push_front(m);
-                return;
+                break;
             }
+        if (i < q.size())
+        {
+            // Re-queue the ENTIRE unsent tail (q[i..]) in order, ahead of anything
+            // enqueued since the swap, so a reconnect retries all of it -- not just
+            // the one message that failed.
+            std::lock_guard<std::mutex> lk(sendMtx_);
+            for (size_t k = q.size(); k-- > i;)
+                sendQ_.push_front(q[k]);
         }
     }
 
-    // Send a whole text message; loops if libcurl accepts it in pieces. Relay
-    // control/EVENT messages are small (a few KB), so the loop rarely iterates.
+    // Send one whole text message. Nostr control/EVENT messages are small (a few
+    // KB) and fit the socket buffer, so a single curl_ws_send sends them entire.
+    // A partial accept would desync WebSocket framing (the frame header already
+    // declared the full length), so force a reconnect rather than emit a bogus
+    // continuation frame; the half-sent frame dies with the closed socket. On
+    // CURLE_AGAIN curl has accepted 0 bytes, so retrying the whole buffer is safe.
     static bool wsSendAll(CURL *c, const std::string &m)
     {
-        size_t off = 0;
-        int spins = 0;
-        while (off < m.size())
+        for (int spins = 0;;)
         {
             size_t sent = 0;
-            unsigned flags = (off == 0) ? CURLWS_TEXT : CURLWS_CONT;
-            CURLcode r = curl_ws_send(c, m.data() + off, m.size() - off, &sent, 0, flags);
+            CURLcode r = curl_ws_send(c, m.data(), m.size(), &sent, 0, CURLWS_TEXT);
             if (r == CURLE_AGAIN)
             {
                 if (++spins > 2000)
-                    return false; // ~2s stuck: treat as dropped
+                    return false; // ~2s stuck: treat as dropped -> reconnect
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
             if (r != CURLE_OK)
                 return false;
-            off += sent;
-            spins = 0;
+            return sent == m.size(); // partial accept -> reconnect (never in practice)
         }
-        return true;
     }
 
     void sleepInterruptible(int ms)
