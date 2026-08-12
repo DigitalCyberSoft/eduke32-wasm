@@ -1184,6 +1184,13 @@ static int osdcmd_dumpmapstate(osdfuncparm_t const * const)
     return OSDCMD_OK;
 }
 
+int Net_PortableSnapAbiTest(void);   // savegame.cpp
+static int osdcmd_snap_abitest(osdfuncparm_t const * const)
+{
+    Net_PortableSnapAbiTest();   // logs [abitest] PASS/FAIL; see LOG
+    return OSDCMD_OK;
+}
+
 static int osdcmd_playerinfo(osdfuncparm_t const * const)
 {
     LOG_F(INFO, "Your player index is %d.", myconnectindex);
@@ -1785,6 +1792,7 @@ int32_t registerosdcommands(void)
     OSD_RegisterFunction("connect","connect: connects to a multiplayer game", osdcmd_connect);
     OSD_RegisterFunction("disconnect","disconnect: disconnects from the local multiplayer game", osdcmd_disconnect);
     OSD_RegisterFunction("dumpmapstates", "dumps current snapshots to CL/Srv_MapStates.bin", osdcmd_dumpmapstate);
+    OSD_RegisterFunction("snap_abitest", "snap_abitest: portable late-join snapshot self-test (save+reload; cross 32/64-bit transcode)", osdcmd_snap_abitest);
 #if 0
     OSD_RegisterFunction("kick","kick <id>: kicks a multiplayer client.  See listplayers.", osdcmd_kick);
     OSD_RegisterFunction("kickban","kickban <id>: kicks a multiplayer client and prevents them from reconnecting.  See listplayers.", osdcmd_kickban);

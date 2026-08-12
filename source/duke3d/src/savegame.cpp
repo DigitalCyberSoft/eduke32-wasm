@@ -888,6 +888,78 @@ uint16_t G_CountOldSaves(void)
     return bad;
 }
 
+// Hash the pointer-width-sensitive snapshot state (CON gamevars + g_animatePtr):
+// exactly the DS_PTRCELL cells the portable snapshot narrows/widens. Used by the
+// self-test below to prove the transcode round-trips losslessly.
+static uint64_t sv_ptrcellHash(void)
+{
+    uint64_t h = 1469598103934665603ULL;               // FNV-1a
+    auto mix = [&h](int64_t v) { h ^= (uint64_t)v; h *= 1099511628211ULL; };
+    for (int i = 0; i < g_gameVarCount; i++)
+    {
+        if (aGameVars[i].flags & SAVEGAMEVARSKIPMASK)   // == SV_SKIPMASK (defined later); skip non-serialized vars
+            continue;
+        unsigned const per = aGameVars[i].flags & GAMEVAR_USER_MASK;
+        if (per == 0)
+            mix((int64_t)aGameVars[i].global);
+        else
+        {
+            intptr_t const *pv = aGameVars[i].pValues;
+            int const n = (per == GAMEVAR_PERPLAYER) ? MAXPLAYERS : MAXSPRITES;
+            if (pv)
+                for (int k = 0; k < n; k++)
+                    mix((int64_t)pv[k]);
+        }
+    }
+    mix(g_animateCnt);
+    for (int i = 0; i < g_animateCnt; i++)
+        mix((int64_t)(intptr_t)g_animatePtr[i]);
+    return h;
+}
+
+// Portable-snapshot self-test (dev; OSD "snap_abitest"). Checksum the
+// pointer-width-sensitive state, write the PORTABLE late-join snapshot, load it
+// straight back through sv_loadheader/sv_loadsnapshot (which runs the DS_PTRCELL
+// narrow-on-save / widen-on-load transcode and the relaxed ptrsize gate), then
+// re-checksum. Equal hashes => the cross 32/64-bit transcode is lossless on this
+// build; the reported header ptrsize should be SV_PORTABLE_PTRSIZE. 0 on PASS.
+int Net_PortableSnapAbiTest(void)
+{
+    if (g_player[myconnectindex].ps == NULL || numsectors <= 0)
+    {
+        LOG_F(INFO, "[abitest] no level loaded; start a game (or let the attract demo run) first.");
+        return -1;
+    }
+
+    uint64_t const c0 = sv_ptrcellHash();
+
+    if (Net_SaveLateJoinSnapshot() != 0)
+    {
+        LOG_F(INFO, "[abitest] Net_SaveLateJoinSnapshot() failed.");
+        return -1;
+    }
+
+    buildvfs_kfd fd = kopen4load("latejoin.esv", 0);
+    if (fd == buildvfs_kfd_invalid)
+    {
+        LOG_F(INFO, "[abitest] cannot reopen latejoin.esv");
+        return -1;
+    }
+    savehead_t h;
+    int st = sv_loadheader(fd, 0, &h);
+    LOG_F(INFO, "[abitest] portable snapshot header: ptrsize=%d (native sizeof(intptr_t)=%d), snapsiz=%d, loadheader=%d",
+          (int)h.getPtrSize(), (int)sizeof(intptr_t), (int)h.snapsiz, st);
+    if (!st)
+        st = sv_loadsnapshot(fd, 0, &h);
+    kclose(fd);
+
+    uint64_t const c1 = sv_ptrcellHash();
+    bool const pass = (st == 0) && (c0 == c1);
+    LOG_F(INFO, "[abitest] load status=%d  ptrcell-hash pre=%016llx post=%016llx  => %s",
+          st, (unsigned long long)c0, (unsigned long long)c1, pass ? "PASS" : "FAIL");
+    return pass ? 0 : -1;
+}
+
 // LATE-JOIN SNAPSHOT (oldnet transport track): write the running game to a fixed
 // file the transport then streams to every peer. Lives here for G_SaveTimers /
 // G_RestoreTimers (static). 0 on success.
@@ -900,7 +972,10 @@ int Net_SaveLateJoinSnapshot(void)
         G_RestoreTimers();
         return -1;
     }
-    int const r = sv_saveandmakesnapshot(fil, "latejoin", 0, 0, 0, 0, false);
+    // portable=true: cross 32/64-bit late-join. The network snapshot must load on
+    // a peer of the other pointer width (native host <-> wasm guest), so its
+    // intptr_t cells go on the wire at the fixed SV_PORTABLE_PTRSIZE.
+    int const r = sv_saveandmakesnapshot(fil, "latejoin", 0, 0, 0, 0, false, /*portable=*/true);
     buildvfs_fclose(fil);
     G_RestoreTimers();
 #if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
@@ -1089,7 +1164,18 @@ static uint8_t savegame_comprthres;
 #define DS_SAVEFN 256  // .ptr is function that is run when saving
 #define DS_NOCHK 1024  // don't check for diffs (and don't write out in dump) since assumed constant throughout demo
 #define DS_PROTECTFN 512
+#define DS_PTRCELL 2048  // cells are intptr_t-width; a portable snapshot serializes them as fixed int32 (cross 32/64-bit netplay)
 #define DS_END (0x70000000)
+
+// Portable (cross 32/64-bit) network-snapshot wire width for DS_PTRCELL cells
+// (gamevars, gamearrays, g_animatePtr). Equal to sizeof(intptr_t) normally (no
+// transcode); set to SV_PORTABLE_PTRSIZE only for the duration of a portable
+// network snapshot save/load, so a 64-bit native host and a 32-bit wasm guest
+// produce and consume byte-identical late-join snapshots. Their values are
+// semantically 32-bit (CON is a 32-bit VM; relativized offsets fit int32), so
+// the narrow-on-save / widen-on-load is lossless.
+#define SV_PORTABLE_PTRSIZE 4
+static int sv_wirePtrSize = sizeof(intptr_t);
 
 static int32_t ds_getcnt(const dataspec_t *spec)
 {
@@ -1145,9 +1231,28 @@ static uint8_t *writespecdata(const dataspec_t *spec, buildvfs_FILE fil, uint8_t
         if (!ptr || !cnt)
             continue;
 
+        // Portable snapshot: DS_PTRCELL cells are native intptr_t but must go on
+        // the wire at the fixed portable width so 32/64-bit peers agree. Narrow
+        // into a scratch int32 buffer, then write that. (No transcode when the
+        // wire width already equals the native width -- native disk saves, demos,
+        // and the wasm build, where this is a plain raw dump.) The dump/diff path
+        // below is demo-only and never runs portable, so it stays raw.
+        bool const xcode = (spec->flags & DS_PTRCELL) && (uint32_t)sv_wirePtrSize != spec->size;
+
         if (fil)
         {
-            if ((spec->flags & DS_CMP) || ((spec->flags & DS_CNTMASK) == 0 && spec->size * cnt <= savegame_comprthres))
+            if (xcode)
+            {
+                int32_t *const wbuf = (int32_t *)Xmalloc((size_t)cnt * sizeof(int32_t));
+                intptr_t const *const src = (intptr_t const *)ptr;
+                for (int i = 0; i < cnt; i++) wbuf[i] = (int32_t)src[i];
+                if ((spec->flags & DS_CMP) || ((spec->flags & DS_CNTMASK) == 0 && (uint32_t)sv_wirePtrSize * cnt <= savegame_comprthres))
+                    buildvfs_fwrite(wbuf, sv_wirePtrSize, cnt, fil);
+                else
+                    dfwrite_LZ4((void *)wbuf, sv_wirePtrSize, cnt, fil);
+                Xfree(wbuf);
+            }
+            else if ((spec->flags & DS_CMP) || ((spec->flags & DS_CNTMASK) == 0 && spec->size * cnt <= savegame_comprthres))
                 buildvfs_fwrite(ptr, spec->size, cnt, fil);
             else
                 dfwrite_LZ4((void *)ptr, spec->size, cnt, fil);
@@ -1217,7 +1322,33 @@ static int32_t readspecdata(const dataspec_t *spec, buildvfs_kfd fil, uint8_t **
         if (!ptr || !cnt)
             continue;
 
-        if (fil != buildvfs_kfd_invalid)
+        // Portable snapshot: DS_PTRCELL cells arrive at the fixed portable width;
+        // read them into a scratch int32 buffer and widen (sign-extend) into the
+        // native intptr_t state. No transcode when wire==native width (native disk
+        // saves, demos, wasm) -- then it is the plain read below. Portable late-join
+        // reads straight from file with no dump buffer, so mem is always ptr.
+        bool const xcode = (spec->flags & DS_PTRCELL) && (uint32_t)sv_wirePtrSize != spec->size;
+
+        if (fil != buildvfs_kfd_invalid && xcode)
+        {
+            int32_t *const wbuf = (int32_t *)Xmalloc((size_t)cnt * sizeof(int32_t));
+            bool const comp = !((spec->flags & DS_CNTMASK) == 0 && (uint32_t)sv_wirePtrSize * cnt <= savegame_comprthres);
+            int const  siz  = comp ? cnt : cnt * sv_wirePtrSize;
+            int const  ksiz = comp ? kdfread_LZ4(wbuf, sv_wirePtrSize, siz, fil) : kread(fil, wbuf, siz);
+
+            if (ksiz != siz)
+            {
+                OSD_Printf("rsd: DS_PTRCELL spec=%s, idx=%d: read %d, expected %d!\n",
+                           (char *)sptr->ptr, (int32_t)(spec - sptr), ksiz, siz);
+                Xfree(wbuf);
+                return -1;
+            }
+
+            intptr_t *const dst = (intptr_t *)ptr;
+            for (int i = 0; i < cnt; i++) dst[i] = (intptr_t)wbuf[i];
+            Xfree(wbuf);
+        }
+        else if (fil != buildvfs_kfd_invalid)
         {
             auto const mem  = (dump && (spec->flags & DS_NOCHK) == 0) ? dump : (uint8_t *)ptr;
             bool const comp = !((spec->flags & DS_CNTMASK) == 0 && spec->size * cnt <= savegame_comprthres);
@@ -1507,7 +1638,7 @@ static uint32_t calcsz(const dataspec_t *spec)
         if (cnt <= 0)
             continue;
 
-        dasiz += cnt * spec->size;
+        dasiz += cnt * ((spec->flags & DS_PTRCELL) ? (uint32_t)sv_wirePtrSize : spec->size);
     }
 
     return dasiz;
@@ -1671,7 +1802,7 @@ static const dataspec_t svgm_anmisc[] =
     { 0, &g_animateGoal[0], sizeof(g_animateGoal[0]), MAXANIMATES },
     { 0, &g_animateVel[0], sizeof(g_animateVel[0]), MAXANIMATES },
     { DS_SAVEFN, (void *)&sv_preanimateptrsave, 0, 1 },
-    { 0, &g_animatePtr[0], sizeof(g_animatePtr[0]), MAXANIMATES },
+    { DS_PTRCELL, &g_animatePtr[0], sizeof(g_animatePtr[0]), MAXANIMATES },
     { DS_SAVEFN|DS_LOADFN , (void *)&sv_postanimateptr, 0, 1 },
     { 0, &g_curViewscreen, sizeof(g_curViewscreen), 1 }, // unused
     { 0, &g_origins[0], sizeof(g_origins[0]), ARRAY_SIZE(g_origins) },
@@ -1736,7 +1867,7 @@ static void sv_makevarspec()
 
         unsigned const per = aGameVars[i].flags & GAMEVAR_USER_MASK;
 
-        svgm_vars[vcnt].flags = 0;
+        svgm_vars[vcnt].flags = DS_PTRCELL;  // intptr_t cells -> fixed int32 on the portable wire
         svgm_vars[vcnt].ptr   = (per == 0) ? &aGameVars[i].global : aGameVars[i].pValues;
         svgm_vars[vcnt].size  = sizeof(intptr_t);
         svgm_vars[vcnt].cnt   = (per == 0) ? 1 : (per == GAMEVAR_PERPLAYER ? MAXPLAYERS : MAXSPRITES);
@@ -1764,6 +1895,7 @@ static void sv_makevarspec()
         }
         else
         {
+            svgm_vars[vcnt].flags = DS_PTRCELL;  // intptr_t cells -> fixed int32 on the portable wire
             svgm_vars[vcnt].size = pValues == NULL ? 0 : sizeof(aGameArrays[0].pValues[0]);
             svgm_vars[vcnt].cnt  = aGameArrays[i].size;  // assumed constant throughout demo, i.e. no RESIZEARRAY
         }
@@ -1796,9 +1928,14 @@ static void SV_AllocSnap(int32_t allocinit)
 }
 
 // make snapshot only if spot < 0 (demo)
-int32_t sv_saveandmakesnapshot(buildvfs_FILE fil, char const *name, int8_t spot, int8_t recdiffsp, int8_t diffcompress, int8_t synccompress, bool isAutoSave)
+int32_t sv_saveandmakesnapshot(buildvfs_FILE fil, char const *name, int8_t spot, int8_t recdiffsp, int8_t diffcompress, int8_t synccompress, bool isAutoSave, bool portable)
 {
     savehead_t h;
+
+    // Portable network snapshot: serialize intptr_t cells at the fixed cross-ABI
+    // width so a native (64-bit) host and a wasm (32-bit) guest exchange
+    // byte-identical late-join snapshots. Native disk saves stay native-width.
+    sv_wirePtrSize = portable ? SV_PORTABLE_PTRSIZE : (int)sizeof(intptr_t);
 
     // set a few savegame system globals
     savegame_comprthres = SV_DEFAULTCOMPRTHRES;
@@ -1814,7 +1951,7 @@ int32_t sv_saveandmakesnapshot(buildvfs_FILE fil, char const *name, int8_t spot,
     Bmemcpy(h.headerstr, "E32SAVEGAME", 11);
     h.majorver = SV_MAJOR_VER;
     h.minorver = SV_MINOR_VER;
-    h.ptrsize  = sizeof(intptr_t);
+    h.ptrsize  = sv_wirePtrSize;   // portable snapshots advertise the fixed cross-ABI wire width
 
     if (isAutoSave)
         h.ptrsize |= 1u << 7u;
@@ -1905,10 +2042,12 @@ int32_t sv_saveandmakesnapshot(buildvfs_FILE fil, char const *name, int8_t spot,
         if (p != svsnapshot+svsnapsiz)
         {
             OSD_Printf("sv_saveandmakesnapshot: ptr-(snapshot end)=%d!\n", (int32_t)(p - (svsnapshot + svsnapsiz)));
+            sv_wirePtrSize = sizeof(intptr_t);
             return 1;
         }
     }
 
+    sv_wirePtrSize = sizeof(intptr_t);   // restore native width for subsequent disk saves
     return 0;
 }
 
@@ -1953,7 +2092,11 @@ int32_t sv_loadheader(buildvfs_kfd fil, int32_t spot, savehead_t *h)
         }
     }
 
-    if (h->getPtrSize() != sizeof(intptr_t))
+    // Accept the portable network-snapshot pointer width (SV_PORTABLE_PTRSIZE) in
+    // addition to this build's native width: a portable snapshot's intptr_t cells
+    // are transcoded to native width on load (see DS_PTRCELL), so a 64-bit host and
+    // a 32-bit wasm guest interoperate. Any other width is genuinely incompatible.
+    if (h->getPtrSize() != sizeof(intptr_t) && h->getPtrSize() != SV_PORTABLE_PTRSIZE)
     {
 #ifndef DEBUGGINGAIDS
         if (havedemo)
@@ -2007,6 +2150,12 @@ int32_t sv_loadsnapshot(buildvfs_kfd fil, int32_t spot, savehead_t *h)
 
     savegame_comprthres = h->comprthres;
 
+    // Match the snapshot's on-wire pointer width: portable late-join snapshots
+    // advertise SV_PORTABLE_PTRSIZE, native disk saves advertise sizeof(intptr_t).
+    // DS_PTRCELL cells are transcoded to native width on load when these differ.
+    // Reset to native at the end (and re-set by every save/load entry).
+    sv_wirePtrSize = h->getPtrSize();
+
     if (spot >= 0)
     {
         // savegame
@@ -2048,6 +2197,7 @@ int32_t sv_loadsnapshot(buildvfs_kfd fil, int32_t spot, savehead_t *h)
 
     postloadplayer((spot >= 0));
 
+    sv_wirePtrSize = sizeof(intptr_t);   // restore native width for subsequent disk loads/saves
     return 0;
 }
 

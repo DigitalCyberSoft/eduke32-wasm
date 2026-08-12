@@ -138,7 +138,7 @@ int32_t sv_readdiff(buildvfs_kfd fil);
 uint32_t sv_writediff(buildvfs_FILE fil);
 int32_t sv_loadheader(buildvfs_kfd fil, int32_t spot, savehead_t *h);
 int32_t sv_loadsnapshot(buildvfs_kfd fil, int32_t spot, savehead_t *h);
-int32_t sv_saveandmakesnapshot(buildvfs_FILE fil, char const *name, int8_t spot, int8_t recdiffsp, int8_t diffcompress, int8_t synccompress, bool isAutoSave = false);
+int32_t sv_saveandmakesnapshot(buildvfs_FILE fil, char const *name, int8_t spot, int8_t recdiffsp, int8_t diffcompress, int8_t synccompress, bool isAutoSave = false, bool portable = false);
 void sv_freemem();
 void sv_prepareactors(actor_t * const actor);
 void sv_restoreactors(actor_t * const actor);
