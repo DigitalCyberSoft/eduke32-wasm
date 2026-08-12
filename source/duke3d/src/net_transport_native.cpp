@@ -1040,6 +1040,15 @@ void net_transport_init(void)
     if (!ok)
         g_t.reset(); // setup failed: run inert, exactly like the stub
     g_inited = true;
+    // Guarantee rtc::Cleanup() runs on EVERY normal exit path, not just the clean
+    // Net_Disconnect route. G_GameExit (e.g. the "didn't get quit packet in time"
+    // timeout, oldnet.cpp) tears the app down WITHOUT calling net_transport_shutdown(),
+    // so only static destruction of g_t runs -- ~NativeTransport joins our own
+    // threads but never cleans up libdatachannel's global thread pool, which then
+    // aborts ("terminate called without an active exception" -> SIGABRT) at exit.
+    // atexit() fires before static dtors; net_transport_shutdown() is idempotent,
+    // so if Net_Disconnect already ran, this is a harmless no-op.
+    atexit(net_transport_shutdown);
 }
 
 void net_transport_shutdown(void)
