@@ -123,6 +123,16 @@ private:
         }
     }
 
+    // Progress callback: curl invokes this ~once/second during connect+transfer
+    // (it caps its internal poll wait when NOPROGRESS=0). Returning non-zero aborts
+    // curl_easy_perform, so a connect in progress bails out within ~1s of stop()
+    // instead of blocking the shutdown join for the full connect timeout. Without
+    // this, a relay reconnecting at exit hangs the whole process in std::thread::join.
+    static int progressCb(void *clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+    {
+        return static_cast<WsClient *>(clientp)->running_.load() ? 0 : 1;
+    }
+
     CURL *connectOnce()
     {
         CURL *c = curl_easy_init();
@@ -139,11 +149,16 @@ private:
         curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L); // no SIGALRM/SIGPIPE in a threaded app
         curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, (long)(kConnectTimeoutMs / 1000));
         curl_easy_setopt(c, CURLOPT_USERAGENT, "eduke32-native/1.0");
+        // Make curl_easy_perform interruptible so stop()/requestStop() can't be
+        // blocked behind an in-flight connect (see progressCb).
+        curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, &WsClient::progressCb);
+        curl_easy_setopt(c, CURLOPT_XFERINFODATA, this);
 
         CURLcode res = curl_easy_perform(c);
         if (res != CURLE_OK)
         {
-            if (onErr_)
+            if (onErr_ && running_.load()) // don't spam errors while shutting down
                 onErr_(curl_easy_strerror(res));
             curl_easy_cleanup(c);
             return nullptr;
