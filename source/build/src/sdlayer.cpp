@@ -2377,10 +2377,19 @@ int32_t handleevents_sdlcommon(SDL_Event *ev)
             //  <VER> is 1.3 for PK, 1.2 for tueidj
             if (appactive && g_mouseGrabbed)
             {
-                if (s_mouseRefocusSkip > 0)   // discard the post-alt+tab re-lock jump
+                // Post-alt+tab, SDL re-locks the pointer and can emit one giant
+                // relative delta (the warp from the old cursor spot back to center).
+                // A fixed skip-N missed it when it landed a few events late -> the
+                // "aim suddenly offset from center" glitch. For a guard window after
+                // refocus, discard only an IMPLAUSIBLY LARGE single-event delta (the
+                // teleport) while still passing normal movement, so real aiming is
+                // never swallowed and the jump can't jerk the view whenever it lands.
+                if (s_mouseRefocusSkip > 0)
                 {
                     s_mouseRefocusSkip--;
-                    break;
+                    if (ev->motion.xrel > (xdim >> 2) || ev->motion.xrel < -(xdim >> 2)
+                        || ev->motion.yrel > (ydim >> 2) || ev->motion.yrel < -(ydim >> 2))
+                        break;   // re-lock teleport -- drop it, don't move the aim
                 }
 # if SDL_MAJOR_VERSION < 2
                 if (ev->motion.x != xdim >> 1 || ev->motion.y != ydim >> 1)
@@ -2776,12 +2785,21 @@ int32_t handleevents_pollsdl(void)
                         appactive = (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED);
                         if (g_mouseGrabbed && g_mouseEnabled)
                             grabmouse_low(appactive);
-                        // Re-sync the mouse across the focus change: drop any
-                        // accumulated delta and swallow the next few motion
-                        // events (the pointer-lock re-acquisition jump) so the
-                        // aim center doesn't drift after alt+tab.
+                        // Re-sync the mouse across the focus change so the aim center
+                        // doesn't drift after alt+tab. Drop the accumulated delta; on
+                        // regaining focus also flush queued motion and reset SDL's
+                        // relative accumulator (kills an already-queued re-lock jump),
+                        // then arm a guard window during which MOUSEMOTION discards an
+                        // implausibly large single delta (the teleport can land a few
+                        // events late, which the old fixed skip-3 let through).
                         g_mousePos.x = g_mousePos.y = 0;
-                        s_mouseRefocusSkip = 3;
+                        if (appactive)
+                        {
+                            SDL_PumpEvents();
+                            SDL_FlushEvent(SDL_MOUSEMOTION);
+                            SDL_GetRelativeMouseState(NULL, NULL);
+                        }
+                        s_mouseRefocusSkip = 30;
 #ifdef _WIN32
                         windowsHandleFocusChange(appactive);
 #endif
