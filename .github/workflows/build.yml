@@ -77,7 +77,7 @@ jobs:
           dnf -y install gcc-c++ make git which \
             SDL2-devel SDL2_mixer-devel alsa-lib-devel \
             libdatachannel-devel libsecp256k1-devel miniupnpc-devel openssl-devel \
-            flac-devel libvorbis-devel
+            libcurl-devel flac-devel libvorbis-devel
       - name: Build (NETNATIVE=1)
         run: make NETNATIVE=1 NETDUKE32=1 USE_LIBVPX=0 RENDERTYPE=SDL SDL_TARGET=2 -j"$(nproc)"
       - name: Package
@@ -97,7 +97,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
-        run: brew install sdl2 sdl2_mixer libdatachannel libsecp256k1 miniupnpc openssl flac libvorbis pkg-config
+        run: brew install sdl2 sdl2_mixer libdatachannel libsecp256k1 miniupnpc openssl curl flac libvorbis pkg-config
       - name: Build (NETNATIVE=1)
         run: make NETNATIVE=1 NETDUKE32=1 USE_LIBVPX=0 RENDERTYPE=SDL SDL_TARGET=2 -j"$(sysctl -n hw.ncpu)"
       - name: Package
@@ -126,7 +126,7 @@ jobs:
           install: >-
             mingw-w64-x86_64-toolchain mingw-w64-x86_64-SDL2 mingw-w64-x86_64-SDL2_mixer
             mingw-w64-x86_64-libdatachannel mingw-w64-x86_64-libsecp256k1
-            mingw-w64-x86_64-miniupnpc mingw-w64-x86_64-openssl mingw-w64-x86_64-flac make git
+            mingw-w64-x86_64-miniupnpc mingw-w64-x86_64-openssl mingw-w64-x86_64-curl mingw-w64-x86_64-flac make git
       - name: Build (NETNATIVE=1)
         run: make NETNATIVE=1 NETDUKE32=1 USE_LIBVPX=0 -j2
       - name: Package

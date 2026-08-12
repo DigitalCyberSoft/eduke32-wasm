@@ -3,17 +3,22 @@
 // nostr.ts SimplePool usage: publish/subscribe encrypted ephemeral (signaling)
 // and replaceable (lobby) events keyed by the room's derived identity.
 //
-// Threading: rtc::WebSocket callbacks fire on libdatachannel worker threads
-// (serialized per socket). The subscription table + dedup set are shared, so
-// they are mutex-guarded. Each relay owns its own sjson context (sjson is not
-// thread-safe, but per-socket callbacks are serialized).
+// Threading: each relay runs on its own WsClient (libcurl) worker thread, whose
+// callbacks are serialized per socket. The subscription table + dedup set are
+// shared, so they are mutex-guarded. Each relay owns its own sjson context
+// (sjson is not thread-safe, but per-socket callbacks are serialized).
+//
+// The relay WebSocket runs over libcurl (OpenSSL), NOT libdatachannel: the
+// GnuTLS WSS backend stalls the client-side upgrade and public relays close
+// before it completes. See nn_ws.hpp. libdatachannel still carries the actual
+// peer DataChannels elsewhere.
 //-------------------------------------------------------------------------
 #ifndef NN_RELAY_HPP_
 #define NN_RELAY_HPP_
 
 #include "nn_nostr.hpp"
+#include "nn_ws.hpp"
 
-#include <rtc/rtc.hpp>
 #include <sjson.h>
 
 #include <atomic>
@@ -41,6 +46,7 @@ public:
 
     void start()
     {
+        WsClient::globalInit();
         std::lock_guard<std::mutex> lk(mtx_);
         if (started_)
             return;
@@ -60,10 +66,16 @@ public:
             conns.swap(conns_);
             subs_.clear();
         }
-        for (auto &c : conns) // close outside the lock (callbacks may re-enter)
+        // Two-phase, outside the lock (worker callbacks re-enter and take mtx_):
+        // signal every relay to stop, then join. This keeps a relay stuck in a
+        // connect attempt from serializing shutdown behind its connect timeout.
+        for (auto &c : conns)
+            if (c->ws)
+                c->ws->requestStop();
+        for (auto &c : conns)
         {
             if (c->ws)
-                try { c->ws->close(); } catch (...) {}
+                c->ws->stop(); // joins the worker thread
             if (c->ctx)
                 sjson_destroy_context(c->ctx);
         }
@@ -119,7 +131,7 @@ public:
         std::lock_guard<std::mutex> lk(mtx_);
         int n = 0;
         for (auto &c : conns_)
-            if (c->open.load())
+            if (c->ws && c->ws->isOpen())
                 n++;
         return n;
     }
@@ -128,11 +140,8 @@ private:
     struct Conn
     {
         std::string url;
-        std::shared_ptr<rtc::WebSocket> ws;
-        sjson_context *ctx = nullptr;
-        std::atomic<bool> open{ false };
-        std::mutex sendMtx;
-        std::deque<std::string> backlog;   // messages queued before the socket opened
+        std::unique_ptr<WsClient> ws;    // owns the worker thread + send queue + reconnect
+        sjson_context *ctx = nullptr;    // per-connection parse context (own thread)
     };
 
     struct Sub
@@ -205,55 +214,49 @@ private:
         auto c = std::make_shared<Conn>();
         c->url = url;
         c->ctx = sjson_create_context(0, 0, nullptr);
-        auto ws = std::make_shared<rtc::WebSocket>();
-        c->ws = ws;
-        conns_.push_back(c);
 
         std::weak_ptr<Conn> wc = c;
         NostrClient *self = this;
-        ws->onOpen([self, wc]() {
-            if (auto c = wc.lock())
-            {
-                printf("[nnet] relay up %s\n", c->url.c_str());
-                fflush(stdout);
-                self->onOpen(c.get());
-            }
-        });
-        ws->onMessage([self, wc](rtc::message_variant data) {
-            if (!std::holds_alternative<std::string>(data))
-                return;
-            if (auto c = wc.lock())
-                self->onMessage(c.get(), std::get<std::string>(data));
-        });
-        ws->onClosed([wc]() {
-            if (auto c = wc.lock())
-            {
-                if (c->open.load())
+        // WsClient (libcurl/OpenSSL) owns the worker thread, send queue, and
+        // reconnect-with-backoff. Callbacks fire on that thread; onOpen runs on
+        // every (re)connect, so we re-issue subscriptions there.
+        c->ws.reset(new WsClient(
+            url,
+            /*onOpen*/ [self, wc]() {
+                if (auto c = wc.lock())
+                {
+                    printf("[nnet] relay up %s\n", c->url.c_str());
+                    fflush(stdout);
+                    self->onOpen(c.get());
+                }
+            },
+            /*onMessage*/ [self, wc](const std::string &msg) {
+                if (auto c = wc.lock())
+                    self->onMessage(c.get(), msg);
+            },
+            /*onClose*/ [wc]() {
+                if (auto c = wc.lock())
+                {
                     printf("[nnet] relay down %s\n", c->url.c_str());
-                c->open.store(false);
-            }
-        });
-        // Never swallow relay errors silently again: three dead wss relays once looked
-        // like an empty room and cost a full debugging session.
-        ws->onError([wc](std::string e) {
-            if (auto c = wc.lock())
-            {
-                printf("[nnet] relay error %s: %s\n", c->url.c_str(), e.c_str());
-                fflush(stdout);
-            }
-        });
-        try { ws->open(url); }
-        catch (const std::exception &e)
-        {
-            printf("[nnet] relay open failed %s: %s\n", url.c_str(), e.what());
-            fflush(stdout);
-        }
+                    fflush(stdout);
+                }
+            },
+            // Never swallow relay errors silently again: three dead wss relays once
+            // looked like an empty room and cost a full debugging session.
+            /*onError*/ [wc](const std::string &e) {
+                if (auto c = wc.lock())
+                {
+                    printf("[nnet] relay error %s: %s\n", c->url.c_str(), e.c_str());
+                    fflush(stdout);
+                }
+            }));
+        conns_.push_back(c);
+        c->ws->start();
     }
 
     void onOpen(Conn *c)
     {
-        c->open.store(true);
-        // (Re)issue every active subscription to this relay.
+        // (Re)issue every active subscription on this freshly-opened socket.
         std::vector<std::string> reqs;
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -262,28 +265,14 @@ private:
         }
         for (auto &r : reqs)
             sendRaw(c, r);
-        // Flush anything queued before the socket opened.
-        std::deque<std::string> backlog;
-        {
-            std::lock_guard<std::mutex> lk(c->sendMtx);
-            backlog.swap(c->backlog);
-        }
-        for (auto &m : backlog)
-            sendRaw(c, m);
     }
 
+    // WsClient queues internally (thread-safe) and flushes on the next open, so
+    // there is no separate pre-open backlog to manage here.
     void sendRaw(Conn *c, const std::string &msg)
     {
-        if (!c->open.load())
-        {
-            std::lock_guard<std::mutex> lk(c->sendMtx);
-            if (!c->open.load())
-            {
-                c->backlog.push_back(msg);
-                return;
-            }
-        }
-        try { c->ws->send(msg); } catch (...) {}
+        if (c->ws)
+            c->ws->send(msg);
     }
 
     void broadcast(const std::string &msg)

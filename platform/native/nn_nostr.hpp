@@ -9,7 +9,7 @@
 //
 // Event BUILD is dependency-light (hand-rolled exact-format JSON, since the
 // signed fields are all ASCII: hex pubkey, base64 content, ASCII tags). Event
-// PARSE uses the repo-bundled sjson. Transport uses rtc::WebSocket for relays.
+// PARSE uses the repo-bundled sjson. Transport uses libcurl (nn_ws.hpp) for relays.
 //-------------------------------------------------------------------------
 #ifndef NN_NOSTR_HPP_
 #define NN_NOSTR_HPP_

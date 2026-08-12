@@ -20,7 +20,8 @@ CXX="${CXX:-g++} -std=c++17 -O2 -Wall"
 echo "== build native transport test CLIs (prefix=$PREFIX) =="
 $CXX $INC "$ROOT/platform/native/test/nn_crypto_test.cpp" -o "$OUT/crypto_test" $LIBDIRS -lsecp256k1 -lcrypto
 $CXX $INC "$ROOT/platform/native/test/nn_nostr_test.cpp"  -o "$OUT/nostr_test"  $LIBDIRS -lsecp256k1 -lcrypto
-$CXX $INC "$ROOT/platform/native/test/nn_relay_test.cpp"  -o "$OUT/relay_test"  $LIBDIRS -ldatachannel -lsecp256k1 -lcrypto -lpthread
+# relay transport now runs over libcurl (OpenSSL WebSocket), not libdatachannel.
+$CXX $INC "$ROOT/platform/native/test/nn_relay_test.cpp"  -o "$OUT/relay_test"  $LIBDIRS -lcurl -lsecp256k1 -lcrypto -lpthread
 $CXX $INC "$ROOT/platform/native/test/nn_peer_test.cpp"   -o "$OUT/peer_test"   $LIBDIRS -ldatachannel -lsecp256k1 -lcrypto -lpthread
 # seam test links the REAL net_transport_native.cpp (needs -DNETNATIVE + the engine include dir)
 $CXX -DNETNATIVE $INC -I "$ROOT/source/duke3d/src" \

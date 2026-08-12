@@ -914,9 +914,17 @@ ifeq (1,$(NETDUKE32))
     COMPILERFLAGS += -DNETDUKE32
     ifeq (1,$(NETNATIVE))
         # Native transport: libdatachannel (no pkg-config file on most distros) +
-        # libsecp256k1 + miniupnpc (both ship .pc). Replaces net_transport_stub.cpp.
-        COMPILERFLAGS += -DNETNATIVE -Iplatform/native $(shell $(PKG_CONFIG) --cflags libsecp256k1 miniupnpc libcrypto 2>/dev/null)
-        LIBS += -ldatachannel $(shell $(PKG_CONFIG) --libs libsecp256k1 miniupnpc libcrypto 2>/dev/null)
+        # libsecp256k1 + miniupnpc + libcurl. libcurl (OpenSSL WebSocket) carries the
+        # Nostr relay connection -- libdatachannel's GnuTLS WSS stalls the upgrade ~10s
+        # and relays close first; libcurl opens in <1s and stays stable (see nn_ws.hpp).
+        # Query libcurl separately with a -lcurl fallback: a missing libcurl.pc (e.g.
+        # keg-only brew curl on macOS) must not make pkg-config drop the other libs too.
+        NN_PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags libsecp256k1 miniupnpc libcrypto 2>/dev/null)
+        NN_PKG_LIBS := $(shell $(PKG_CONFIG) --libs libsecp256k1 miniupnpc libcrypto 2>/dev/null)
+        NN_CURL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libcurl 2>/dev/null)
+        NN_CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || echo -lcurl)
+        COMPILERFLAGS += -DNETNATIVE -Iplatform/native $(NN_PKG_CFLAGS) $(NN_CURL_CFLAGS)
+        LIBS += -ldatachannel $(NN_PKG_LIBS) $(if $(NN_CURL_LIBS),$(NN_CURL_LIBS),-lcurl)
     endif
 endif
 ifneq (0,$(STARTUP_WINDOW))

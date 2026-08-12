@@ -44,7 +44,8 @@ static bool waitOpen(NostrClient &c, int ms)
 
 int main(int argc, char **argv)
 {
-    rtc::InitLogger(rtc::LogLevel::Error);
+    // The relay transport is now libcurl (nn_ws.hpp), not libdatachannel, so no
+    // rtc logger/cleanup is needed here.
     int rc = 2;
 
     if (argc >= 4 && std::string(argv[1]) == "selfrt")
@@ -107,6 +108,5 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: selfrt|sub|pub ...\n");
     }
 
-    rtc::Cleanup().wait();
     return rc;
 }
