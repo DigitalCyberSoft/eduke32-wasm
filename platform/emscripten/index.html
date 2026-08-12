@@ -98,6 +98,15 @@
     <section>
       <h4>Loaded GRP files</h4>
       <ul id="grplist"><li class="empty">&hellip;</li></ul>
+      <div class="row" style="margin-top:8px">
+        <button class="s" id="btnAddGrp">Add game data&hellip;</button>
+        <span id="grpAddNote" style="color:#7a756a;font-size:12px"></span>
+      </div>
+      <div class="row" id="mainGrpRow" style="margin-top:8px;display:none">
+        <span style="color:#8a8479;font-size:12px">Main game: <span id="mainGrpName" style="color:var(--duke-yellow)"></span></span>
+        <button class="s" id="btnUseShareware">Use shareware</button>
+      </div>
+      <input type="file" id="grpFile" multiple style="display:none">
     </section>
     <section>
       <h4>Display</h4>
@@ -204,6 +213,240 @@
   }
   // ---------------------------------------------------------------------------
 
+  // ===========================================================================
+  // LOCAL PERSISTENCE (browser MEMFS is wiped on reload)
+  //
+  //   settings (small text cfg files) -> localStorage
+  //   extra game data / GRPs (multi-MB) -> IndexedDB
+  //
+  // On boot we copy both back into MEMFS BEFORE the engine reads them; at runtime
+  // we mirror the engine's cfg writes out and let the Settings panel import GRPs.
+  // Everything is best-effort: a disabled localStorage/IndexedDB (private mode) or
+  // a full quota degrades to "no persistence", never a failed boot.
+  //
+  // In this build cwd stays "/" (the homedir ".config/eduke32" mkdir is non-recursive
+  // and fails, so G_ExtPreInit never chdir()s), so the engine reads/writes these cfg
+  // files at the MEMFS root -- which is exactly where we restore them.
+  // ===========================================================================
+  var E32_CFGS = ['eduke32.cfg', 'settings.cfg', 'm32_settings.cfg'];
+  function e32CfgKey(name) { return 'eduke32/cfg/' + name; }
+
+  // --- settings: restore, screen patch, write-mirror, unload backstop ---------
+
+  // Copy persisted cfg text into MEMFS so the engine's startup read sees it.
+  function e32RestoreConfigs() {
+    E32_CFGS.forEach(function (name) {
+      var v = null;
+      try { v = localStorage.getItem(e32CfgKey(name)); } catch (e) {}
+      if (v == null) return;
+      try { Module.FS.writeFile('/' + name, v); } catch (e) {}
+    });
+  }
+
+  // Force the render resolution to the current 4:3 box every boot (tracks window
+  // size + the Settings res cap). Patch the restored eduke32.cfg IN PLACE rather
+  // than clobbering the user's other settings; write a bare stub only on first boot.
+  function e32ApplyScreenSetup() {
+    var b = renderBox();
+    var stub = '[Screen Setup]\nScreenMode = 0\nScreenWidth = ' + b.w + '\nScreenHeight = ' + b.h + '\nScreenBPP = 8\n';
+    var cur = '';
+    try { cur = Module.FS.readFile('/eduke32.cfg', { encoding: 'utf8' }); } catch (e) { cur = ''; }
+    if (!cur) { try { Module.FS.writeFile('/eduke32.cfg', stub); } catch (e) {} return; }
+    var setKey = function (text, key, val) {
+      return text.replace(new RegExp('^([ \\t]*' + key + '[ \\t]*=[ \\t]*).*$', 'mi'), function (_, prefix) { return prefix + val; });
+    };
+    cur = setKey(cur, 'ScreenMode', 0);
+    cur = setKey(cur, 'ScreenWidth', b.w);
+    cur = setKey(cur, 'ScreenHeight', b.h);
+    try { Module.FS.writeFile('/eduke32.cfg', cur); } catch (e) {}
+  }
+
+  // The engine writes cfg files via libc fopen/fwrite/fclose, which route through
+  // Module.FS.close in this (non-WASMFS) build; wrap it so every completed write of
+  // a known cfg is copied to localStorage. Catches the boot write, autosaves, manual
+  // saves, and the quit-time flush. Installed AFTER the restore writes above so it
+  // only ever fires on ENGINE writes, not on our own.
+  function e32InstallCfgMirror() {
+    try {
+      var FS = Module.FS;
+      if (!FS || FS.__e32cfgHooked) return;
+      var origClose = FS.close.bind(FS);
+      FS.close = function (stream) {
+        var path = stream && stream.path;
+        var writable = !!stream && (stream.flags & 3) !== 0; // O_WRONLY | O_RDWR
+        var r = origClose(stream);
+        try {
+          if (path && writable) {
+            var base = ('' + path).split('/').pop();
+            if (E32_CFGS.indexOf(base) !== -1) {
+              var data = FS.readFile(path, { encoding: 'utf8' });
+              try { localStorage.setItem(e32CfgKey(base), data); } catch (e) {}
+            }
+          }
+        } catch (e) {}
+        return r;
+      };
+      FS.__e32cfgHooked = true;
+    } catch (e) {}
+  }
+
+  // Backstop: snapshot the cfg files straight from MEMFS when the tab is hidden or
+  // unloaded, in case a write slipped past the close hook. Synchronous MEMFS reads,
+  // so this can never catch a half-written file.
+  function e32SnapshotConfigs() {
+    var FS = window.Module && Module.FS;
+    if (!FS) return;
+    E32_CFGS.forEach(function (name) {
+      var data;
+      try { data = FS.readFile('/' + name, { encoding: 'utf8' }); } catch (e) { return; }
+      if (data == null) return;
+      try { localStorage.setItem(e32CfgKey(name), data); } catch (e) {}
+    });
+  }
+  window.addEventListener('pagehide', e32SnapshotConfigs);
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') e32SnapshotConfigs(); });
+
+  // --- extra game data (IndexedDB): store, restore, main-GRP preference --------
+
+  var E32_UDB = 'eduke32-userdata';
+  function e32OpenUserDb(onOpen, onErr) {
+    try {
+      if (typeof indexedDB === 'undefined') { onErr && onErr(); return; }
+      var req = indexedDB.open(E32_UDB, 1);
+      req.onupgradeneeded = function () {
+        var db = req.result;
+        if (!db.objectStoreNames.contains('files')) db.createObjectStore('files', { keyPath: 'name' }); // extra groups/mods
+        if (!db.objectStoreNames.contains('main'))  db.createObjectStore('main',  { keyPath: 'id' });    // preferred registered main GRP
+      };
+      req.onsuccess = function () { onOpen(req.result); };
+      req.onerror = function () { onErr && onErr(req.error); };
+    } catch (e) { onErr && onErr(e); }
+  }
+
+  // CRC-32 (IEEE/zlib, poly 0xEDB88320) -- same as the engine's Bcrc32 and the net
+  // layer's grp.ts, so values line up with grptable.ts / grpscan.cpp.
+  var E32_CRC_TABLE = (function () {
+    var t = new Uint32Array(256), n, k, c;
+    for (n = 0; n < 256; n++) { c = n; for (k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; }
+    return t;
+  })();
+  function e32Crc32(bytes) {
+    var c = 0xffffffff;
+    for (var i = 0; i < bytes.length; i++) c = (c >>> 8) ^ E32_CRC_TABLE[(c ^ bytes[i]) & 0xff];
+    return (c ^ 0xffffffff) >>> 0;
+  }
+
+  // Registered (non-shareware, non-add-on) DUKE base GRPs. CRCs mirrored from
+  // platform/emscripten/net/grptable.ts (GRP_TABLE) -- keep in sync. Used to decide
+  // whether an imported GRP should be remembered as the preferred main game.
+  var E32_REGISTERED_DUKE_CRCS = [0xbbc9ce44, 0xaa4f6a40, 0xfd3dcff1, 0x982afe4a, 0xf514a6ac];
+  function e32IsRegisteredDukeGrp(crc) { return E32_REGISTERED_DUKE_CRCS.indexOf(crc >>> 0) !== -1; }
+
+  // Persist a generic extra group/mod (loaded on top of the base with -g on boot).
+  function e32StoreUserFile(name, bytes, cb) {
+    e32OpenUserDb(function (db) {
+      try {
+        var t = db.transaction('files', 'readwrite');
+        t.objectStore('files').put({ name: name, bytes: bytes, size: bytes.length, savedAt: Date.now() });
+        t.oncomplete = function () { try { db.close(); } catch (e) {} cb && cb(null); };
+        t.onerror = function () { try { db.close(); } catch (e) {} cb && cb(t.error || new Error('put failed')); };
+      } catch (e) { try { db.close(); } catch (e2) {} cb && cb(e); }
+    }, function (e) { cb && cb(e || new Error('idb unavailable')); });
+  }
+
+  // Persist THE preferred registered main GRP (single record) and mark it in
+  // localStorage so boot can prefer it without opening IndexedDB first.
+  function e32StoreMainGrp(name, bytes, crc, cb) {
+    e32OpenUserDb(function (db) {
+      try {
+        var t = db.transaction('main', 'readwrite');
+        t.objectStore('main').put({ id: 'main', name: name, crc: crc >>> 0, size: bytes.length, bytes: bytes, savedAt: Date.now() });
+        t.oncomplete = function () {
+          try { db.close(); } catch (e) {}
+          try { localStorage.setItem('eduke32/mainGrp', JSON.stringify({ crc: crc >>> 0, size: bytes.length, name: name })); } catch (e) {}
+          cb && cb(null);
+        };
+        t.onerror = function () { try { db.close(); } catch (e) {} cb && cb(t.error || new Error('put failed')); };
+      } catch (e) { try { db.close(); } catch (e2) {} cb && cb(e); }
+    }, function (e) { cb && cb(e || new Error('idb unavailable')); });
+  }
+
+  // Forget the preferred main GRP -> next boot falls back to bundled shareware.
+  function e32ClearMainGrp(cb) {
+    try { localStorage.removeItem('eduke32/mainGrp'); } catch (e) {}
+    e32OpenUserDb(function (db) {
+      try {
+        var t = db.transaction('main', 'readwrite');
+        t.objectStore('main').delete('main');
+        t.oncomplete = function () { try { db.close(); } catch (e) {} cb && cb(); };
+        t.onerror = function () { try { db.close(); } catch (e) {} cb && cb(); };
+      } catch (e) { try { db.close(); } catch (e2) {} cb && cb(); }
+    }, function () { cb && cb(); });
+  }
+
+  // preRun: prefer a persisted registered main GRP over the bundled shareware.
+  // Writes the stored bytes to a reserved MEMFS name (never collides with the
+  // preloaded /DUKE3D.GRP) and selects it with -gamegrp. Defers to an active net
+  // download choice (that path pushes its own -gamegrp). Falls back to shareware on
+  // any error/missing blob. Gated by a run dependency so main() waits for it.
+  function e32RestoreMainGrp() {
+    var marker = null;
+    try { marker = JSON.parse(localStorage.getItem('eduke32/mainGrp') || 'null'); } catch (e) { marker = null; }
+    if (!marker) return;
+    try { var nc = JSON.parse(localStorage.getItem('eduke32-net-gamegrp') || 'null'); if (nc && typeof nc.crc === 'number') return; } catch (e) {}
+    if (typeof indexedDB === 'undefined' || !Module.FS || !Module.addRunDependency) return;
+    Module.addRunDependency('e32-maingrp');
+    var fired = false;
+    var done = function () { if (fired) return; fired = true; try { Module.removeRunDependency('e32-maingrp'); } catch (e) {} };
+    setTimeout(done, 8000); // never let a stuck IndexedDB stall boot
+    e32OpenUserDb(function (db) {
+      try {
+        var g = db.transaction('main', 'readonly').objectStore('main').get('main');
+        g.onsuccess = function () {
+          try {
+            var rec = g.result;
+            if (rec && rec.bytes) {
+              Module.FS.writeFile('/_e32_main.grp', rec.bytes);
+              Module.arguments.push('-gamegrp', '_e32_main.grp');
+            }
+          } catch (e) {}
+          try { db.close(); } catch (e) {}
+          done();
+        };
+        g.onerror = function () { try { db.close(); } catch (e) {} done(); };
+      } catch (e) { try { db.close(); } catch (e2) {} done(); }
+    }, done);
+  }
+
+  // preRun (async, gated by a run dependency): load every stored EXTRA file into the
+  // MEMFS root and queue group-type files for loading with -g. No-op / fail-safe when
+  // IndexedDB is unavailable.
+  function e32RestoreUserData() {
+    if (typeof indexedDB === 'undefined' || !Module.FS || !Module.addRunDependency) return;
+    Module.addRunDependency('e32-userdata');
+    var fired = false;
+    var done = function () { if (fired) return; fired = true; try { Module.removeRunDependency('e32-userdata'); } catch (e) {} };
+    setTimeout(done, 8000); // never let a stuck IndexedDB stall boot
+    e32OpenUserDb(function (db) {
+      try {
+        var all = db.transaction('files', 'readonly').objectStore('files').getAll();
+        all.onsuccess = function () {
+          try {
+            (all.result || []).forEach(function (rec) {
+              if (!rec || !rec.name || !rec.bytes) return;
+              try { Module.FS.writeFile('/' + rec.name, rec.bytes); } catch (e) {}
+              if (/\.(grp|zip|pk3|pk4)$/i.test(rec.name)) { try { Module.arguments.push('-g', rec.name); } catch (e) {} }
+            });
+          } catch (e) {}
+          try { db.close(); } catch (e) {}
+          done();
+        };
+        all.onerror = function () { try { db.close(); } catch (e) {} done(); };
+      } catch (e) { try { db.close(); } catch (e2) {} done(); }
+    }, done);
+  }
+  // ===========================================================================
+
   window.__BUILD__ = "__BUILD_ID__";  // replaced at deploy time (CI 'Assemble site'); cache-buster + on-page build tag
 
   // STALE-PAGE SELF-HEAL. GitHub Pages serves everything with max-age=600 and a
@@ -258,16 +501,21 @@
       if (!window.__e32ver) { var m = /EDuke32\s+\S+/.exec(t); if (m) { window.__e32ver = m[0]; var v = document.getElementById('ver'); if (v) v.textContent = m[0]; } }
     },
     preRun: [function () {
-      // Windowed at the 4:3 render box. The screen override above makes the engine
-      // render at this resolution; fitCanvas() centers it with side margins.
-      try {
-        var b = renderBox();
-        Module.FS.writeFile('/eduke32.cfg',
-          '[Screen Setup]\nScreenMode = 0\nScreenWidth = ' + b.w + '\nScreenHeight = ' + b.h + '\nScreenBPP = 8\n');
-      } catch (e) {}
+      // Restore persisted settings into MEMFS, then windowed at the 4:3 render box
+      // (the screen override above makes the engine render at this resolution;
+      // fitCanvas() centers it with side margins), then start mirroring the engine's
+      // config writes back to localStorage. Order matters: restore + screen patch run
+      // BEFORE the mirror hook so they don't echo our own writes back out.
+      e32RestoreConfigs();
+      e32ApplyScreenSetup();
+      e32InstallCfgMirror();
     },
     // eduke32-net addition: apply a downloaded GRP choice before the engine runs.
-    applyNetGrpChoice]
+    applyNetGrpChoice,
+    // Prefer a persisted registered/Atomic main GRP over the bundled shareware.
+    e32RestoreMainGrp,
+    // Restore user-imported extra game-data files (GRPs/mods) from IndexedDB.
+    e32RestoreUserData]
   };
   window.onerror = function (msg) { errEl.textContent = String(msg); };
 
@@ -349,7 +597,7 @@
     var $ = function (id) { return document.getElementById(id); };
     var settingsEl = $('settings'), gearEl = $('gear'), diagEl = $('diag');
 
-    function open()  { populateGRPs(); syncControls(); settingsEl.classList.add('open'); try { document.exitPointerLock(); } catch (e) {} }
+    function open()  { populateGRPs(); syncMainGrp(); syncControls(); settingsEl.classList.add('open'); try { document.exitPointerLock(); } catch (e) {} }
     function close() { settingsEl.classList.remove('open'); }
 
     function hsize(n) { return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.round(n / 1024) + ' KB'; }
@@ -449,6 +697,58 @@
     });
     $('diagChk').addEventListener('change', function () { setDiag(this.checked); });
     $('btnClear').addEventListener('click', clearData);
+
+    // Show/hide the "Main game: <name>  [Use shareware]" row from the persisted
+    // registered-GRP marker (see e32StoreMainGrp / e32RestoreMainGrp).
+    function syncMainGrp() {
+      var row = $('mainGrpRow'), marker = null;
+      try { marker = JSON.parse(localStorage.getItem('eduke32/mainGrp') || 'null'); } catch (e) {}
+      if (marker && marker.name) {
+        $('mainGrpName').textContent = (KNOWN_GRP[marker.size] || marker.name);
+        row.style.display = 'flex';
+      } else row.style.display = 'none';
+    }
+    $('btnUseShareware').addEventListener('click', function () {
+      if (!confirm('Revert to the shareware game and reload?')) return;
+      e32ClearMainGrp(function () { location.reload(); });
+    });
+
+    // Import extra game data (GRPs / mods): write into the engine FS now and persist
+    // for next boot. A registered/Atomic DUKE3D.GRP is remembered as the main game
+    // (IndexedDB 'main' + localStorage marker); anything else is stored as an extra
+    // group loaded with -g. Takes effect on the next reload.
+    var grpFileEl = $('grpFile'), grpAddNote = $('grpAddNote');
+    $('btnAddGrp').addEventListener('click', function () { grpFileEl.click(); });
+    grpFileEl.addEventListener('change', function () {
+      var files = Array.prototype.slice.call(grpFileEl.files || []);
+      grpFileEl.value = '';
+      if (!files.length) return;
+      grpAddNote.textContent = 'Saving…';
+      var pending = files.length, failed = 0, mainLabel = null;
+      var finish = function () {
+        populateGRPs(); syncMainGrp();
+        grpAddNote.textContent = (failed ? failed + ' failed; ' : '') +
+          (mainLabel ? 'Saved ' + mainLabel + ' as the main game. ' : '') + 'Reload to load new game data.';
+      };
+      files.forEach(function (f) {
+        var rd = new FileReader();
+        rd.onload = function () {
+          var bytes = new Uint8Array(rd.result);
+          var crc = 0; try { crc = e32Crc32(bytes); } catch (e) {}
+          var cb = function (err) { if (err) failed++; if (--pending === 0) finish(); };
+          if (/\.grp$/i.test(f.name) && e32IsRegisteredDukeGrp(crc)) {
+            mainLabel = KNOWN_GRP[bytes.length] || f.name;
+            e32StoreMainGrp(f.name, bytes, crc, cb);           // preferred main game
+          } else {
+            try { Module.FS.writeFile('/' + f.name, bytes); } catch (e) {}
+            e32StoreUserFile(f.name, bytes, cb);               // extra group / mod
+          }
+        };
+        rd.onerror = function () { failed++; if (--pending === 0) finish(); };
+        rd.readAsArrayBuffer(f);
+      });
+    });
+
     // Esc closes the panel (before the game sees it) when the panel is open.
     window.addEventListener('keydown', function (e) {
       if (settingsEl.classList.contains('open') && e.key === 'Escape') { close(); e.preventDefault(); e.stopPropagation(); }
