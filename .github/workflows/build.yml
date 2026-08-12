@@ -1,10 +1,14 @@
 name: Build & Release (web + native)
 
 # Web build is the fork's shippable product (WASM, runs on any browser on
-# Mac/Windows/Linux). Native jobs ATTEMPT the desktop build on each platform's
-# own runner -- they are non-blocking (continue-on-error) while the netcode is
-# ported off Emscripten (the whole stream-mode multiplayer is currently
-# #ifdef __EMSCRIPTEN__), so they document the port and go green once it lands.
+# Mac/Windows/Linux). Native jobs build the SAME game as a desktop binary with a
+# real libdatachannel WebRTC/Nostr transport (net_transport_native.cpp), gated
+# NETNATIVE=1 -- wire-compatible with the browser, so native <-> browser peers
+# interoperate. The Linux job builds green (verified locally on Fedora 42: the
+# stream-mode netcode is #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)).
+# macOS/Windows stay continue-on-error until their libdatachannel toolchains are
+# confirmed on the runners -- and all native jobs are non-blocking so a runner
+# hiccup never holds back the web release.
 #
 # Push a tag like v0.1.0 to cut a Release with the web bundle attached; every
 # push to the integration branch just builds + uploads artifacts.
@@ -71,7 +75,7 @@ jobs:
       - name: Install deps
         run: |
           dnf -y install gcc-c++ make git which \
-            SDL2-devel SDL2_mixer-devel \
+            SDL2-devel SDL2_mixer-devel alsa-lib-devel \
             libdatachannel-devel libsecp256k1-devel miniupnpc-devel openssl-devel \
             flac-devel libvorbis-devel
       - name: Build (NETNATIVE=1)

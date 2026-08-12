@@ -907,8 +907,10 @@ static void Bot_NavBuild(void)
     int32_t minx = INT32_MAX, miny = INT32_MAX, maxx = INT32_MIN, maxy = INT32_MIN;
     for (int w = 0; w < numwalls; w++)
     {
-        minx = min(minx, wall[w].x); maxx = max(maxx, wall[w].x);
-        miny = min(miny, wall[w].y); maxy = max(maxy, wall[w].y);
+        // cast through the struct-tracker wrapper: gcc won't deduce min/max over
+        // (int32_t, WallTracker<int>); emcc's clang does. Explicit int keeps both.
+        minx = min(minx, (int32_t)wall[w].x); maxx = max(maxx, (int32_t)wall[w].x);
+        miny = min(miny, (int32_t)wall[w].y); maxy = max(maxy, (int32_t)wall[w].y);
     }
     if (minx > maxx)
         { s_nvgW = s_nvgH = 0; return; }
@@ -4466,6 +4468,12 @@ int32_t g_netPredictMode = 3;
 // default OFF: comparisons and auto-resync run regardless; the dump bursts
 // correlated with renderer deaths on the bench. Soak enables for hunts.
 int32_t g_netForensics = 0;
+// Test-harness input injectors: set only by the Emscripten Web_Test* exports
+// below, so they stay 0 in native builds -- but the consumer that reads them in
+// the input-staging path is compiled for NETNATIVE too, so the storage must
+// exist unconditionally (else the native link fails on these two symbols).
+int32_t g_testFire  = 0;
+int32_t g_testDrive = 0;
 #ifdef __EMSCRIPTEN__
 extern "C" void Web_SetPredictMode(int mode)
 {
@@ -4558,7 +4566,6 @@ extern "C" int Web_AimGapHoriz(void)
 // the victim's fate in the consumed sim. With closed-loop aim staged, the
 // shot every peer computes comes from this view -- a dead prop here plus a
 // clean sync verdict IS cross-peer registration.
-int32_t g_testFire;
 extern "C" int Web_AimAtNearestPic(int pic)
 {
     auto const ps = g_player[myconnectindex].ps;
@@ -4586,7 +4593,6 @@ extern "C" int Web_AimAtNearestPic(int pic)
     return best;
 }
 extern "C" void Web_TestFire(int on) { g_testFire = on; }
-int32_t g_testDrive;
 extern "C" void Web_TestDrive(int on) { g_testDrive = on; }
 extern "C" int Web_PicAlive(int idx, int pic)
 {
