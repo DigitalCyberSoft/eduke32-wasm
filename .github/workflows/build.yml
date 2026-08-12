@@ -11,7 +11,7 @@ name: Build & Release (web + native)
 
 on:
   push:
-    branches: [main, integration-merge, wasm]
+    branches: [master, integration-merge, wasm]
     tags: ['v*']
   workflow_dispatch:
 
