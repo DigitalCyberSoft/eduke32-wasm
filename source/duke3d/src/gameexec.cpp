@@ -930,6 +930,15 @@ GAMEEXEC_STATIC void VM_Move(void)
                                                                  : (sector[vm.pSprite->sectnum].floorshade - vm.pSprite->shade) >> 1;
 }
 
+// Coop weapon-stay ammo credit, tracked PER PICKUP SPRITE (bit per player) rather
+// than per weapon TYPE. Stock ifgotweaponce keyed weaprecs by picnum, so once you
+// grabbed any shotgun EVERY other shotgun in the level read as "already got" and
+// gave nothing -- you lost the ammo from every extra copy. Keyed per sprite, a
+// distinct second shotgun grants ammo once, while re-walking the SAME one still
+// gives nothing (no farming). Reset each level in G_EnterLevel. Per-peer (the host
+// runs the authoritative coop sim; player ammo syncs from there).
+uint16_t g_coopWeapGrab[MAXSPRITES];
+
 static void P_AddWeaponMaybeSwitch(DukePlayer_t * const ps, int const weaponNum)
 {
     if ((ps->weaponswitch & (1|4)) == (1|4))
@@ -3541,21 +3550,25 @@ breakfor:
 
                 if ((g_gametypeFlags[ud.coop] & GAMETYPE_WEAPSTAY) && (g_netServer || ud.multimode > 1))
                 {
-                    if (*insptr == 0)
+                    // Credit is tracked PER PICKUP SPRITE (g_coopWeapGrab, a per-
+                    // player bitmask) instead of per weapon type, so a distinct
+                    // second shotgun still grants ammo once. `ifgotweaponce 0`
+                    // queries "have I already taken THIS sprite?"; `ifgotweaponce 1`
+                    // marks it. owner==spriteNum keeps it to map-placed weapons.
+                    if ((unsigned)vm.spriteNum < MAXSPRITES && (unsigned)vm.playerNum < MAXPLAYERS)
                     {
-                        int j = 0;
-                        for (; j < vm.pPlayer->weapreccnt; ++j)
-                            if (vm.pPlayer->weaprecs[j] == vm.pSprite->picnum)
-                                break;
-
-                        branch(j < vm.pPlayer->weapreccnt && vm.pSprite->owner == vm.spriteNum);
-                        dispatch();
-                    }
-                    else if (vm.pPlayer->weapreccnt < MAX_WEAPONS)
-                    {
-                        vm.pPlayer->weaprecs[vm.pPlayer->weapreccnt++] = vm.pSprite->picnum;
-                        branch(vm.pSprite->owner == vm.spriteNum);
-                        dispatch();
+                        uint16_t const pmask = (uint16_t)(1u << vm.playerNum);
+                        if (*insptr == 0)
+                        {
+                            branch((g_coopWeapGrab[vm.spriteNum] & pmask) != 0 && vm.pSprite->owner == vm.spriteNum);
+                            dispatch();
+                        }
+                        else
+                        {
+                            g_coopWeapGrab[vm.spriteNum] |= pmask;
+                            branch(vm.pSprite->owner == vm.spriteNum);
+                            dispatch();
+                        }
                     }
                 }
                 branch(false);

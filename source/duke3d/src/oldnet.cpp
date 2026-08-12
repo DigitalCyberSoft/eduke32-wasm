@@ -5803,6 +5803,14 @@ static inline bool Net_StreamSkipsStat(int st)
 }
 struct NetSprShadow { vec3_t pos; int16_t ang, sect, stat, picnum, cstat; };
 static NetSprShadow s_sprShadow[MAXSPRITES];
+// Guest-side: sprites the host has reported dead (enemy, extra<=0). The guest
+// keeps re-simulating actors as a predictor; a dead monster is a CON-state
+// change to a corpse (not a deletesprite), and that CON state is not streamed,
+// so the guest's own A_Execute would animate the corpse back to its alive frame
+// -- and since monster damage is host-authoritative the guest can't re-kill it
+// (an unkillable zombie). Once flagged here, G_MoveActors stops locally
+// simulating the actor so the host's streamed corpse frames stick.
+static uint8_t s_hostDead[MAXSPRITES];
 struct NetSecShadow { int32_t cz, fz; };
 static NetSecShadow s_secShadow[MAXSECTORS];
 static int32_t s_lastPlayerStreamPlc = -1;
@@ -6187,6 +6195,18 @@ static void Net_ClientPickupScan(void)
             jj = nextjj;
         }
 }
+// Latch/clear the guest freeze flag for one sprite from a stream record. A live
+// enemy (extra>0) always clears it (covers respawn and slot reuse); an enemy at
+// extra<=0 sets it. A corpse frame that no longer classifies as an enemy leaves
+// the existing latch untouched.
+static inline void Net_LatchHostDead(int idx, int extra, bool isEnemy)
+{
+    if (extra > 0)
+        s_hostDead[idx] = 0;
+    else if (isEnemy)
+        s_hostDead[idx] = 1;
+}
+
 static void Net_ApplySpriteStream(const char *buf, int len)
 {
     if (len < 2)
@@ -6220,6 +6240,10 @@ static void Net_ApplySpriteStream(const char *buf, int len)
             continue;
         if (Net_IsPlayerSprite(idx))
             continue;                      // the player pack owns those
+        // Enemy-ness of the guest's CURRENT sprite (its live picnum), captured
+        // before we overwrite picnum with the streamed corpse frame -- this is
+        // what catches the alive->dead transition for the freeze latch below.
+        bool const guestWasEnemy = (sprite[idx].statnum < MAXSTATUS) && A_CheckEnemySprite(&sprite[idx]);
         if ((flags & NET_SPRF_DELETE) || stat == 0xFFFFu)
         {
             if (sprite[idx].statnum < MAXSTATUS)
@@ -6227,6 +6251,7 @@ static void Net_ApplySpriteStream(const char *buf, int len)
                 Net_ClientCreditPickup(idx);   // guest grabs its own pickups before they vanish
                 A_DeleteSprite(idx);
             }
+            s_hostDead[idx] = 0;               // slot freed/reused: drop the freeze latch
             s_itemConsumedUntil[idx] = 0;      // gone on the host too: stop suppressing
             continue;
         }
@@ -6258,6 +6283,7 @@ static void Net_ApplySpriteStream(const char *buf, int len)
             vec3_t kp = { x, y, z };
             setsprite((int16_t)idx, &kp);
             actor[idx].bpos = kp;
+            Net_LatchHostDead(idx, extra, guestWasEnemy);
             continue;
         }
 
@@ -6294,7 +6320,25 @@ static void Net_ApplySpriteStream(const char *buf, int len)
         vec3_t p = { x, y, z };
         setsprite((int16_t)idx, &p);
         actor[idx].bpos = p;
+        // Freeze latch: also re-check enemy-ness on the just-applied picnum so a
+        // corpse materialized fresh (the guest never held it alive) freezes too.
+        Net_LatchHostDead(idx, extra, guestWasEnemy || A_CheckEnemySprite(&sprite[idx]));
     }
+}
+
+// Guest predicate: has the host reported this actor dead? G_MoveActors uses this
+// to stop locally re-simulating it (see s_hostDead). Host and single-player
+// always return 0.
+int Net_StreamGuestActorFrozen(int spriteNum)
+{
+    return g_netStreamMode && numplayers > 1 && myconnectindex != connecthead
+        && (unsigned)spriteNum < MAXSPRITES && s_hostDead[spriteNum];
+}
+
+// Level (re)entry: sprite indices get reused, so drop every stale freeze latch.
+void Net_StreamClearDeadActors(void)
+{
+    Bmemset(s_hostDead, 0, sizeof(s_hostDead));
 }
 
 static void Net_ApplySectorStream(const char *buf, int len)

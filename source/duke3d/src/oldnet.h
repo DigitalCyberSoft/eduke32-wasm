@@ -153,6 +153,12 @@ OLDNET_EXTERN bool oldnet_gotinitialsettings; // True if we got PACKET_TYPE_INIT
 extern int32_t g_netStreamMode;
 extern int32_t g_netLateJoinMask; // slots whose peer-up landed mid-game; host seats them via relaunch (menus.cpp)
 
+// Stream-mode guest freeze: the host owns dead enemies. Once the host reports an
+// actor dead (extra<=0), the guest stops locally re-simulating it so its own CON
+// can't animate the corpse back alive (the unkillable-zombie bug). Host + SP: 0.
+int  Net_StreamGuestActorFrozen(int spriteNum); // G_MoveActors guard
+void Net_StreamClearDeadActors(void);           // G_EnterLevel reset (indices reused)
+
 // NEW_GAME flags bit (high half of the low 16 reserved bits): guests must NOT
 // run their own level entry -- the host enters first and streams each guest
 // the entry snapshot through the late-join pipeline. Two independent premaps

@@ -2390,6 +2390,14 @@ int G_EnterLevel(int gameMode)
     everyothertime = 0;
     g_globalRandom = 0;
 
+    // Coop weapon-stay: clear per-pickup-sprite ammo credit so each level's
+    // weapons grant ammo afresh (see g_coopWeapGrab in gameexec.cpp).
+    { extern uint16_t g_coopWeapGrab[MAXSPRITES]; Bmemset(g_coopWeapGrab, 0, sizeof(g_coopWeapGrab)); }
+
+    // Stream-mode guest freeze: sprite indices are reused across levels, so drop
+    // every stale host-dead latch before the new map's actors take those slots.
+    Net_StreamClearDeadActors();
+
     ud.last_level = ud.level_number+1;
 
     G_ClearFIFO();
