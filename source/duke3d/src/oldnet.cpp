@@ -6198,7 +6198,9 @@ static void Net_ClientPickupScan(void)
 // Latch/clear the guest freeze flag for one sprite from a stream record. A live
 // enemy (extra>0) always clears it (covers respawn and slot reuse); an enemy at
 // extra<=0 sets it. A corpse frame that no longer classifies as an enemy leaves
-// the existing latch untouched.
+// the existing latch untouched. (A freeze-blasted LIVE enemy, pal==1/extra==0,
+// also latches here; that is harmless -- it self-corrects on thaw when extra
+// returns to 1 and the sweep streams it, and a frozen enemy shouldn't move.)
 static inline void Net_LatchHostDead(int idx, int extra, bool isEnemy)
 {
     if (extra > 0)
@@ -6289,6 +6291,13 @@ static void Net_ApplySpriteStream(const char *buf, int len)
 
         if (sprite[idx].statnum >= MAXSTATUS)
         {
+            // Fresh slot: unambiguously a NEW object, so drop any stale freeze
+            // latch left by a previous occupant (a corpse the guest deleted
+            // locally -- via radius damage/crusher/corpse cap -- before the host
+            // reused this index). The latch below re-sets it iff this new sprite
+            // is itself a dead enemy. Without this the new sprite inherits the
+            // freeze and G_MoveActors skips it for the rest of the level.
+            s_hostDead[idx] = 0;
             // Materialize at the host's exact index (freelist rotation makes
             // the engine's next insert claim precisely this slot).
             if (Net_RotateFreeSpriteToHead((int16_t)idx) != 0)
