@@ -2,7 +2,7 @@ name: Deploy WebAssembly build to GitHub Pages
 
 on:
   push:
-    branches: [wasm]
+    branches: [main, wasm]
     paths:
       - 'source/**'
       - 'Common.mak'
