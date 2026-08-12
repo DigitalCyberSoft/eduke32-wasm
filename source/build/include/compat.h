@@ -7,6 +7,27 @@
 
 #pragma once
 
+// NetDuke32 native transport (NETNATIVE): the stream-mode netcode is shared
+// between the Emscripten and native builds (guarded __EMSCRIPTEN__ || NETNATIVE)
+// and uses EM_ASM purely for gated forensics logging -- an Emscripten-only
+// builtin. On any non-Emscripten build compile it to nothing so the shared
+// netcode links natively. (Emscripten defines __EMSCRIPTEN__, so its real
+// emscripten.h EM_ASM is never shadowed.)
+#if !defined(__EMSCRIPTEN__)
+# ifndef EM_ASM
+#  define EM_ASM(...)        ((void)0)
+# endif
+# ifndef EM_ASM_INT
+#  define EM_ASM_INT(...)    0
+# endif
+# ifndef EM_ASM_DOUBLE
+#  define EM_ASM_DOUBLE(...) 0.0
+# endif
+# ifndef EM_ASM_PTR
+#  define EM_ASM_PTR(...)    0
+# endif
+#endif
+
 #ifndef __APPLE__
 #include <malloc.h>
 #endif
