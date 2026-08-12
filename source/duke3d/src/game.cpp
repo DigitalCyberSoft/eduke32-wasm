@@ -7185,8 +7185,16 @@ MAIN_LOOP_RESTART:
     {
         if (gameHandleEvents() && quitevent)
         {
-            KB_KeyDown[sc_Escape] = 1;
-            quitevent = 0;
+            // Window close button (X): quit the process immediately and cleanly.
+            // Previously this only injected Escape (merely opening the menu), so
+            // clicking X never actually closed the window; and in stream-mode MP
+            // the menu-quit path additionally stalls up to ~180s on the peer quit
+            // handshake ("Didn't get quit packet in time"). g_quickExit skips the
+            // interactive bonus/order screens that would otherwise wait for input,
+            // and G_GameExit -> app_exit runs atexit(net_transport_shutdown), so the
+            // relay/peer sockets still close cleanly.
+            g_quickExit = 1;
+            G_GameExit(NULL);
         }
 
         // NOTE: the native WebRTC host launch lives in M_DisplayMenus (menus.cpp), NOT here.
