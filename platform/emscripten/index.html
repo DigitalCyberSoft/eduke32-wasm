@@ -106,6 +106,10 @@
         <span style="color:#8a8479;font-size:12px">Main game: <span id="mainGrpName" style="color:var(--duke-yellow)"></span></span>
         <button class="s" id="btnUseShareware">Use shareware</button>
       </div>
+      <div id="extraRow" style="margin-top:8px;display:none">
+        <span style="color:#8a8479;font-size:12px">Stored extra data (stacked on the game at boot):</span>
+        <ul id="extralist"></ul>
+      </div>
       <input type="file" id="grpFile" multiple style="display:none">
     </section>
     <section>
@@ -291,11 +295,21 @@
   }
 
   // Backstop: snapshot the cfg files straight from MEMFS when the tab is hidden or
-  // unloaded, in case a write slipped past the close hook. Synchronous MEMFS reads,
-  // so this can never catch a half-written file.
+  // unloaded. CRITICAL ORDER: ask the ENGINE to flush first (Web_SaveConfig ->
+  // CONFIG_WriteSetup(0), the full write including settings.cfg where the
+  // sound/music cvars live) -- the engine otherwise never writes its config
+  // in-session (G_Shutdown is unreachable in a browser), so snapshotting MEMFS
+  // alone faithfully persisted a STALE boot-time file: that was the "settings
+  // never save" bug. Synchronous: the engine write, the FS.close mirror, and
+  // this snapshot all complete inside the event handler.
   function e32SnapshotConfigs() {
     var FS = window.Module && Module.FS;
     if (!FS) return;
+    // NOTE: no Module.calledRun check -- this emscripten runtime never sets it
+    // (verified live: it gated Web_SaveConfig off on every real pagehide, which
+    // was the whole "settings still don't save" bug). The export existing means
+    // the runtime is up; the engine's setupread guard makes early calls no-ops.
+    try { if (Module._Web_SaveConfig) Module._Web_SaveConfig(); } catch (e) {}
     E32_CFGS.forEach(function (name) {
       var data;
       try { data = FS.readFile('/' + name, { encoding: 'utf8' }); } catch (e) { return; }
@@ -421,8 +435,20 @@
   // preRun (async, gated by a run dependency): load every stored EXTRA file into the
   // MEMFS root and queue group-type files for loading with -g. No-op / fail-safe when
   // IndexedDB is unavailable.
+  //
+  // BASE-GAME SHADOWING GUARD: -g groups override the main GRP's files, which is
+  // the point for real mods -- but a stored TOTAL-CONVERSION/base GRP (e.g. an
+  // unregistered 50MB GRP imported back when it WAS the game) stacked on a chosen
+  // main game scrambles that game's data. Verified live: a stale TRUMPDUKE.GRP row
+  // over imported Atomic turns the boot ANM into rainbow noise (its PALETTE/LOOKUP
+  // shadow Atomic's). So: with a main game selected, base-game-SIZED groups
+  // (>8 MB; real mods are smaller) are left un-stacked -- still stored, listed in
+  // Settings with a Remove button, and stacked again if the main choice is cleared.
   function e32RestoreUserData() {
     if (typeof indexedDB === 'undefined' || !Module.FS || !Module.addRunDependency) return;
+    var hasMain = false;
+    try { hasMain = !!JSON.parse(localStorage.getItem('eduke32/mainGrp') || 'null'); } catch (e) {}
+    try { var nc = JSON.parse(localStorage.getItem('eduke32-net-gamegrp') || 'null'); if (nc && typeof nc.crc === 'number') hasMain = true; } catch (e) {}
     Module.addRunDependency('e32-userdata');
     var fired = false;
     var done = function () { if (fired) return; fired = true; try { Module.removeRunDependency('e32-userdata'); } catch (e) {} };
@@ -434,8 +460,13 @@
           try {
             (all.result || []).forEach(function (rec) {
               if (!rec || !rec.name || !rec.bytes) return;
+              var isGroup = /\.(grp|zip|pk3|pk4)$/i.test(rec.name);
+              if (hasMain && isGroup && rec.bytes.length > 8 * 1024 * 1024) {
+                console.log('[e32] NOT stacking stored "' + rec.name + '" (base-game-sized; it would shadow the selected main game\'s data -- remove it in Settings if unwanted)');
+                return;
+              }
               try { Module.FS.writeFile('/' + rec.name, rec.bytes); } catch (e) {}
-              if (/\.(grp|zip|pk3|pk4)$/i.test(rec.name)) { try { Module.arguments.push('-g', rec.name); } catch (e) {} }
+              if (isGroup) { try { Module.arguments.push('-g', rec.name); console.log('[e32] stacking stored extra "' + rec.name + '"'); } catch (e) {} }
             });
           } catch (e) {}
           try { db.close(); } catch (e) {}
@@ -597,7 +628,7 @@
     var $ = function (id) { return document.getElementById(id); };
     var settingsEl = $('settings'), gearEl = $('gear'), diagEl = $('diag');
 
-    function open()  { populateGRPs(); syncMainGrp(); syncControls(); settingsEl.classList.add('open'); try { document.exitPointerLock(); } catch (e) {} }
+    function open()  { populateGRPs(); populateExtras(); syncMainGrp(); syncControls(); settingsEl.classList.add('open'); try { document.exitPointerLock(); } catch (e) {} }
     function close() { settingsEl.classList.remove('open'); }
 
     function hsize(n) { return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.round(n / 1024) + ' KB'; }
@@ -630,6 +661,52 @@
                        '<span class="gsz">' + hsize(g.size) + '</span>';
         ul.appendChild(li);
       });
+    }
+
+    // Stored EXTRA files (IndexedDB 'files' store) -- everything here is written
+    // into the FS at boot and group-type files are stacked with -g. Invisible
+    // residue in this store is how a long-forgotten total-conversion GRP silently
+    // corrupted the imported main game, so it gets a visible list with per-file
+    // Remove buttons.
+    function e32DeleteUserFile(name, cb) {
+      e32OpenUserDb(function (db) {
+        try {
+          var t = db.transaction('files', 'readwrite');
+          t.objectStore('files').delete(name);
+          t.oncomplete = function () { try { db.close(); } catch (e) {} cb && cb(); };
+          t.onerror = function () { try { db.close(); } catch (e) {} cb && cb(); };
+        } catch (e) { try { db.close(); } catch (e2) {} cb && cb(); }
+      }, function () { cb && cb(); });
+    }
+    function populateExtras() {
+      var ul = $('extralist'), row = $('extraRow');
+      if (!ul || !row) return;
+      e32OpenUserDb(function (db) {
+        var all;
+        try { all = db.transaction('files', 'readonly').objectStore('files').getAll(); }
+        catch (e) { try { db.close(); } catch (e2) {} return; }
+        all.onsuccess = function () {
+          try { db.close(); } catch (e) {}
+          var recs = all.result || [];
+          ul.innerHTML = '';
+          row.style.display = recs.length ? 'block' : 'none';
+          recs.forEach(function (rec) {
+            if (!rec || !rec.name) return;
+            var li = document.createElement('li');
+            var nm = document.createElement('span'); nm.className = 'gname'; nm.textContent = rec.name;
+            var sz = document.createElement('span'); sz.className = 'gsz';
+            sz.textContent = hsize(rec.size || (rec.bytes ? rec.bytes.length : 0));
+            var rm = document.createElement('button'); rm.className = 's'; rm.textContent = 'Remove';
+            rm.addEventListener('click', function () {
+              if (!confirm('Remove stored "' + rec.name + '"? It will no longer be loaded at boot (reload to apply).')) return;
+              e32DeleteUserFile(rec.name, populateExtras);
+            });
+            li.appendChild(nm); li.appendChild(sz); li.appendChild(rm);
+            ul.appendChild(li);
+          });
+        };
+        all.onerror = function () { try { db.close(); } catch (e) {} };
+      }, function () {});
     }
 
     function syncControls() {
@@ -772,7 +849,10 @@
   if (!btn) return;
   var muted = false;
   try { muted = localStorage.getItem('e32-muted') === '1'; } catch (e) {}
-  function ready() { return !!(window.Module && Module.ccall && window.__e32menu); }
+  // Gate on the EXPORT, not window.__e32menu: that harness surface silently died
+  // once (buffer truncation -> JS syntax error) and took the mute button with it.
+  // Web_SetMute is safe any time after the runtime is up.
+  function ready() { return !!(window.Module && Module.ccall && Module._Web_SetMute); }
   function paint() { btn.innerHTML = muted ? '&#128263;' : '&#128266;'; btn.classList.toggle('muted', muted); }
   function apply() {
     if (ready()) { try { Module.ccall('Web_SetMute', null, ['number'], [muted ? 1 : 0]); } catch (e) {} }

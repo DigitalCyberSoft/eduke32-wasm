@@ -824,6 +824,10 @@ int CONFIG_ReadSetup(void)
     SCRIPT_GetString(ud.config.scripthandle, "Misc", "Locale", &locale[0]);
     localeSetCurrent(locale);
 
+#if defined(NETDUKE32) && (defined(__EMSCRIPTEN__) || defined(NETNATIVE))
+    { extern void Menu_NetConfigLoad(void); Menu_NetConfigLoad(); }  // restore multiplayer host-setup choices
+#endif
+
     ud.config.setupread = 1;
     return 0;
 }
@@ -1043,6 +1047,10 @@ void CONFIG_WriteSetup(uint32_t flags)
     const char* locale = localeGetCurrent();
     SCRIPT_PutString(ud.config.scripthandle, "Misc", "Locale", locale ? locale : "en");
 
+#if defined(NETDUKE32) && (defined(__EMSCRIPTEN__) || defined(NETNATIVE))
+    { extern void Menu_NetConfigSave(void); Menu_NetConfigSave(); }  // remember multiplayer host-setup choices
+#endif
+
     SCRIPT_Save(ud.config.scripthandle, g_setupFileName);
 
     if ((flags & 2) == 0)
@@ -1052,6 +1060,39 @@ void CONFIG_WriteSetup(uint32_t flags)
     CONFIG_WriteSettings();
     Bfflush(NULL);
 }
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+// WEB: in-session full-config flush, called from index.html on pagehide/
+// visibilitychange (before its MEMFS->localStorage snapshot) and from Menu_Close.
+// The browser never reaches G_Shutdown, and the only write that DID happen
+// in-session was the flags&1 partial (game startup), which returns before the
+// Sound section and never writes settings.cfg -- the cvar file where
+// mus_volume/snd_fxvolume actually live. That is exactly why video settings
+// appeared to persist while sound/music never did. setupread-guarded: calling
+// before init is a no-op.
+extern "C" EMSCRIPTEN_KEEPALIVE void Web_SaveConfig(void)
+{
+    extern void Web_MuteCfgGuard(int preWrite);
+    Web_MuteCfgGuard(1);   // mask the page-mute: persist the user's REAL toggles
+    CONFIG_WriteSetup(0);
+    Web_MuteCfgGuard(0);
+}
+
+// Diagnostic: live sound state, readable from the page/harness.
+// bit17=SoundToggle, bit16=MusicToggle, bits 15..8=MusicVolume, 7..0=FXVolume.
+extern "C" EMSCRIPTEN_KEEPALIVE int Web_DbgVolumes(void)
+{
+    return ((ud.config.SoundToggle ? 1 : 0) << 17) | ((ud.config.MusicToggle ? 1 : 0) << 16)
+         | ((ud.config.MusicVolume & 0xff) << 8) | (ud.config.FXVolume & 0xff);
+}
+
+// Diagnostic: run one OSD command from the page (harness only).
+extern "C" EMSCRIPTEN_KEEPALIVE void Web_OSD(const char *cmd)
+{
+    OSD_Dispatch(cmd);
+}
+#endif
 
 char const * CONFIG_GetGameFuncOnKeyboard(int gameFunc)
 {
