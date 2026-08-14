@@ -694,6 +694,46 @@ static int P_PostFireHitscan(int playerNum, int const spriteNum, hitdata_t *cons
     {
         A_DamageObject(hitData->sprite, spriteNum);
 
+#if defined(NETDUKE32) && (defined(__EMSCRIPTEN__) || defined(NETNATIVE))
+        // ── FAVOR-THE-SHOOTER, from the REAL hit (stream coop) ──────────────────
+        // A_DamageObject above is a no-op on the guest (g_netClient), so the guest
+        // reports the EXACT sprite its shot just hit -- the one that drew the impact
+        // spark -- and the host applies it. Reporting here (post-shot) instead of
+        // the pre-shot client-hitscan block is what makes registration match the
+        // visual: auto-aim and the true vertical angle are already baked into
+        // hitData->sprite. MONSTERS -> kind 1 (host decrements enemy health);
+        // BREAKABLES -> kind 2 (host QUEUES it and runs A_DamageObject on-tick, so it
+        // no longer desyncs). Players stay on the P_FireWeapon block.
+        {
+            extern int32_t g_netStreamMode;
+            if (g_netStreamMode && numplayers > 1 && myconnectindex != connecthead && playerNum == myconnectindex
+                && (unsigned)hitData->sprite < MAXSPRITES && sprite[hitData->sprite].statnum < MAXSTATUS
+                && sprite[hitData->sprite].picnum != APLAYER)
+            {
+                auto const pv    = &sprite[hitData->sprite];
+                int  const hdmg  = (spriteNum >= 0) ? sprite[spriteNum].extra : 0;   // shotspark's damage
+                if (hdmg > 0 && pv->extra > 0)   // a LIVE thing we just hit
+                {
+                    if (A_CheckEnemySprite(pv))
+                    {
+                        // Report by POSITION, not sprite index: the guest and host can
+                        // number the SAME monster with different indices, so an
+                        // index-keyed report lands on the host's unrelated sprite and
+                        // the kill never registers. The host resolves this to the live
+                        // enemy AT this spot.
+                        extern void Net_ClientReportEnemyHit(int idxHint, int x, int y, int z, int damage, int weaponPic);
+                        Net_ClientReportEnemyHit(hitData->sprite, pv->x, pv->y, pv->z, hdmg, SHOTSPARK1);
+                    }
+                    else
+                    {
+                        extern void Net_ClientReportHit(int kind, int victim, int damage, int weaponPic);
+                        Net_ClientReportHit(2, hitData->sprite, hdmg, SHOTSPARK1);   // breakable (index; objects are static)
+                    }
+                }
+            }
+        }
+#endif
+
 #ifndef EDUKE32_STANDALONE
         if (!FURY && sprite[hitData->sprite].picnum == APLAYER &&
             (ud.ffire == 1 || (!GTFLAGS(GAMETYPE_PLAYERSFRIENDLY) && GTFLAGS(GAMETYPE_TDM) &&
@@ -2114,7 +2154,7 @@ static void P_FireWeapon(int playerNum)
     }
 #endif
 
-#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+#if defined(NETDUKE32) && (defined(__EMSCRIPTEN__) || defined(NETNATIVE))
     // ── CLIENT-SIDE HITSCAN (user 2026-08-10: "the hitscan should be client
     // side, not host side ... the problem is where you are calculating it") ──
     // MEASURED ROOT: the guest never computes its own hit -- weapons are host-
@@ -2128,8 +2168,8 @@ static void P_FireWeapon(int playerNum)
     // each player hit; the host applies it verbatim (Net_ApplyHitReport). Runs
     // ONLY on the guest for its OWN player and ONLY for hitscan weapons.
     {
-        extern int32_t g_netStreamMode, g_netForensics;
-        extern void Net_ClientReportHit(int victimSeat, int damage, int weaponPic);
+        extern int32_t g_netStreamMode;
+        extern void Net_ClientReportHit(int kind, int victim, int damage, int weaponPic);
         int const shoots = PWEAPON(playerNum, pPlayer->curr_weapon, Shoots);
         if (g_netStreamMode && numplayers > 1 && myconnectindex != connecthead
             && playerNum == myconnectindex && (unsigned)pPlayer->cursectnum < (unsigned)numsectors
@@ -2147,20 +2187,30 @@ static void P_FireWeapon(int playerNum)
                 hitdata_t h;
                 hitscan(&pPlayer->pos, pPlayer->cursectnum, sintable[(a + 512) & 2047], sintable[a & 2047],
                         ((100 - horiz) << 5) + zSpread, &h, CLIPMASK1);
+                // PLAYERS only here (the proven deathmatch path). Monsters and
+                // breakables are reported from the REAL post-shot hit in
+                // P_PostFireHitscan, where auto-aim + the true vertical angle have
+                // already been applied -- this pre-shot re-scan would otherwise
+                // report a different ray than the shot the player actually sees.
                 if (h.sprite >= 0 && (unsigned)h.sprite < MAXSPRITES && sprite[h.sprite].picnum == APLAYER)
                 {
                     int const victim = P_Get(h.sprite);
                     if (victim != playerNum && (unsigned)victim < MAXPLAYERS)
                     {
                         int const dmg = G_DefaultActorHealthForTile(shoots) + (krand() % 6);
-                        Net_ClientReportHit(victim, dmg, SHOTSPARK1);
+                        Net_ClientReportHit(0, victim, dmg, SHOTSPARK1);   // kind 0 = player seat
                         reported++;
                     }
                 }
             }
+#ifdef __EMSCRIPTEN__
+            extern int32_t g_netForensics;
             if (g_netForensics && reported)
-                EM_ASM({ console.log('[chscan] guest client-hitscan reported ' + $0 + '/' + $1 + ' pellets on players'); },
+                EM_ASM({ console.log('[chscan] guest client-hitscan reported ' + $0 + '/' + $1 + ' pellets'); },
                        reported, pellets);
+#else
+            (void)reported;
+#endif
         }
     }
 #endif

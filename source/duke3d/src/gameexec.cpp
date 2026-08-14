@@ -7007,6 +7007,14 @@ void VM_UpdateAnim(int const spriteNum, int32_t * const pData)
 // NORECURSE
 void A_Execute(int const spriteNum, int const playerNum, int const playerDist)
 {
+    // STREAM COOP note: the guest runs enemy CON locally (animation/attacks/deaths
+    // all render); the host stays authoritative via the sprite stream (position/
+    // health hard-sync) and the replay-kill (oldnet.cpp Net_LatchHostDead) which
+    // makes the guest's own CON run each host-confirmed death. A previous
+    // "freeze all enemy CON on the guest" gate here turned every monster into a
+    // sliding mannequin that could never animate or die -- draw frames come from
+    // t_data (game.cpp G_DoSpriteAnimations), which only advances inside this
+    // function. Do not reintroduce it.
     // for some reason this is faster than using the C++ syntax; e.g vm = vmstate_t{ ... }
     vmstate_t const tempvm
     = { spriteNum, playerNum, playerDist, 0, &sprite[spriteNum], &actor[spriteNum].t_data[0], g_player[playerNum].ps, &actor[spriteNum] };

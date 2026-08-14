@@ -940,6 +940,19 @@ void P_ResetWeapons(int playerNum)
 {
     auto &p = *g_player[playerNum].ps;
 
+    // Coop weapon-stay: a fresh life may re-take every weapon still in the
+    // world (stock semantics -- the per-player weaprecs this bitmask replaced
+    // reset on death). Without this, dying permanently locked a player out of
+    // every weapon sprite they had already grabbed ("if I respawn, I should
+    // be able to pick up untouched weapons again"). Runs on every sim that
+    // performs the respawn (guest locally, host for its copy), so both agree.
+    {
+        extern uint16_t g_coopWeapGrab[MAXSPRITES];
+        uint16_t const pmask = (uint16_t)~(1u << playerNum);
+        for (int gi = 0; gi < MAXSPRITES; gi++)
+            g_coopWeapGrab[gi] &= pmask;
+    }
+
     for (short & ammo : p.ammo_amount)
         ammo = 0;
 
@@ -2394,8 +2407,8 @@ int G_EnterLevel(int gameMode)
     // weapons grant ammo afresh (see g_coopWeapGrab in gameexec.cpp).
     { extern uint16_t g_coopWeapGrab[MAXSPRITES]; Bmemset(g_coopWeapGrab, 0, sizeof(g_coopWeapGrab)); }
 
-    // Stream-mode guest freeze: sprite indices are reused across levels, so drop
-    // every stale host-dead latch before the new map's actors take those slots.
+    // Stream-mode coop: sprite indices are reused across levels, so drop every
+    // stale replay-kill latch before the new map's actors take those slots.
     Net_StreamClearDeadActors();
 
     ud.last_level = ud.level_number+1;

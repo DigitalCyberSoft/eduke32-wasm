@@ -117,6 +117,8 @@ static void oldnet_sendpacket(int other, unsigned char *bufptr, int len)
         case PACKET_TYPE_MASTER_TO_SLAVE:
         case PACKET_TYPE_SLAVE_TO_MASTER:
         case PACKET_TYPE_PING:
+        case PACKET_TYPE_WEAPON_STATE:  // per-tic guest weapon: unreliable, self-corrects next tic
+        case PACKET_TYPE_POS_REPORT:    // per-tic guest position: unreliable, next report supersedes
             channel  = NET_CHAN_MOVE;   // per-tic input: unreliable, unordered
             reliable = 0;
             break;
@@ -136,6 +138,7 @@ static void oldnet_sendpacket(int other, unsigned char *bufptr, int len)
         // next one (33ms later) carries current truth.
         case PACKET_TYPE_STATE_SNAP:
         case PACKET_TYPE_SECTOR_STREAM:
+        case PACKET_TYPE_WALL_STREAM:    // absolute wall-vertex paints: self-heal like sector heights
             if (g_netStreamMode)
             {
                 channel  = NET_CHAN_MOVE;
@@ -571,9 +574,62 @@ static int32_t  s_pendingSnapTic;
 // Stream-mode machinery (defined after Net_ApplyPendingStateSnap).
 static void Net_StreamAuthoritativeState(void);
 static void Net_ApplySpriteStream(const char *buf, int len);
+static void Net_ApplyWallStream(const char *buf, int len);
 static void Net_ClientPickupScan(void);   // guest client-authoritative item pickup
-static void Net_ApplyHitReport(int attacker, int victim, int dmg, int weaponPic);  // host: apply a guest's reported hit
+static void Net_ApplyHitReport(int attacker, int victim, int dmg, int weaponPic);       // host: apply a guest's reported PLAYER hit
+static void Net_ApplyEnemyHitReport(int attacker, int idxHint, int x, int y, int z, int dmg, int weaponPic); // host: apply a guest's reported MONSTER hit (by position)
 static void Net_ApplySectorStream(const char *buf, int len);
+// Guest-reported BREAKABLE/object hits are QUEUED here and drained ON-TICK
+// (Net_DrainObjectHits, called from G_DoMoveThings). Running A_DamageObject from
+// packet handling spawned/deleted sprites + rolled RNG off-tick and desynced the
+// host; deferring to the tick makes it sync-safe.
+static int16_t s_objHitVictim[128];
+static uint8_t s_objHitAtk[128];
+static int     s_objHitN;
+// Guest-reported ENEMY hits, likewise QUEUED and drained ON-TICK (Net_DrainEnemyHits,
+// right before G_MoveActors): the apply WAKES dormant monsters (changespritestat) and
+// writes health, which must land on the authoritative timeline, not mid-packet.
+struct NetEnemyHit { int32_t x, y, z; int16_t idx; uint16_t dmg; uint16_t wpic; uint8_t atk; };
+static NetEnemyHit s_enemyHit[128];
+static int         s_enemyHitN;
+int32_t g_hostProbeIdx = -1, g_hostProbePlc = 0;   // NN_TESTKILL host-death probe (test rig only)
+// HOST: each guest's authoritative LIVE weapon -- it decides what it fires, not us.
+// Stashed off-tick from PACKET_TYPE_WEAPON_STATE, force-applied on-tick before the
+// seat's P_ProcessInput (Net_ApplyGuestWeapon). s_gwHave gates it so we never force a
+// seat we've heard nothing from.
+static int8_t   s_gwWeapon[MAXPLAYERS];
+static uint16_t s_gwGot[MAXPLAYERS];
+static int16_t  s_gwAmmo[MAXPLAYERS];
+static uint8_t  s_gwHave[MAXPLAYERS];
+static uint16_t s_gwSeq[MAXPLAYERS];   // newest applied report (unordered channel)
+static void Net_SendWeaponState(void);   // guest -> host, per-tic (defined below)
+// HOST: each guest's authoritative POSITION -- the guest owns its own movement
+// ("trust the client where it ended up"). The host's input-replay copy of a guest
+// drifts (clipping/timing skew), and reflecting that drift back as a correction
+// was the live "teleporting me to places I shouldn't be". Reports land per-tic
+// from PACKET_TYPE_POS_REPORT; Net_ApplyGuestPos snaps the seat right before its
+// P_ProcessInput, so the host sim (enemy AI, hazards, its own render of the
+// guest) tracks guest truth within one RTT. Between reports the input-replay
+// still integrates forward from the last snapped base -- dropped packets coast.
+static vec3_t   s_gpPos[MAXPLAYERS];
+static vec3_t   s_gpVel[MAXPLAYERS];
+static fix16_t  s_gpAng[MAXPLAYERS], s_gpHoriz[MAXPLAYERS];
+static int16_t  s_gpSect[MAXPLAYERS];
+static int32_t  s_gpSprZ[MAXPLAYERS];
+static uint8_t  s_gpHave[MAXPLAYERS];
+static uint16_t s_gpSeq[MAXPLAYERS];
+static void Net_SendPosReport(void);     // guest -> host, per-tic (defined below)
+// SHARED COOP ACCESS (live 2026-08-14: "access cards need to be shared between
+// users if either user collects one"). Cards are granted by each sim's LOCAL CON
+// (per-player got_access), so the guest's ledger and the host's copy of the guest
+// could disagree -- a card door then opened on one screen and refused on the
+// other. Now: guests report their earned bits upstream (reliable, idempotent OR);
+// the host unions every seat's bits each tic, ORs the union back into every seat,
+// and broadcasts it -- one shared key ring for the whole coop session.
+static uint8_t s_accSentMask;    // guest: last mask reported upstream
+static uint8_t s_accBcastMask;   // host: last union broadcast
+static void Net_SendAccessState(void);   // guest -> host, on change (defined below)
+void Net_ClientReportEnemyHit(int idxHint, int x, int y, int z, int damage, int weaponPic); // defined below
 // NEW_GAME delivery hardening: a real browser can still be BOOTING the wasm
 // when the host launches (live: join_ok -> launch within 1s; the guest's
 // engine missed the roster packet and entered an empty world). The host
@@ -3225,6 +3281,76 @@ void Net_HandleInput(void)
         if (start > myEnd) start = myEnd;
         if (start == myEnd && myEnd > 0) start = myEnd - 1;
 
+#if defined(NETNATIVE) && !defined(__EMSCRIPTEN__)
+        // Headless verification driver (env NN_TESTKILL; inert otherwise). Once
+        // in-game: (1) switch to KNEE so the weapon-state wire shows a [gw] apply
+        // on the host, (2) report a lethal hit on the nearest live enemy in OUR
+        // world -- exercising report -> host resolve/wake -> host death CON ->
+        // stream -> guest replay-kill end-to-end, minus only the literal hitscan.
+        {
+            static int s_tkPhase = -1;
+            static int s_tkTarget = -1;
+            if (s_tkPhase < 0)
+                s_tkPhase = (getenv("NN_TESTKILL") != NULL) ? 0 : 9;
+            auto const tkps = g_player[myconnectindex].ps;
+            if (s_tkPhase < 9 && tkps != NULL && (tkps->gm & MODE_GAME))
+            {
+                if (s_tkPhase == 0 && movefifoplc > 120)
+                {
+                    tkps->curr_weapon = KNEE_WEAPON;
+                    LOG_F(INFO, "[testkill] switched to KNEE (expect [gw] on host)");
+                    s_tkPhase = 1;
+                }
+                else if (s_tkPhase == 1 && movefifoplc > 240)
+                {
+                    int best = -1; int64_t bestd = INT64_MAX;
+                    for (int i = 0; i < MAXSPRITES; i++)
+                    {
+                        if (sprite[i].statnum >= MAXSTATUS || !A_CheckEnemySprite(&sprite[i]) || sprite[i].extra <= 0)
+                            continue;
+                        int64_t const dx = sprite[i].x - tkps->pos.x, dy = sprite[i].y - tkps->pos.y;
+                        int64_t const d = dx * dx + dy * dy;
+                        if (d < bestd) { bestd = d; best = i; }
+                    }
+                    if (best >= 0)
+                    {
+                        LOG_F(INFO, "[testkill] lethal report on idx=%d pic=%d stat=%d extra=%d",
+                              best, (int)sprite[best].picnum, (int)sprite[best].statnum, (int)sprite[best].extra);
+                        Net_ClientReportEnemyHit(best, sprite[best].x, sprite[best].y, sprite[best].z, 300, SHOTSPARK1);
+                        s_tkTarget = best;
+                        s_tkPhase = 2;
+                    }
+                }
+                else if (s_tkPhase == 2 && movefifoplc > 420 && s_tkTarget >= 0)
+                {
+                    // Post-kill probe: htextra==-1 proves the local CON CONSUMED the
+                    // replayed hit (death branch executed); statnum>=MAXSTATUS means
+                    // the host gibbed+deleted it. Either is a completed death.
+                    LOG_F(INFO, "[testkill] post idx=%d stat=%d extra=%d htextra=%d",
+                          s_tkTarget, (int)sprite[s_tkTarget].statnum, (int)sprite[s_tkTarget].extra,
+                          (int)actor[s_tkTarget].htextra);
+                    s_tkPhase = 3;
+                }
+            }
+        }
+#endif
+        Net_SendWeaponState();   // guest: tell the host which weapon it's firing (host-auth fire uses it)
+        Net_SendPosReport();     // guest: authoritative self position (the host adopts, never corrects)
+        Net_SendAccessState();   // guest: newly earned key cards -> the shared coop key ring
+        {
+            // Test rig (NN_TESTACCESS=1): simulate a guest card pickup so the
+            // shared-key-ring round trip proves out headlessly -- guest report
+            // up, host union+share, broadcast back down ([access] lines).
+            static int s_taDone;
+            if (!s_taDone && movefifoplc > 200 && getenv("NN_TESTACCESS") != NULL
+                && g_player[myconnectindex].ps != NULL)
+            {
+                s_taDone = 1;
+                g_player[myconnectindex].ps->got_access |= 1;
+                LOG_F(INFO, "[testaccess] guest granted itself the blue card");
+            }
+        }
+
         packbuf[0] = PACKET_TYPE_SLAVE_TO_MASTER;
         packbuf[1] = (char)g_netMoveEpoch;
         j = 2;
@@ -3927,21 +4053,101 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
             }
             case PACKET_TYPE_HIT_REPORT:
             {
-                // CLIENT-AUTHORITATIVE HITSCAN (guest -> host). The sender is
-                // 'other', so a guest can only ever report its OWN hits -- the
-                // host trusts the shooter for damage IT dealt, not the identity.
-                // Bounds/sanity gate everything; a report from a non-guest seat
-                // (unseated, or a bot slot spoofed) is ignored.
+                // CLIENT-AUTHORITATIVE HITSCAN (guest -> host). ONE unified wire;
+                // kind selects player-seat (0) vs enemy-sprite (1) -- both native
+                // and wasm speak it. The sender is 'other', so a guest can only
+                // ever report its OWN hits. Bounds/sanity gate everything; a report
+                // from a non-guest seat (unseated / spoofed bot) is ignored.
                 if (myconnectindex != connecthead || !g_player[other].connected
                     || (g_netBotMask & (1 << other)))
                     break;
-                int const victim = (uint8_t)packbuf[1];
-                int const dmg    = (int)((uint8_t)packbuf[2] | ((uint8_t)packbuf[3] << 8));
-                int const wpic   = (int)((uint8_t)packbuf[4] | ((uint8_t)packbuf[5] << 8));
-                if ((unsigned)victim >= MAXPLAYERS || !g_player[victim].connected
-                    || victim == other || dmg <= 0 || dmg > 1000)
+                int const kind   = (uint8_t)packbuf[1];
+                int const victim = (int)((uint8_t)packbuf[2] | ((uint8_t)packbuf[3] << 8));
+                int const dmg    = (int)((uint8_t)packbuf[4] | ((uint8_t)packbuf[5] << 8));
+                int const wpic   = (int)((uint8_t)packbuf[6] | ((uint8_t)packbuf[7] << 8));
+                if (dmg <= 0 || dmg > 4000)   // hitscan pellets are small
                     break;
-                Net_ApplyHitReport(other, victim, dmg, wpic);
+                if (kind == 0)   // PLAYER seat victim
+                {
+                    if ((unsigned)victim >= MAXPLAYERS || !g_player[victim].connected || victim == other)
+                        break;
+                    Net_ApplyHitReport(other, victim, dmg, wpic);
+                }
+                else if (kind == 1)   // ENEMY: 20-byte, carries the hit position (idx is a hint)
+                {
+                    // QUEUE for on-tick drain: the apply wakes dormant monsters
+                    // (changespritestat) and writes health -- both must land on the
+                    // authoritative timeline right before G_MoveActors, not here
+                    // mid-packet.
+                    if (s_enemyHitN < (int)ARRAY_SIZE(s_enemyHit))
+                    {
+                        s_enemyHit[s_enemyHitN] = { (int)B_UNBUF32(&packbuf[8]), (int)B_UNBUF32(&packbuf[12]),
+                                                    (int)B_UNBUF32(&packbuf[16]), (int16_t)victim,
+                                                    (uint16_t)dmg, (uint16_t)wpic, (uint8_t)other };
+                        s_enemyHitN++;
+                    }
+                }
+                else if (kind == 2)   // BREAKABLE / OBJECT sprite victim -- DEFER to on-tick
+                {
+                    if ((unsigned)victim < MAXSPRITES && s_objHitN < (int)ARRAY_SIZE(s_objHitVictim))
+                    {
+                        s_objHitVictim[s_objHitN] = (int16_t)victim;
+                        s_objHitAtk[s_objHitN]    = (uint8_t)other;
+                        s_objHitN++;
+                    }
+                }
+                break;
+            }
+            case PACKET_TYPE_WEAPON_STATE:
+            {
+                // GUEST -> HOST: authoritative live weapon for seat 'other'. Stash
+                // off-tick; Net_ApplyGuestWeapon forces it on-tick before that seat's
+                // P_ProcessInput, so the host fires what the guest actually holds
+                // instead of reconstructing it from a droppable keypress.
+                if (myconnectindex != connecthead || (unsigned)other >= MAXPLAYERS
+                    || !g_player[other].connected || (g_netBotMask & (1 << other)))
+                    break;
+                int const w = (uint8_t)packbuf[1];
+                if ((unsigned)w >= MAX_WEAPONS || packbufleng < 8)
+                    break;
+                // Unordered channel: drop anything not strictly newer than the last
+                // applied report (wraparound-safe), else a stale packet flaps the
+                // seat's weapon back (seen live: 2->0->2 within 100ms).
+                uint16_t const seq = (uint16_t)((uint8_t)packbuf[6] | ((uint8_t)packbuf[7] << 8));
+                if (s_gwHave[other] && (int16_t)(seq - s_gwSeq[other]) <= 0)
+                    break;
+                s_gwSeq[other]    = seq;
+                s_gwWeapon[other] = (int8_t)w;
+                s_gwGot[other]    = (uint16_t)((uint8_t)packbuf[2] | ((uint8_t)packbuf[3] << 8));
+                s_gwAmmo[other]   = (int16_t)((uint8_t)packbuf[4] | ((uint8_t)packbuf[5] << 8));
+                s_gwHave[other]   = 1;
+                break;
+            }
+            case PACKET_TYPE_POS_REPORT:
+            {
+                // GUEST -> HOST: client-authoritative self position. Stash the
+                // newest (seq-guarded, unordered channel); Net_ApplyGuestPos
+                // snaps the seat on-tick before its P_ProcessInput.
+                if (myconnectindex != connecthead || (unsigned)other >= MAXPLAYERS
+                    || !g_player[other].connected || (g_netBotMask & (1 << other))
+                    || packbufleng < 41)
+                    break;
+                uint16_t const seq = (uint16_t)((uint8_t)packbuf[1] | ((uint8_t)packbuf[2] << 8));
+                if (s_gpHave[other] && (int16_t)(seq - s_gpSeq[other]) <= 0)
+                    break;
+                s_gpSeq[other]   = seq;
+                int jj = 3;
+                s_gpPos[other].x = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                s_gpPos[other].y = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                s_gpPos[other].z = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                s_gpVel[other].x = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                s_gpVel[other].y = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                s_gpVel[other].z = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                s_gpAng[other]   = (fix16_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                s_gpHoriz[other] = (fix16_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                s_gpSect[other]  = (int16_t)B_UNBUF16(&packbuf[jj]); jj += 2;
+                s_gpSprZ[other]  = (int32_t)B_UNBUF32(&packbuf[jj]); jj += 4;
+                s_gpHave[other]  = 1;
                 break;
             }
             case PACKET_TYPE_STATE_SNAP:
@@ -4026,6 +4232,46 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     || !(g_player[myconnectindex].ps->gm & MODE_GAME))
                     break;
                 Net_ApplySectorStream((const char *)packbuf, packbufleng);
+                break;
+            }
+            case PACKET_TYPE_WALL_STREAM:
+            {
+                // Host-owned wall-motion doors (swing/slide). Same guards.
+                if (myconnectindex == connecthead || other != connecthead
+                    || g_netJoinCatchup || !g_netStreamMode)
+                    break;
+                if (g_player[myconnectindex].ps == NULL
+                    || !(g_player[myconnectindex].ps->gm & MODE_GAME))
+                    break;
+                Net_ApplyWallStream((const char *)packbuf, packbufleng);
+                break;
+            }
+            case PACKET_TYPE_ACCESS_STATE:
+            {
+                // SHARED COOP ACCESS: idempotent OR of the 3 key-card bits.
+                // guest->host: that seat earned a card in its local sim;
+                // host->guest: the coop-wide union (applied to every local
+                // seat so the guest's own door checks pass immediately).
+                if (packbufleng < 2 || !g_netStreamMode
+                    || !(g_gametypeFlags[ud.coop] & GAMETYPE_COOP))
+                    break;
+                int const mask = (uint8_t)packbuf[1] & 7;
+                if (myconnectindex == connecthead)
+                {
+                    if ((unsigned)other < MAXPLAYERS && g_player[other].ps != NULL)
+                    {
+                        g_player[other].ps->got_access |= (int16_t)mask;   // union spreads next tic
+                        LOG_F(INFO, "[access] seat %d reports cards mask=%d", other, mask);
+                    }
+                }
+                else if (other == connecthead)
+                {
+                    int ai;
+                    TRAVERSE_CONNECT(ai)
+                        if (g_player[ai].ps != NULL)
+                            g_player[ai].ps->got_access |= (int16_t)mask;
+                    LOG_F(INFO, "[access] host shared cards mask=%d", mask);
+                }
                 break;
             }
             case PACKET_TYPE_PLAYER_READY:
@@ -5350,28 +5596,63 @@ int32_t g_netDbgPackN = 0, g_netDbgSprN = 0, g_netDbgHitN = 0;
 // lands locally; the host applies it verbatim and drops the phantom damage it
 // would have computed from the same shot (no double-count, no wrong-aim miss).
 
-// GUEST -> HOST: report a hit this client resolved locally. victimSeat is the
-// player/bot index; damage/weaponPic come straight from the actor hit tracker.
-void Net_ClientReportHit(int victimSeat, int damage, int weaponPic)
+// GUEST -> HOST: report a hit this client resolved locally against its OWN world
+// with its EXACT aim (favor-the-shooter). ONE unified protocol; kind selects the
+// victim namespace so players AND monsters ride the SAME wire (native and wasm
+// both speak it -- the block that calls this is compiled on both):
+//   kind 0 = PLAYER victim  (victim is a player/bot SEAT index, < MAXPLAYERS)
+//   kind 1 = ENEMY  victim  (victim is a live enemy SPRITE index, < MAXSPRITES)
+void Net_ClientReportHit(int kind, int victim, int damage, int weaponPic)
 {
     if (!g_netStreamMode || numplayers < 2 || myconnectindex == connecthead)
         return;
-    if ((unsigned)victimSeat >= MAXPLAYERS || damage <= 0)
+    if (damage <= 0)
         return;
-    uint8_t buf[6];
+    if (kind == 0 ? ((unsigned)victim >= MAXPLAYERS) : ((unsigned)victim >= MAXSPRITES))
+        return;
+    uint8_t buf[8];
     buf[0] = PACKET_TYPE_HIT_REPORT;
-    buf[1] = (uint8_t)victimSeat;
-    buf[2] = (uint8_t)(damage & 0xff);
-    buf[3] = (uint8_t)((damage >> 8) & 0xff);
-    buf[4] = (uint8_t)(weaponPic & 0xff);
-    buf[5] = (uint8_t)((weaponPic >> 8) & 0xff);
-    oldnet_sendpacket(connecthead, buf, 6);
+    buf[1] = (uint8_t)kind;
+    buf[2] = (uint8_t)(victim & 0xff);
+    buf[3] = (uint8_t)((victim >> 8) & 0xff);
+    buf[4] = (uint8_t)(damage & 0xff);
+    buf[5] = (uint8_t)((damage >> 8) & 0xff);
+    buf[6] = (uint8_t)(weaponPic & 0xff);
+    buf[7] = (uint8_t)((weaponPic >> 8) & 0xff);
+    oldnet_sendpacket(connecthead, buf, 8);
     { extern int32_t g_netDbgHitN; g_netDbgHitN++; }   // guest tally: reports SENT
 #ifdef __EMSCRIPTEN__
     if (g_netForensics)
-        EM_ASM({ console.log('[hitrep] SENT victim=' + $0 + ' dmg=' + $1 + ' pic=' + $2); },
-               victimSeat, damage, weaponPic);
+        EM_ASM({ console.log('[hitrep] SENT kind=' + $0 + ' victim=' + $1 + ' dmg=' + $2 + ' pic=' + $3); },
+               kind, victim, damage, weaponPic);
 #endif
+}
+
+// GUEST -> HOST: report a MONSTER hit by POSITION. Same PACKET_TYPE_HIT_REPORT,
+// kind 1, but 20 bytes -- it carries the hit sprite's x/y/z so the host can find
+// the LIVE enemy at that spot. The sprite index is only a hint (used iff the host
+// happens to number that enemy the same). This is THE fix for "I killed it but the
+// host wasn't aware": guest and host index the same monster differently.
+void Net_ClientReportEnemyHit(int idxHint, int x, int y, int z, int damage, int weaponPic)
+{
+    if (!g_netStreamMode || numplayers < 2 || myconnectindex == connecthead)
+        return;
+    if (damage <= 0)
+        return;
+    uint8_t buf[20];
+    buf[0] = PACKET_TYPE_HIT_REPORT;
+    buf[1] = 1;                                  // kind 1 = enemy
+    buf[2] = (uint8_t)(idxHint & 0xff);
+    buf[3] = (uint8_t)((idxHint >> 8) & 0xff);
+    buf[4] = (uint8_t)(damage & 0xff);
+    buf[5] = (uint8_t)((damage >> 8) & 0xff);
+    buf[6] = (uint8_t)(weaponPic & 0xff);
+    buf[7] = (uint8_t)((weaponPic >> 8) & 0xff);
+    B_BUF32(&buf[8],  x);
+    B_BUF32(&buf[12], y);
+    B_BUF32(&buf[16], z);
+    oldnet_sendpacket(connecthead, buf, 20);
+    { extern int32_t g_netDbgHitN; g_netDbgHitN++; }
 }
 
 // HOST: apply a guest-reported hit to the victim's authoritative health. The
@@ -5414,6 +5695,346 @@ static void Net_ApplyHitReport(int attacker, int victim, int dmg, int weaponPic)
         EM_ASM({ console.log('[hitapply] atk=' + $0 + ' victim=' + $1 + ' dmg=' + $2 + ' hp=' + $3); },
                attacker, victim, dmg, sprite[vp->i].extra);
 #endif
+}
+
+// HOST: apply a guest-reported MONSTER hit, resolved BY POSITION. The guest and host
+// number the same monster with different sprite indices, so the index is only a hint;
+// the truth is "the guest's shot hit a live enemy AT (x,y,z)". We find the LIVE enemy
+// nearest that spot, wake it if dormant, and ARM the engine's pending-damage fields
+// (htextra) -- its CON consumes that next tic exactly like any local weapon hit and
+// runs pain or the full death, so the guest that FIRED decides the kill and the host
+// world processes it natively.
+static void Net_ApplyEnemyHitReport(int attacker, int idxHint, int x, int y, int z, int dmg, int weaponPic)
+{
+    if ((unsigned)attacker >= MAXPLAYERS)
+        return;
+    auto const ap = g_player[attacker].ps;
+    if (ap == NULL || (unsigned)ap->i >= MAXSPRITES)
+        return;
+    // Prefer the index hint iff it IS a live enemy here (indices happen to agree);
+    // otherwise take the live enemy nearest the reported position.
+    int target = -1;
+    if ((unsigned)idxHint < MAXSPRITES && sprite[idxHint].statnum < MAXSTATUS
+        && A_CheckEnemySprite(&sprite[idxHint]) && sprite[idxHint].extra > 0)
+        target = idxHint;
+    else
+    {
+        int64_t best = (int64_t)1200 * 1200;   // resolve radius^2 (build x/y units)
+        // Scan BOTH the awake (STAT_ACTOR) and DORMANT (STAT_ZOMBIEACTOR) enemy
+        // lists. Map monsters SPAWN dormant and only wake when the host's own coarse
+        // LOS check to the nearest player clears -- flakier and laggier than the
+        // guest's exact-aim shot. A dormant enemy was invisible to the old
+        // ACTOR-only scan, so a guest's kill on a monster the host hadn't woken was
+        // silently dropped ("MISS"). Resolve it here across both lists; wake below.
+        for (int pass = 0; pass < 2; pass++)
+        {
+            int const scanStat = pass ? STAT_ZOMBIEACTOR : STAT_ACTOR;
+            for (bssize_t SPRITES_OF(scanStat, i))
+            {
+                if (!A_CheckEnemySprite(&sprite[i]) || sprite[i].extra <= 0)
+                    continue;
+                int64_t const dx = (int64_t)sprite[i].x - x, dy = (int64_t)sprite[i].y - y, dz = ((int64_t)sprite[i].z - z) >> 4;
+                int64_t const d = dx * dx + dy * dy + dz * dz;
+                if (d < best) { best = d; target = i; }
+            }
+        }
+    }
+    if (target < 0)
+    { LOG_F(INFO, "[enemyhit] MISS hint=%d pos=%d,%d,%d dmg=%d (no live enemy near)", idxHint, x, y, z, dmg); return; }
+
+    // WAKE a dormant target. Death is CON-driven and runs ONLY for STAT_ACTOR
+    // sprites (G_MoveActors), so damaging a STAT_ZOMBIEACTOR just makes a 0-HP sprite
+    // that never dies. Relinking it to STAT_ACTOR (a pure linked-list move -- no RNG,
+    // no spawn/delete; we're on-tick via Net_DrainEnemyHits) makes G_MoveActors run
+    // its death this SAME tic. The guest's shot IS the authority that this monster is
+    // live for it -- the host now "handles things outside its own view" for the guest.
+    bool const woke = (sprite[target].statnum == STAT_ZOMBIEACTOR);
+    if (woke)
+    {
+        changespritestat(target, STAT_ACTOR);
+        actor[target].timetosleep = 0;
+    }
+
+    // ARM the engine's pending-damage fields -- the SAME path every weapon uses
+    // (A_DamageObject/A_RadiusDamage do htextra += dmg) -- and let the monster's
+    // CON consume it once: ifhitweapon -> A_IncurDamage -> ifdead -> death, WITH
+    // gibs/sound/kill credit, on the host too.
+    //
+    // The previous direct `extra -= dmg` write was THE host-side zombie bug: it
+    // armed nothing, so the host's copy of a guest-killed monster never entered
+    // its damage branch (no death), walked on at negative HP, and A_IncurDamage's
+    // extra<0 bail then ATE every subsequent host hit on it -- "my kill didn't
+    // register, the guest had already killed it". Accumulating htextra instead
+    // gives: simultaneous host+guest damage sums and is consumed as ONE hit (death
+    // processed once); a re-fire on a monster whose REAL death already ran still
+    // no-ops via the extra<0 bail. Both properties, no direct-write hack.
+    if (actor[target].htextra < 0)
+        actor[target].htextra = (int16_t)dmg;
+    else
+        actor[target].htextra = (int16_t)min(actor[target].htextra + dmg, 32000);
+    if ((unsigned)weaponPic < MAXTILES)
+        actor[target].htpicnum = (int16_t)weaponPic;   // death type / bot retaliation
+    actor[target].htowner = (int16_t)ap->i;            // kill attribution to the shooter
+    LOG_F(INFO, "[enemyhit] ARM target=%d (hint=%d)%s pic=%d dmg=%d htextra=%d extra=%d", target, idxHint, woke ? " WOKE" : "", (int)sprite[target].picnum, dmg, (int)actor[target].htextra, (int)sprite[target].extra);
+    { extern int32_t g_netDbgHitN; g_netDbgHitN++; }   // host tally: reports APPLIED
+    if (g_hostProbeIdx < 0) { g_hostProbeIdx = target; g_hostProbePlc = movefifoplc; }   // arm the test probe
+}
+
+// HOST, ON-TICK: run the breakable/object hits the guests reported this frame. Called
+// from G_DoMoveThings (same phase as weapon-fire A_DamageObject), so the sprites it
+// spawns/deletes and the RNG it rolls stay on the authoritative timeline -- unlike
+// the old mid-packet call that desynced. dmgSrc = the shooter's player sprite.
+void Net_DrainObjectHits(void)
+{
+    if (myconnectindex != connecthead)
+    {
+        s_objHitN = 0;   // only the host applies these; a guest just drops them
+        return;
+    }
+    for (int k = 0; k < s_objHitN; k++)
+    {
+        int const victim = s_objHitVictim[k];
+        int const atk    = s_objHitAtk[k];
+        if ((unsigned)victim >= MAXSPRITES || sprite[victim].statnum >= MAXSTATUS)
+            continue;
+        // Players/enemies have their own authoritative paths; never route them here.
+        if (sprite[victim].picnum == APLAYER || A_CheckEnemySprite(&sprite[victim]))
+            continue;
+        if ((unsigned)atk >= MAXPLAYERS)
+            continue;
+        auto const ap = g_player[atk].ps;
+        if (ap != NULL && (unsigned)ap->i < MAXSPRITES)
+            A_DamageObject(victim, ap->i);
+    }
+    s_objHitN = 0;
+}
+
+// HOST, ON-TICK: apply the enemy hits guests reported this frame. Called from
+// G_DoMoveThings right after the object drain and BEFORE G_MoveWorld, so a monster
+// this wakes runs its death CON on this very tic. Draining here (not mid-packet)
+// keeps the wake + health writes on the authoritative timeline.
+void Net_DrainEnemyHits(void)
+{
+    if (myconnectindex != connecthead)
+    {
+        s_enemyHitN = 0;   // only the host resolves these
+        return;
+    }
+    for (int k = 0; k < s_enemyHitN; k++)
+    {
+        NetEnemyHit const *h = &s_enemyHit[k];
+        Net_ApplyEnemyHitReport(h->atk, h->idx, h->x, h->y, h->z, h->dmg, h->wpic);
+    }
+    s_enemyHitN = 0;
+#if defined(NETNATIVE) && !defined(__EMSCRIPTEN__)
+    // Headless verification probe (env NN_TESTKILL on the HOST; inert otherwise):
+    // ~5s after the first ARM, log the target's state. cstat==0 + a bumped kill
+    // counter is positive proof the HOST's own death CON ran -- the exact evidence
+    // the previous round's test lacked (it proved only the guest's death).
+    extern int32_t g_hostProbeIdx, g_hostProbePlc;
+    static int s_probeOn = -1;
+    if (s_probeOn < 0)
+        s_probeOn = (getenv("NN_TESTKILL") != NULL) ? 1 : 0;
+    if (s_probeOn == 1 && g_hostProbeIdx >= 0 && movefifoplc > g_hostProbePlc + 150)
+    {
+        int killed = 0, pi;
+        TRAVERSE_CONNECT(pi)
+            if (g_player[pi].ps != NULL)
+                killed += g_player[pi].ps->actors_killed;
+        LOG_F(INFO, "[hostprobe] idx=%d stat=%d extra=%d htextra=%d cstat=%d killed=%d",
+              g_hostProbeIdx, (int)sprite[g_hostProbeIdx].statnum, (int)sprite[g_hostProbeIdx].extra,
+              (int)actor[g_hostProbeIdx].htextra, (int)sprite[g_hostProbeIdx].cstat, killed);
+        s_probeOn = 2;   // one-shot
+    }
+#endif
+}
+
+// GUEST -> HOST, per-tic: the guest's live weapon so the host fires what the guest
+// actually holds instead of reconstructing it from a transient keypress (which it
+// drops whenever its copy of the seat is mid-recoil -> "picked up the RPG but fired
+// the shotgun", and fatal for the RPG since a projectile weapon needs the host to
+// spawn the actual rocket). curr_weapon + the gotweapon bit + this weapon's ammo are
+// all P_FireWeapon needs to shoot it and P_CheckWeapon needs to NOT switch away.
+static void Net_SendWeaponState(void)
+{
+    if (!g_netStreamMode || numplayers < 2 || myconnectindex == connecthead)
+        return;
+    auto const ps = g_player[myconnectindex].ps;
+    if (ps == NULL || (unsigned)ps->curr_weapon >= MAX_WEAPONS)
+        return;
+    int const w = ps->curr_weapon;
+    static uint16_t s_gwSeqOut;
+    ++s_gwSeqOut;
+    uint8_t buf[8];
+    buf[0] = PACKET_TYPE_WEAPON_STATE;
+    buf[1] = (uint8_t)w;
+    buf[2] = (uint8_t)(ps->gotweapon & 0xff);
+    buf[3] = (uint8_t)((ps->gotweapon >> 8) & 0xff);
+    buf[4] = (uint8_t)(ps->ammo_amount[w] & 0xff);
+    buf[5] = (uint8_t)((ps->ammo_amount[w] >> 8) & 0xff);
+    buf[6] = (uint8_t)(s_gwSeqOut & 0xff);          // seq: the channel is UNORDERED --
+    buf[7] = (uint8_t)((s_gwSeqOut >> 8) & 0xff);   // a stale packet must not regress the host
+    oldnet_sendpacket(connecthead, buf, 8);
+}
+
+// GUEST -> HOST, per-tic: authoritative self position/velocity/facing. The host
+// adopts it for this seat (Net_ApplyGuestPos) instead of trusting its own
+// input-replay integration, which drifts. 41 bytes on the unreliable move
+// channel; a drop just means the host coasts one tic on the last base.
+static void Net_SendPosReport(void)
+{
+    if (!g_netStreamMode || numplayers < 2 || myconnectindex == connecthead || g_netJoinCatchup)
+        return;
+    auto const ps = g_player[myconnectindex].ps;
+    if (ps == NULL || (unsigned)ps->i >= MAXSPRITES)
+        return;
+    static uint16_t s_posSeqOut;
+    ++s_posSeqOut;
+    uint8_t buf[41];
+    buf[0] = PACKET_TYPE_POS_REPORT;
+    buf[1] = (uint8_t)(s_posSeqOut & 0xff);
+    buf[2] = (uint8_t)((s_posSeqOut >> 8) & 0xff);
+    int j = 3;
+    B_BUF32(&buf[j], ps->pos.x);            j += 4;
+    B_BUF32(&buf[j], ps->pos.y);            j += 4;
+    B_BUF32(&buf[j], ps->pos.z);            j += 4;
+    B_BUF32(&buf[j], ps->vel.x);            j += 4;
+    B_BUF32(&buf[j], ps->vel.y);            j += 4;
+    B_BUF32(&buf[j], ps->vel.z);            j += 4;
+    B_BUF32(&buf[j], (int32_t)ps->q16ang);  j += 4;
+    B_BUF32(&buf[j], (int32_t)ps->q16horiz); j += 4;
+    B_BUF16(&buf[j], (uint16_t)ps->cursectnum); j += 2;
+    B_BUF32(&buf[j], sprite[ps->i].z);      j += 4;
+    oldnet_sendpacket(connecthead, buf, j);
+}
+
+// HOST, per-tic: adopt a guest seat's reported position right before its input
+// runs. The guest is the authority for its OWN movement (the OpenArena rule the
+// self-snap removal on the guest side completes): the host stops second-guessing
+// where the guest ended up and instead keeps its copy honest for everything that
+// reads it -- enemy AI targeting, hazard checks, the host player's view of the
+// guest. Facing rides along so host-side fire/projectiles for the seat aim true.
+void Net_ApplyGuestPos(int seat)
+{
+    if (!g_netStreamMode || myconnectindex != connecthead
+        || (unsigned)seat >= MAXPLAYERS || seat == myconnectindex)
+        return;
+    if (!s_gpHave[seat] || s_joinFlowSlot == seat)   // mid-heal reports describe the pre-heal world
+        return;
+    auto const ps = g_player[seat].ps;
+    if (ps == NULL || (unsigned)ps->i >= MAXSPRITES)
+        return;
+    ps->opos      = ps->pos;              // continuity for interpolation consumers
+    ps->pos       = s_gpPos[seat];
+    ps->bobpos.x  = ps->pos.x;
+    ps->bobpos.y  = ps->pos.y;
+    ps->vel       = s_gpVel[seat];
+    ps->oq16ang   = ps->q16ang;
+    ps->oq16horiz = ps->q16horiz;
+    ps->q16ang    = s_gpAng[seat];
+    ps->q16horiz  = s_gpHoriz[seat];
+    if ((unsigned)s_gpSect[seat] < (unsigned)numsectors)
+        ps->cursectnum = s_gpSect[seat];
+    else
+        updatesector(ps->pos.x, ps->pos.y, &ps->cursectnum);
+    vec3_t sp = { ps->pos.x, ps->pos.y, s_gpSprZ[seat] };
+    setsprite(ps->i, &sp);                // relinks the sprite's sector too
+    // Low-rate liveness proof for the wire (send -> stash -> on-tick adopt).
+    static int32_t s_gpApplied;
+    if ((++s_gpApplied & 511) == 1)
+        LOG_F(INFO, "[gpos] seat=%d applies=%d at (%d,%d)", seat, s_gpApplied, ps->pos.x, ps->pos.y);
+}
+
+// GUEST: report newly earned key cards upstream (reliable channel; idempotent).
+// Sends only on a NEW bit; a level change (mask reset) just re-baselines.
+static void Net_SendAccessState(void)
+{
+    if (!g_netStreamMode || numplayers < 2 || myconnectindex == connecthead
+        || !(g_gametypeFlags[ud.coop] & GAMETYPE_COOP))
+        return;
+    auto const ps = g_player[myconnectindex].ps;
+    if (ps == NULL)
+        return;
+    uint8_t const cur = (uint8_t)(ps->got_access & 7);
+    if ((cur & ~s_accSentMask) == 0)
+    {
+        s_accSentMask = cur;
+        return;
+    }
+    s_accSentMask = cur;
+    uint8_t buf[2] = { PACKET_TYPE_ACCESS_STATE, cur };
+    oldnet_sendpacket(connecthead, buf, 2);
+    LOG_F(INFO, "[access] guest reports cards mask=%d", cur);
+}
+
+// HOST, per-tic (coop stream): one shared key ring. Union every seat's cards,
+// OR the union back into every seat (host-side door checks pass for anyone),
+// and broadcast newly-added bits to the guests. Level change (empty union)
+// re-baselines the broadcast tracker.
+void Net_ShareCoopAccess(void)
+{
+    if (!g_netStreamMode || numplayers < 2 || myconnectindex != connecthead
+        || !(g_gametypeFlags[ud.coop] & GAMETYPE_COOP))
+        return;
+    int un = 0, i;
+    TRAVERSE_CONNECT(i)
+        if (g_player[i].ps != NULL)
+            un |= (g_player[i].ps->got_access & 7);
+    if (un == 0)
+    {
+        s_accBcastMask = 0;
+        return;
+    }
+    TRAVERSE_CONNECT(i)
+        if (g_player[i].ps != NULL)
+            g_player[i].ps->got_access |= (int16_t)un;
+    if ((un & ~s_accBcastMask) != 0)
+    {
+        s_accBcastMask = (uint8_t)un;
+        uint8_t buf[2] = { PACKET_TYPE_ACCESS_STATE, (uint8_t)un };
+        TRAVERSE_CONNECT(i)
+            if (i != myconnectindex && !(g_netBotMask & (1 << i)))
+                oldnet_sendpacket(i, buf, 2);
+        LOG_F(INFO, "[access] host shares cards mask=%d to all seats", un);
+    }
+}
+
+// HOST, per-tic: converge a guest seat's weapon onto what the guest reports,
+// right before we run its input. Guest seats only; no-op until we've heard from it.
+//
+// The switch NEVER lands mid-fire-cycle (kickback_pic != 0): stomping curr_weapon
+// there evaluates the new weapon's timeline at the old weapon's phase (eaten /
+// instant shots) and -- worse -- aborts in-flight cycles before their payload
+// frame (a HANDBOMB cycle whose spawn frame hasn't hit yet would never throw the
+// bomb the guest already threw). Because the report re-arrives every tic, the
+// switch simply lands on the first tic the cycle is over -- the same "wait out
+// the cycle" a local switch does. When it lands it goes through a full state
+// reset (what static P_ChangeWeapon would do, minus the CON veto): raise anim,
+// no stale crossfade, clean kickback.
+void Net_ApplyGuestWeapon(int seat)
+{
+    if (myconnectindex != connecthead || (unsigned)seat >= MAXPLAYERS || seat == myconnectindex)
+        return;
+    if (!s_gwHave[seat])
+        return;
+    auto const ps = g_player[seat].ps;
+    if (ps == NULL)
+        return;
+    int const w = s_gwWeapon[seat];
+    if ((unsigned)w >= MAX_WEAPONS)
+        return;
+    ps->gotweapon      = s_gwGot[seat];      // the guest owns its inventory
+    ps->ammo_amount[w] = s_gwAmmo[seat];     // ...and this weapon's ammo
+    if (ps->curr_weapon != w && ps->kickback_pic == 0)
+    {
+        LOG_F(INFO, "[gw] seat=%d weap %d -> %d", seat, ps->curr_weapon, w);
+        ps->last_weapon       = -1;
+        ps->reloading         = 0;
+        ps->random_club_frame = 0;
+        ps->curr_weapon       = (int8_t)w;
+        ps->weapon_pos        = WEAPON_POS_RAISE;   // raise the new weapon; fire waits like the guest's did
+        P_SetWeaponGamevars(seat, ps);
+    }
 }
 
 const char *Net_DebugHudStr(void)
@@ -5658,15 +6279,17 @@ void Net_ApplyPendingStateSnap(void)
         }
         if (self && g_netStreamMode)
         {
-            // XY only: teleporters and respawns always move laterally, while
-            // a long FALL legitimately opens a z gap of RTT * zvel that a
-            // z-term falsely flagged (live: "snapping my view... to different
-            // places" mid-air). Vertical drift settles through local gravity.
-            int32_t const dx = klabs(ps->pos.x - pp.x);
-            int32_t const dy = klabs(ps->pos.y - pp.y);
-            applyPos = (dx > 2048 || dy > 2048);
-            if (applyPos)
-                selfCorrected = true;
+            // NEVER. Self movement is CLIENT-OWNED, full stop (live 2026-08-14:
+            // "it should be trusting me as the client where I ended up"). The
+            // teleport-scale escape hatch that used to live here compared us
+            // against the host's INPUT-REPLAY copy of this seat -- a drifting
+            // reconstruction -- so any transport hiccup while running (or the
+            // host picking a different respawn point) yanked the guest to a
+            // place it never was. The host's copy is now slaved to our per-tic
+            // POS_REPORT (Net_ApplyGuestPos), so there is nothing authoritative
+            // to correct us WITH -- the echo could only ever be our own stale
+            // position. Health/score below still apply.
+            applyPos = false;
         }
         if (applyPos)
         {
@@ -5707,7 +6330,31 @@ void Net_ApplyPendingStateSnap(void)
                 setsprite(ps->i, &sp);
                 actor[ps->i].bpos = sp;
             }
-            sprite[ps->i].extra = sprExtra;   // health is host truth, always
+            // SELF PAIN REPLAY (stream): monster damage is computed host-side,
+            // so our own health drop used to arrive as a silent number -- no
+            // tint, no grunt, no flinch ("animations for getting hit by
+            // monsters aren't showing up"). Instead of writing the drop, ARM
+            // the engine's own pending-hit channel with the delta and let the
+            // local APLAYER CON consume it (ifhitweapon -> A_IncurDamage): the
+            // full authentic pain pipeline runs -- palfrom tint, pain sound,
+            // knockback nudge, even the real death branch on a lethal drop --
+            // and health still lands exactly on host truth this same tic.
+            // Damage the local sim already predicted (falls, melee bites via
+            // CON addphealth) matched the host's number, so its delta is 0
+            // here -- no double pain.
+            int const oldExtra = sprite[ps->i].extra;
+            if (self && g_netStreamMode && !ps->dead_flag && oldExtra > 0
+                && sprExtra < oldExtra && actor[ps->i].htextra < 0)
+            {
+                actor[ps->i].htextra  = (int16_t)min<int>(oldExtra - sprExtra, 32000);
+                actor[ps->i].htpicnum = SHOTSPARK1;
+                actor[ps->i].htowner  = ps->i;   // self-owner: skips the coop friendly-fire nullify
+                actor[ps->i].htang    = (int16_t)((fix16_to_int(ps->q16ang) + 1024) & 2047);
+                // extra stays at oldExtra: A_IncurDamage subtracts the delta this tic.
+                LOG_F(INFO, "[selfpain] ARM dmg=%d hp %d -> %d", oldExtra - sprExtra, oldExtra, (int)sprExtra);
+            }
+            else
+                sprite[ps->i].extra = sprExtra;   // health is host truth, always
         }
         if (applyPos && (unsigned)cursect < (unsigned)numsectors)
             ps->cursectnum = cursect;
@@ -5791,6 +6438,11 @@ enum
     NET_STREAM_SECT_DIRTY = 48,
     NET_STREAM_SECT_SWEEP = 16,
     NET_SECREC_BYTES      = 10,
+    // Wall stream (wall-motion doors: vertex x/y). Small caps: only door
+    // walls are eligible, and a whole swing door is ~6 walls.
+    NET_STREAM_WALL_DIRTY = 24,
+    NET_STREAM_WALL_SWEEP = 8,
+    NET_WALLREC_BYTES     = 10,
 };
 // Statnums that never stream: SE effectors are sim-internal machinery, and
 // STAT_MISC is pure cosmetics (casings, debris, teleport FX) every guest's
@@ -5801,18 +6453,32 @@ static inline bool Net_StreamSkipsStat(int st)
 {
     return st == STAT_EFFECTOR || st == STAT_MISC;
 }
-struct NetSprShadow { vec3_t pos; int16_t ang, sect, stat, picnum, cstat; };
+struct NetSprShadow { vec3_t pos; int16_t ang, sect, stat, picnum, cstat, extra; };
 static NetSprShadow s_sprShadow[MAXSPRITES];
-// Guest-side: sprites the host has reported dead (enemy, extra<=0). The guest
-// keeps re-simulating actors as a predictor; a dead monster is a CON-state
-// change to a corpse (not a deletesprite), and that CON state is not streamed,
-// so the guest's own A_Execute would animate the corpse back to its alive frame
-// -- and since monster damage is host-authoritative the guest can't re-kill it
-// (an unkillable zombie). Once flagged here, G_MoveActors stops locally
-// simulating the actor so the host's streamed corpse frames stick.
+// Guest-side: enemies whose host-authoritative death we have already replayed.
+// The guest re-simulates actors as a predictor; a Duke death is a CON-driven
+// transition to a corpse (NOT a deletesprite) that the stream does not carry, so
+// merely freezing the sprite pins its last ALIVE frame (an unkillable statue) and
+// the guest can't finish it (monster damage is host-only). Instead, when the host
+// reports an enemy dead (extra<=0) we replay a lethal hit so the guest's OWN CON
+// runs the full death -> a real corpse, exactly as if it had killed the enemy
+// itself. This latch fires that replay exactly once per death (cleared on
+// respawn/slot-reuse/level-entry so a later enemy at the same index is killed too).
 static uint8_t s_hostDead[MAXSPRITES];
 struct NetSecShadow { int32_t cz, fz; };
 static NetSecShadow s_secShadow[MAXSECTORS];
+// WALL-MOTION DOORS (swing ST23, slide ST25/ST9, splitting-ST ST26) move wall
+// VERTICES -- the sector stream (heights only) never carried them, so a card
+// door the host opened stayed closed on every guest's screen forever (live
+// 2026-08-14: "it shows as open on the host, which is the one that didn't open
+// it" -- remote seats' inputs are zeroed on guests, so host-side operates
+// never replay there). Scope is door walls ONLY: subways/continuous rotators
+// are the guest's own in-phase local sim and painting them would fight it.
+struct NetWallShadow { int32_t x, y; };
+static NetWallShadow s_wallShadow[MAXWALLS];
+static uint8_t s_wallDoorish[MAXWALLS];
+static int32_t s_wallCursorD, s_wallCursorS;
+static int32_t s_wallEligBuiltPlc = -1;   // <0: (re)build eligibility + shadows
 static int32_t s_lastPlayerStreamPlc = -1;
 static int32_t s_lastSpriteStreamPlc = -1;
 static int32_t s_sprShadowPrimedPlc  = -1;   // <0: prime shadows before deltas
@@ -5832,6 +6498,7 @@ static inline void Net_ShadowFrom(int idx)
     sh.stat   = sprite[idx].statnum;
     sh.picnum = sprite[idx].picnum;
     sh.cstat  = sprite[idx].cstat;
+    sh.extra  = sprite[idx].extra;
 }
 
 static inline bool Net_IsPlayerSprite(int idx)
@@ -5932,6 +6599,7 @@ static void Net_StreamAuthoritativeState(void)
             s_secShadow[sct].cz = sector[sct].ceilingz;
             s_secShadow[sct].fz = sector[sct].floorz;
         }
+        s_wallEligBuiltPlc = -1;   // walls re-prime with everything else
         s_sprShadowPrimedPlc  = movefifoplc;
         s_lastSpriteStreamPlc = movefifoplc;
         return;
@@ -5988,7 +6656,11 @@ static void Net_StreamAuthoritativeState(void)
             || sprite[idx].cstat != sh.cstat);
         bool const moved = (sprite[idx].x != sh.pos.x || sprite[idx].y != sh.pos.y
             || sprite[idx].z != sh.pos.z || sprite[idx].ang != sh.ang
-            || sprite[idx].sectnum != sh.sect);
+            || sprite[idx].sectnum != sh.sect
+            // extra too: kills/damage must reach the guest within a lap (kinematic
+            // records carry extra) -- a stationary monster's death otherwise waits
+            // on the slow round-robin sweep, seconds after the kill.
+            || sprite[idx].extra != sh.extra);
         if (statusChanged || moved)
         {
             j = Net_WriteSpriteRec(strm, j, idx, statusChanged ? 0 : NET_SPRF_KINEMATIC);
@@ -6067,6 +6739,78 @@ static void Net_StreamAuthoritativeState(void)
             if (i != myconnectindex && !(g_netBotMask & (1 << i)))
                 oldnet_sendpacket(i, (unsigned char *)sec, sj);
     }
+
+    // Wall stream -- see s_wallDoorish: vertex paints for wall-motion doors,
+    // the geometry the height stream can't express.
+    if (s_wallEligBuiltPlc < 0)
+    {
+        Bmemset(s_wallDoorish, 0, sizeof(s_wallDoorish));
+        for (int sct = 0; sct < numsectors; sct++)
+        {
+            switch (sector[sct].lotag)
+            {
+                case ST_9_SLIDING_ST_DOOR: case ST_23_SWINGING_DOOR:
+                case ST_25_SLIDING_DOOR:   case ST_26_SPLITTING_ST_DOOR:
+                {
+                    int const we = sector[sct].wallptr + sector[sct].wallnum;
+                    for (int w = sector[sct].wallptr; w >= 0 && w < we && w < numwalls; w++)
+                        s_wallDoorish[w] = 1;
+                    break;
+                }
+                default: break;
+            }
+        }
+        for (int w = 0; w < numwalls; w++)
+        {
+            s_wallShadow[w].x = wall[w].x;
+            s_wallShadow[w].y = wall[w].y;
+        }
+        s_wallEligBuiltPlc = movefifoplc;
+        {
+            int elig = 0;
+            for (int w = 0; w < numwalls; w++)
+                elig += s_wallDoorish[w];
+            LOG_F(INFO, "[wallstrm] %d door walls eligible for streaming", elig);
+        }
+    }
+    static char wstm[700];
+    int wj = 0;
+    wstm[wj++] = (char)PACKET_TYPE_WALL_STREAM;
+    int const wCntPos = wj++;
+    int wrecs = 0, wscanned = 0;
+    for (; wscanned < numwalls && wrecs < NET_STREAM_WALL_DIRTY; wscanned++)
+    {
+        int const w = (s_wallCursorD + wscanned) % numwalls;
+        if (!s_wallDoorish[w]
+            || (wall[w].x == s_wallShadow[w].x && wall[w].y == s_wallShadow[w].y))
+            continue;
+        B_BUF16(&wstm[wj], (uint16_t)w); wj += 2;
+        B_BUF32(&wstm[wj], wall[w].x);   wj += 4;
+        B_BUF32(&wstm[wj], wall[w].y);   wj += 4;
+        s_wallShadow[w].x = wall[w].x;
+        s_wallShadow[w].y = wall[w].y;
+        wrecs++;
+    }
+    s_wallCursorD = (numwalls > 0) ? (s_wallCursorD + wscanned) % numwalls : 0;
+    int wsweep = 0, wwalked = 0;
+    for (; wwalked < numwalls && wsweep < NET_STREAM_WALL_SWEEP; wwalked++)
+    {
+        int const w = (s_wallCursorS + wwalked) % numwalls;
+        if (!s_wallDoorish[w])
+            continue;
+        B_BUF16(&wstm[wj], (uint16_t)w); wj += 2;
+        B_BUF32(&wstm[wj], wall[w].x);   wj += 4;
+        B_BUF32(&wstm[wj], wall[w].y);   wj += 4;
+        wsweep++;
+    }
+    s_wallCursorS = (numwalls > 0) ? (s_wallCursorS + wwalked) % numwalls : 0;
+    if (wrecs + wsweep)
+    {
+        wstm[wCntPos] = (char)(wrecs + wsweep);
+        TRAVERSE_CONNECT(i)
+            if (i != myconnectindex && !(g_netBotMask & (1 << i)))
+                oldnet_sendpacket(i, (unsigned char *)wstm, wj);
+    }
 #ifdef __EMSCRIPTEN__
     if (g_netForensics)
     {
@@ -6134,6 +6878,25 @@ static void Net_GrantPickup(DukePlayer_t *ps, int picnum)
 // e.g. a BFG risen out of its reach on a platform -- does not un-delete it.
 static int32_t s_itemConsumedUntil[MAXSPRITES];
 static int16_t s_itemConsumedPic[MAXSPRITES];
+// GUEST: live enemies GLIDE onto streamed positions instead of hard-snapping.
+// The local CON keeps simulating them (animation/attacks stay alive) while the
+// host's kinematic records land every ~5 tics; teleporting to each record made
+// the tug-of-war visible -- WORST on flying monsters, which have no floor pin:
+// local zvel integration + an out-of-phase hover bob turn every snap into a
+// vertical sawtooth ("strange movement when a monster is flying"). Mid-range
+// errors now lerp 25%/tic (settled in ~8 tics); big jumps (teleporter, respawn)
+// and all non-kinematic transitions still snap exactly.
+static vec3_t  s_enGlideTgt[MAXSPRITES];
+static uint8_t s_enGlideOn[MAXSPRITES];
+
+// Ticks a pickup has been continuously in grab range. The scan must be the
+// FALLBACK, not the winner: item pickups are CON actors whose own script plays
+// the quote/voice and runs addweapon (the raise animation) on touch -- the scan
+// grabbing instantly beat that ~6-tic CON delay every time, so guests got raw
+// silent grants ("pickup notifications and weapon change animations missing").
+// Waiting ~10 tics lets the local CON pickup fire with full vanilla feedback;
+// the scan then only cleans up what CON could not reach (height gap, host race).
+static uint8_t s_pickupNearAge[MAXSPRITES];
 
 static void Net_ClientCreditPickup(int idx)
 {
@@ -6178,35 +6941,147 @@ static void Net_ClientPickupScan(void)
         for (int jj = headspritesect[sects[q]]; jj >= 0; )
         {
             int const nextjj = nextspritesect[jj];
+            extern uint16_t g_coopWeapGrab[MAXSPRITES];
             if ((unsigned)jj < MAXSPRITES && Bot_IsPickup(sprite[jj].picnum)
-                && !(sprite[jj].cstat & 32768))
+                && !(sprite[jj].cstat & 32768)
+                // Coop weapon-stay: if our grab-bit is set on this sprite, the
+                // local CON already REFUSED it (this life took it) -- the raw
+                // fallback must not overrule that (it was a silent ammo farm:
+                // stand on any taken weapon 10 tics and it re-granted). The bit
+                // clears on respawn (P_ResetWeapons), so a fresh life re-takes
+                // it through the normal CON path with full feedback.
+                && !((g_gametypeFlags[ud.coop] & GAMETYPE_WEAPSTAY)
+                     && (g_coopWeapGrab[jj] & (1u << myconnectindex))))
             {
                 int32_t const dh = klabs(sprite[jj].x - ps->pos.x) + klabs(sprite[jj].y - ps->pos.y);
                 // Horizontal grab; VERY tolerant vertically (a full lift of
                 // travel) so the rising-platform height gap never blocks it.
                 if (dh <= 896 && klabs(sprite[jj].z - ps->pos.z) <= (200 << 8))
                 {
-                    Net_GrantPickup(ps, sprite[jj].picnum);
-                    s_itemConsumedUntil[jj] = movefifoplc + 360;   // ~12s hide
-                    s_itemConsumedPic[jj]   = sprite[jj].picnum;
-                    A_DeleteSprite(jj);
+                    // FALLBACK ONLY (see s_pickupNearAge): give the item's own CON
+                    // pickup -- quote, voice, addweapon raise -- ~10 tics to fire
+                    // first; if the item is still here, CON couldn't reach it
+                    // (height gap / host race) and we grab it raw.
+                    if (s_pickupNearAge[jj] < 10)
+                    {
+                        s_pickupNearAge[jj]++;
+                    }
+                    else
+                    {
+                        s_pickupNearAge[jj] = 0;
+                        Net_GrantPickup(ps, sprite[jj].picnum);
+                        s_itemConsumedUntil[jj] = movefifoplc + 360;   // ~12s hide
+                        s_itemConsumedPic[jj]   = sprite[jj].picnum;
+                        A_DeleteSprite(jj);
+                    }
                 }
+                else
+                    s_pickupNearAge[jj] = 0;
             }
             jj = nextjj;
         }
 }
-// Latch/clear the guest freeze flag for one sprite from a stream record. A live
-// enemy (extra>0) always clears it (covers respawn and slot reuse); an enemy at
-// extra<=0 sets it. A corpse frame that no longer classifies as an enemy leaves
-// the existing latch untouched. (A freeze-blasted LIVE enemy, pal==1/extra==0,
-// also latches here; that is harmless -- it self-corrects on thaw when extra
-// returns to 1 and the sweep streams it, and a frozen enemy shouldn't move.)
-static inline void Net_LatchHostDead(int idx, int extra, bool isEnemy)
+// GUEST cosmetic FX for host-side detonations/gibs. Explosion visuals and gibs are
+// STAT_MISC -- the stream deliberately skips them -- so the guest only ever SEES an
+// explosion its own local sim causes. But damage is host-side: a chain set off by
+// the host player (or by this guest's REPORTED barrel shot, or host radius damage)
+// exists only on the host, and the chained barrels/C9/bombs arrive here as bare
+// DELETE records -- they silently vanish, no flash, no boom ("chain explosion
+// graphics not triggering"). So: when a delete lands on a LOCAL copy that is still
+// intact and is a detonator-class sprite, play the explosion HERE as pure
+// cosmetics -- EXPLOSION2 + sound, NO radius damage, no gameplay. If the local sim
+// already chained it, the local copy is already gone (killit) and the record hits
+// an empty slot -> no double. Own bombs/rockets are skipped (owner == self): the
+// local sim already played those. A LIVE enemy deleted outright is a host-side GIB
+// kill that outran the health stream (killit lands same-tic) -> play guts+squish so
+// RPG chain kills don't just blink out.
+static void Net_ClientDeleteFX(int idx, bool wasEnemy, int prevExtra)
+{
+    if (!g_netStreamMode || numplayers < 2 || myconnectindex == connecthead)
+        return;
+    if (sprite[idx].statnum == STAT_MISC || sprite[idx].statnum == STAT_EFFECTOR)
+        return;                                   // cosmetics/effectors: never ours to dress
+    // NO owner==self skip: the "local sim already played it" case is exactly the
+    // case where the local copy is ALREADY GONE (it detonated/retired itself), so
+    // the intact-copy check below self-deduplicates. Live-caught race: the host's
+    // detonation delete can land BEFORE the guest's own detonate tic consumes --
+    // the bomb vanished un-exploded and the self-skip then ate the only FX
+    // ("pipe bomb explosion missing when I trigger it").
+    if (wasEnemy && prevExtra > 0)
+    {
+        A_DoGuts(idx, JIBS6, 3);                  // host gibbed a monster our copy held alive
+        A_PlaySound(SQUISHED, idx);
+        return;
+    }
+    switch (tileGetMapping(sprite[idx].picnum))
+    {
+        case HEAVYHBOMB__:
+            // Same tile is also the pipebomb PICKUP: only a THROWN bomb (owner is
+            // a player sprite) detonates; a consumed pickup just vanishes quietly.
+            if ((unsigned)sprite[idx].owner >= MAXSPRITES
+                || sprite[sprite[idx].owner].picnum != APLAYER)
+                break;
+            fallthrough__;
+        case EXPLODINGBARREL__:
+        case SEENINE__:
+        case OOZFILTER__:
+        case TRIPBOMB__:
+        case RPG__:                               // a host-fired rocket's impact
+        {
+            int const e = A_Spawn(idx, EXPLOSION2);
+            if (e >= 0)
+                sprite[e].ang = sprite[idx].ang;
+            A_PlaySound(PIPEBOMB_EXPLODE, idx);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// REPLAY-KILL (guest). The guest runs enemy CON locally so monsters animate,
+// attack, and can play a REAL death -- but it deals no damage (A_DamageObject is
+// host-gated), so its CON can never reach the dead state on its own. When a stream
+// record shows an enemy dead, arm a pending lethal hit (htextra/htpicnum): the
+// guest's next A_Execute consumes it via ifhitweapon -> A_IncurDamage -> ifdead and
+// runs the full death -- anim, gibs, sound -- within a tic of the host's kill.
+// s_hostDead is the one-shot guard (cleared on extra>0 / delete / fresh slot /
+// level entry so a reused index dies again properly).
+//
+// SUBTLE + LOAD-BEARING: A_IncurDamage BAILS (and eats the pending hit) when the
+// sprite's extra is already NEGATIVE (actors.cpp) -- and the host's don't-clamp
+// means streamed death extras ARE negative. So while the replay is pending we pin
+// the local extra at 0; once the CON consumes the hit (htextra goes -1), stream
+// records may apply anything.
+// prevExtra = the LOCAL extra this sprite had BEFORE the record was applied. The
+// replay fires only on a genuine alive->dead transition (prevExtra > 0): map
+// actors whose extra is the unset default (-1 on host AND guest -- E1L1's RATs)
+// must not be "killed" at join, and an already-dead local copy has nothing to
+// replay. A fresh materialization of a dead enemy passes prevExtra=1 ("assume it
+// lived") so late-join corpses drop instead of standing.
+static inline void Net_LatchHostDead(int idx, int extra, bool isEnemy, int prevExtra)
 {
     if (extra > 0)
         s_hostDead[idx] = 0;
-    else if (isEnemy)
-        s_hostDead[idx] = 1;
+    // Exclude only TRUE freezer statues (pal 1 AND extra exactly 0 -- the engine's
+    // own frozen test). A blanket pal!=1 skipped every MULTIPLAYER-ONLY monster:
+    // pal-marked map enemies are Duke's MP-extra spawn mechanism (SP deletes them,
+    // MP keeps them WITH their pal), so their deaths never replayed on the guest --
+    // "the guest already killed them but they don't die".
+    else if (isEnemy && !(sprite[idx].pal == 1 && extra == 0))
+    {
+        if (!s_hostDead[idx] && prevExtra > 0)
+        {
+            s_hostDead[idx] = 1;
+            actor[idx].htextra  = 1;                       // pending lethal hit
+            actor[idx].htpicnum = SHOTSPARK1;              // plain death (RPG gibs arrive as host deletes)
+            if (g_player[myconnectindex].ps != NULL)
+                actor[idx].htowner = g_player[myconnectindex].ps->i;
+            LOG_F(INFO, "[replaykill] idx=%d pic=%d extra=%d", idx, (int)sprite[idx].picnum, extra);
+        }
+        if (s_hostDead[idx] && actor[idx].htextra >= 0 && sprite[idx].extra < 0)
+            sprite[idx].extra = 0;                         // keep the pending hit consumable
+    }
 }
 
 static void Net_ApplySpriteStream(const char *buf, int len)
@@ -6242,18 +7117,21 @@ static void Net_ApplySpriteStream(const char *buf, int len)
             continue;
         if (Net_IsPlayerSprite(idx))
             continue;                      // the player pack owns those
-        // Enemy-ness of the guest's CURRENT sprite (its live picnum), captured
-        // before we overwrite picnum with the streamed corpse frame -- this is
-        // what catches the alive->dead transition for the freeze latch below.
+        // Enemy-ness and LOCAL health of the guest's CURRENT sprite, captured
+        // before the record overwrites them -- this pair is what detects a genuine
+        // alive->dead transition for the replay-kill below.
         bool const guestWasEnemy = (sprite[idx].statnum < MAXSTATUS) && A_CheckEnemySprite(&sprite[idx]);
+        int        guestPrevExtra = (sprite[idx].statnum < MAXSTATUS) ? (int)sprite[idx].extra : 0;
         if ((flags & NET_SPRF_DELETE) || stat == 0xFFFFu)
         {
             if (sprite[idx].statnum < MAXSTATUS)
             {
                 Net_ClientCreditPickup(idx);   // guest grabs its own pickups before they vanish
+                Net_ClientDeleteFX(idx, guestWasEnemy, guestPrevExtra);   // explosion/gib visuals for host-side detonations
                 A_DeleteSprite(idx);
             }
-            s_hostDead[idx] = 0;               // slot freed/reused: drop the freeze latch
+            s_enGlideOn[idx] = 0;
+            s_hostDead[idx] = 0;               // slot freed/reused: drop the replay-kill latch
             s_itemConsumedUntil[idx] = 0;      // gone on the host too: stop suppressing
             continue;
         }
@@ -6283,20 +7161,36 @@ static void Net_ApplySpriteStream(const char *buf, int len)
                 changespritestat((int16_t)idx, (int16_t)stat);
             sprite[idx].extra = extra;
             vec3_t kp = { x, y, z };
+            // LIVE enemy at a mid-range error: glide instead of snapping (see
+            // s_enGlideTgt). Everything else -- non-enemies, corpses, tiny
+            // errors, teleport-sized jumps -- keeps the exact snap.
+            if (guestWasEnemy && extra > 0)
+            {
+                int64_t const gdx = (int64_t)kp.x - sprite[idx].x, gdy = (int64_t)kp.y - sprite[idx].y;
+                int64_t const gdz = ((int64_t)kp.z - sprite[idx].z) >> 4;
+                int64_t const gd2 = gdx * gdx + gdy * gdy + gdz * gdz;
+                if (gd2 > (int64_t)96 * 96 && gd2 < (int64_t)3072 * 3072)
+                {
+                    s_enGlideTgt[idx] = kp;
+                    s_enGlideOn[idx]  = 1;
+                    Net_LatchHostDead(idx, extra, guestWasEnemy, guestPrevExtra);
+                    continue;
+                }
+            }
+            s_enGlideOn[idx] = 0;
             setsprite((int16_t)idx, &kp);
             actor[idx].bpos = kp;
-            Net_LatchHostDead(idx, extra, guestWasEnemy);
+            Net_LatchHostDead(idx, extra, guestWasEnemy, guestPrevExtra);
             continue;
         }
 
         if (sprite[idx].statnum >= MAXSTATUS)
         {
-            // Fresh slot: unambiguously a NEW object, so drop any stale freeze
-            // latch left by a previous occupant (a corpse the guest deleted
-            // locally -- via radius damage/crusher/corpse cap -- before the host
-            // reused this index). The latch below re-sets it iff this new sprite
-            // is itself a dead enemy. Without this the new sprite inherits the
-            // freeze and G_MoveActors skips it for the rest of the level.
+            // Fresh slot: unambiguously a NEW object, so drop any stale replay-kill
+            // latch left by a previous occupant (a corpse the guest deleted locally
+            // before the host reused this index). The latch below re-sets it iff
+            // this new sprite is itself a dead enemy -- otherwise a live enemy that
+            // reuses the index would never get its death replayed.
             s_hostDead[idx] = 0;
             // Materialize at the host's exact index (freelist rotation makes
             // the engine's next insert claim precisely this slot).
@@ -6311,6 +7205,9 @@ static void Net_ApplySpriteStream(const char *buf, int len)
                     A_DeleteSprite(ni);
                 continue;
             }
+            // Fresh materialization: "assume it lived" so a corpse arriving whole
+            // (late join) gets its death replayed and drops instead of standing.
+            guestPrevExtra = 1;
         }
         else if (sprite[idx].statnum != (int16_t)stat)
             changespritestat((int16_t)idx, (int16_t)stat);
@@ -6329,25 +7226,53 @@ static void Net_ApplySpriteStream(const char *buf, int len)
         vec3_t p = { x, y, z };
         setsprite((int16_t)idx, &p);
         actor[idx].bpos = p;
-        // Freeze latch: also re-check enemy-ness on the just-applied picnum so a
-        // corpse materialized fresh (the guest never held it alive) freezes too.
-        Net_LatchHostDead(idx, extra, guestWasEnemy || A_CheckEnemySprite(&sprite[idx]));
+        s_enGlideOn[idx] = 0;   // full record = real transition: the exact snap above stands
+        // Replay-kill latch: re-check enemy-ness on the just-applied picnum too so
+        // a corpse materialized fresh (the guest never held it alive) is handled.
+        Net_LatchHostDead(idx, extra, guestWasEnemy || A_CheckEnemySprite(&sprite[idx]), guestPrevExtra);
     }
 }
 
-// Guest predicate: has the host reported this actor dead? G_MoveActors uses this
-// to stop locally re-simulating it (see s_hostDead). Host and single-player
-// always return 0.
-int Net_StreamGuestActorFrozen(int spriteNum)
+// Level (re)entry: sprite indices get reused, so drop every stale replay-kill
+// latch (else a new enemy at a reused index would never get its death replayed).
+// GUEST, per tic (after G_MoveWorld, so it wins over the local sim's move): pull
+// gliding enemies toward their streamed targets. bpos keeps the tic-start value so
+// the renderer interpolates each step -- the correction reads as drift, not pops.
+void Net_GlideEnemies(void)
 {
-    return g_netStreamMode && numplayers > 1 && myconnectindex != connecthead
-        && (unsigned)spriteNum < MAXSPRITES && s_hostDead[spriteNum];
+    if (!g_netStreamMode || numplayers < 2 || myconnectindex == connecthead)
+        return;
+    for (int i = 0; i < MAXSPRITES; i++)
+    {
+        if (!s_enGlideOn[i])
+            continue;
+        if (sprite[i].statnum >= MAXSTATUS || !A_CheckEnemySprite(&sprite[i]) || sprite[i].extra <= 0)
+        {
+            s_enGlideOn[i] = 0;   // died/removed/transitioned: transitions snap exactly
+            continue;
+        }
+        vec3_t const from = { sprite[i].x, sprite[i].y, sprite[i].z };
+        int32_t const dx = s_enGlideTgt[i].x - from.x, dy = s_enGlideTgt[i].y - from.y, dz = s_enGlideTgt[i].z - from.z;
+        int64_t const d2 = (int64_t)dx * dx + (int64_t)dy * dy + ((int64_t)dz >> 4) * ((int64_t)dz >> 4);
+        vec3_t to;
+        if (d2 <= (int64_t)64 * 64)
+        {
+            to = s_enGlideTgt[i];
+            s_enGlideOn[i] = 0;   // settled
+        }
+        else
+            to = { from.x + (dx >> 2), from.y + (dy >> 2), from.z + (dz >> 2) };   // 25%/tic
+        actor[i].bpos = from;     // render-interpolate this step
+        setsprite((int16_t)i, &to);
+    }
 }
 
-// Level (re)entry: sprite indices get reused, so drop every stale freeze latch.
 void Net_StreamClearDeadActors(void)
 {
     Bmemset(s_hostDead, 0, sizeof(s_hostDead));
+    Bmemset(s_enGlideOn, 0, sizeof(s_enGlideOn));
+    s_accSentMask = s_accBcastMask = 0;   // fresh level = fresh shared key ring
+    s_wallEligBuiltPlc = -1;              // door-wall eligibility is per-map
 }
 
 static void Net_ApplySectorStream(const char *buf, int len)
@@ -6367,6 +7292,29 @@ static void Net_ApplySectorStream(const char *buf, int len)
             continue;
         sector[sct].ceilingz = cz;
         sector[sct].floorz   = fz;
+    }
+}
+
+// GUEST: absolute wall-vertex paints for wall-motion doors. dragpoint (the same
+// primitive the door SEs use) moves the point AND every welded neighbor, so a
+// painted swing door carries its frame walls exactly like the host's sim did.
+static void Net_ApplyWallStream(const char *buf, int len)
+{
+    if (len < 2)
+        return;
+    int j = 1;
+    int const cnt = (uint8_t)buf[j++];
+    for (int e = 0; e < cnt; e++)
+    {
+        if (j + NET_WALLREC_BYTES > len)
+            break;
+        int     const w = (uint16_t)B_UNBUF16(&buf[j]); j += 2;
+        int32_t const x = (int32_t)B_UNBUF32(&buf[j]);  j += 4;
+        int32_t const y = (int32_t)B_UNBUF32(&buf[j]);  j += 4;
+        if ((unsigned)w >= (unsigned)numwalls)
+            continue;
+        if (wall[w].x != x || wall[w].y != y)
+            dragpoint((int16_t)w, x, y, 0);
     }
 }
 

@@ -4504,14 +4504,6 @@ ACTOR_STATIC void G_MoveActors(void)
         int const  sectNum    = pSprite->sectnum;
         auto const pData      = actor[spriteNum].t_data;
 
-        // Stream-mode guest: the host owns dead enemies. Skip local CON for an
-        // actor the host has reported dead -- otherwise the guest's own A_Execute
-        // animates the corpse back to its alive frame, and since monster damage
-        // is host-authoritative the guest can never re-kill it (unkillable
-        // zombie). The host streams the corpse's frames/position/deletion.
-        if (Net_StreamGuestActorFrozen(spriteNum))
-            goto next_sprite;
-
         int switchPic;
 
         if (pSprite->xrepeat == 0 || (unsigned)sectNum >= MAXSECTORS)

@@ -153,11 +153,13 @@ OLDNET_EXTERN bool oldnet_gotinitialsettings; // True if we got PACKET_TYPE_INIT
 extern int32_t g_netStreamMode;
 extern int32_t g_netLateJoinMask; // slots whose peer-up landed mid-game; host seats them via relaunch (menus.cpp)
 
-// Stream-mode guest freeze: the host owns dead enemies. Once the host reports an
-// actor dead (extra<=0), the guest stops locally re-simulating it so its own CON
-// can't animate the corpse back alive (the unkillable-zombie bug). Host + SP: 0.
-int  Net_StreamGuestActorFrozen(int spriteNum); // G_MoveActors guard
-void Net_StreamClearDeadActors(void);           // G_EnterLevel reset (indices reused)
+// Stream-mode coop REPLAY-KILL: the guest simulates enemies locally (so they
+// animate), but it deals no damage (A_DamageObject is host-only), so its CON can
+// never reach the dead state on its own -- the host-killed monster would stay a
+// "zombie" forever. When the stream reports an enemy dead, oldnet.cpp arms a
+// pending lethal hit (htextra) so the guest's OWN CON runs the real death --
+// anim, gibs, sound -- within a tic of the host's.
+void Net_StreamClearDeadActors(void);            // G_EnterLevel reset (indices reused)
 
 // NEW_GAME flags bit (high half of the low 16 reserved bits): guests must NOT
 // run their own level entry -- the host enters first and streams each guest
@@ -268,7 +270,11 @@ enum DukePacket_t
     PACKET_TYPE_STATE_SNAP,   // host -> diverged guest: in-place RNG+player correction (no reload)
     PACKET_TYPE_SPRITE_STREAM, // host -> guest: continuous authoritative sprite deltas (stream mode)
     PACKET_TYPE_SECTOR_STREAM, // host -> guest: sector ceiling/floor heights (doors are host-owned)
-    PACKET_TYPE_HIT_REPORT,    // guest -> host: CLIENT-AUTHORITATIVE hitscan damage the guest dealt locally
+    PACKET_TYPE_HIT_REPORT,    // guest -> host: CLIENT-AUTHORITATIVE hitscan (unified; kind 0=player seat, 1=enemy sprite)
+    PACKET_TYPE_WEAPON_STATE,  // guest -> host: authoritative live curr_weapon (+got/ammo) so the host fires what the guest holds
+    PACKET_TYPE_POS_REPORT,    // guest -> host: CLIENT-AUTHORITATIVE self position/facing ("trust the client where it ended up")
+    PACKET_TYPE_ACCESS_STATE,  // both ways (coop): shared key-card bits -- any player's card unlocks for everyone
+    PACKET_TYPE_WALL_STREAM,   // host -> guest: wall-vertex positions of wall-motion doors (swing/slide) -- heights alone missed them
     PACKET_END, // Should remain last in list.
 };
 
@@ -283,6 +289,12 @@ void faketimerhandler(void);
 void Net_HandleInput(void);
 void Net_GetPackets(void);
 void Net_ParsePackets(void);
+void Net_DrainObjectHits(void);   // host, on-tick: apply guests' reported breakable/object hits
+void Net_DrainEnemyHits(void);    // host, on-tick: apply guests' reported enemy hits (wake dormant + damage)
+void Net_GlideEnemies(void);      // guest, per-tic: glide live enemies onto streamed positions (no snap jitter)
+void Net_ApplyGuestWeapon(int seat); // host, per-tic: force a guest seat's curr_weapon/got/ammo from its report
+void Net_ApplyGuestPos(int seat);    // host, per-tic: adopt a guest seat's reported position/facing (client-authoritative movement)
+void Net_ShareCoopAccess(void);      // host, per-tic (coop): union every seat's key cards and share to all (guest no-op)
 void Net_SendQuit(void);
 void Net_SendWeaponChoice(void);
 void Net_SendVersion(void);

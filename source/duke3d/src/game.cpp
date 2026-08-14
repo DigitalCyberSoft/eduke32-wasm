@@ -326,6 +326,16 @@ void app_exit(int returnCode)
     Bexit(EXIT_SUCCESS);
 }
 
+#if defined(NETNATIVE) && !defined(__EMSCRIPTEN__)
+// GRP-selector restart (menus.cpp "Game Data"): after a clean G_Shutdown, exec
+// the same binary with the original argv; the freshly written cfg's SelectedGRP
+// then picks the newly chosen game data. argv memory lives for the process
+// lifetime, so stashing the pointer (app_main) is safe.
+int32_t g_restartOnExit;
+static char const* const* s_appArgvSaved;
+extern "C" void net_transport_shutdown(void);
+#endif
+
 void G_GameExit(const char *msg)
 {
     if (msg && *msg != 0 && g_player[myconnectindex].ps != NULL)
@@ -366,6 +376,18 @@ void G_GameExit(const char *msg)
     }
 
     Bfflush(NULL);
+#if defined(NETNATIVE) && !defined(__EMSCRIPTEN__)
+    // GRP-selector restart: SDL is already down (G_Shutdown above); close the
+    // net transport explicitly (execv replaces the process, so the atexit hook
+    // never fires), then relaunch self with the original arguments -- the cfg's
+    // SelectedGRP now names the chosen game data.
+    if (g_restartOnExit && s_appArgvSaved != NULL)
+    {
+        net_transport_shutdown();
+        execv("/proc/self/exe", (char* const*)s_appArgvSaved);
+        LOG_F(ERROR, "restart execv failed: %s", strerror(errno));   // fall through to a normal exit
+    }
+#endif
     app_exit(EXIT_SUCCESS);
 }
 
@@ -1488,6 +1510,20 @@ int A_Spawn(int spriteNum, int tileNum)
 
     if (spriteNum >= 0)
     {
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        // Stream-coop phantom prevention: a guest must NOT dynamically spawn its own
+        // enemy (egg hatch, boss adds) -- it would be a local phantom the host never
+        // has, at an index that never matches, undamageable (guest deals no damage)
+        // and double-visible once the host's real one streams in. The host spawns it
+        // and streams it. Cosmetics/effects/gibs/decals pass through; the stream
+        // materializes enemies via A_InsertSprite (not this path), so it's unaffected.
+        // (spriteNum<0, the map-placed init below, is never gated -- indices match.)
+        {
+            extern int32_t g_netStreamMode;
+            if (g_netStreamMode && g_netClient && A_CheckEnemyTile(tileNum))
+                return -1;
+        }
+#endif
         // spawn from parent sprite <j>
         newSprite = A_InsertSprite(sprite[spriteNum].sectnum,sprite[spriteNum].x,sprite[spriteNum].y,sprite[spriteNum].z,
                            tileNum,0,0,0,0,0,0,spriteNum,0);
@@ -6670,6 +6706,9 @@ extern "C" void net_transport_init(void);
 
 int app_main(int argc, char const* const* argv)
 {
+#if defined(NETNATIVE) && !defined(__EMSCRIPTEN__)
+    s_appArgvSaved = argv;
+#endif
 #ifdef _WIN32
 #ifndef DEBUGGINGAIDS
     if (!G_CheckCmdSwitch(argc, argv, "-noinstancechecking") && !windowsCheckAlreadyRunning())
@@ -7542,6 +7581,12 @@ int G_DoMoveThings(void)
         A_MoveDummyPlayers();//ST 13
     }
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // Coop stream: one shared key ring -- any player's access card unlocks
+    // for everyone (host unions + broadcasts; no-op on guests and non-coop).
+    Net_ShareCoopAccess();
+#endif
+
     for (bssize_t TRAVERSE_CONNECT(i))
     {
         if (g_player[i].ps->team != g_player[i].pteam && g_gametypeFlags[ud.coop] & GAMETYPE_TDM)
@@ -7558,6 +7603,10 @@ int G_DoMoveThings(void)
             sprite[g_player[i].ps->i].pal = g_player[i].pcolor;
 
         P_HandleSharedKeys(i);
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        Net_ApplyGuestWeapon(i);   // host: fire the weapon the guest reported, not the one we reconstructed
+        Net_ApplyGuestPos(i);      // host: adopt the position the guest reported (client owns its movement)
+#endif
 
         if (ud.pause_on == 0)
         {
@@ -7566,8 +7615,28 @@ int G_DoMoveThings(void)
         }
     }
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // Host: apply guests' reported breakable/object AND enemy hits ON-TICK (right
+    // after the weapon-fire phase, before the world moves), so their A_DamageObject /
+    // the enemy wake+damage run on the authoritative timeline instead of mid-packet.
+    // Enemy drain sits before G_MoveWorld so a monster it wakes runs its death CON
+    // this same tic.
+    if (ud.pause_on == 0)
+    {
+        Net_DrainObjectHits();
+        Net_DrainEnemyHits();
+    }
+#endif
+
     if (ud.pause_on == 0)
         G_MoveWorld();
+
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // Guest: after the local sim moved everything, glide live enemies toward the
+    // host's streamed positions (post-move so the correction wins the tic).
+    if (ud.pause_on == 0)
+        Net_GlideEnemies();
+#endif
 
 #if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
     // LAST MAN STANDING round manager (host-only, per authoritative tic). Counts
