@@ -1111,5 +1111,29 @@ void Duke_CommonCleanup(void)
 // used to fingerprint it for the cross-play join gate. NULL until selection.
 extern "C" const char *Net_NativeGrpPath(void)
 {
-    return (g_selectedGrp && g_selectedGrp->filename) ? g_selectedGrp->filename : NULL;
+    if (g_selectedGrp == NULL || g_selectedGrp->filename == NULL)
+        return NULL;
+    // The scan stores the SEARCH-PATH-RELATIVE name (e.g. "DUKE3D.GRP"), but the
+    // transport plain-fopen()s this from the process cwd. That only ever worked by
+    // accident: the config dir used to hold a GRP symlink AND be the cwd. With the
+    // game data living in -j dirs (GRP selector era) the relative name resolves to
+    // nothing, the fingerprint dies, and the host's public announce is suppressed
+    // ("can't find the match"). Resolve through the engine's own search machinery
+    // once and cache it (the selection is fixed for the process lifetime).
+    static char resolved[BMAX_PATH];
+    if (resolved[0])
+        return resolved;
+    if (buildvfs_exists(g_selectedGrp->filename))
+    {
+        Bstrncpyz(resolved, g_selectedGrp->filename, sizeof(resolved));
+        return resolved;
+    }
+    char *fn = NULL;
+    if (findfrompath(g_selectedGrp->filename, &fn) == 0 && fn != NULL)
+    {
+        Bstrncpyz(resolved, fn, sizeof(resolved));
+        Xfree(fn);
+        return resolved;
+    }
+    return g_selectedGrp->filename;
 }

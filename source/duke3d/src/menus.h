@@ -130,6 +130,7 @@ enum MenuIndex_t {
     MENU_NET_JOINCODE   = 20015, // join by invite code (text entry)
     MENU_NET_LOBBY      = 20016, // host/guest lobby (roster + launch)
     MENU_NET_CHANGEMAP  = 20017, // in-game host map change (episode/level + warp)
+    MENU_GRPSELECT      = 20018, // native: pick the GRP to load (persists; restart applies)
 #endif
     MENU_NETJOIN        = 20020,
 };

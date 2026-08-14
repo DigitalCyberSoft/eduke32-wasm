@@ -996,15 +996,44 @@ function wireInEngineMenu(): void {
   // transport. Idempotent (no-op once set), so it is cheap to await on every path.
   const ensureLocalGrp = async (): Promise<void> => {
     if (dukeNet.getLocalGrp()) return;
-    const FS = (globalThis as unknown as { Module?: { FS?: EmscriptenFS } }).Module?.FS;
+    const M = (globalThis as unknown as { Module?: { FS?: EmscriptenFS; arguments?: string[] } }).Module;
+    const FS = M?.FS;
     if (!FS) return;
-    const grps = scanFsGrps(FS);
-    if (!grps.length) return;
+    // THE ENGINE'S main GRP, not "first *.grp in readdir": the registered-GRP
+    // restore boots the import as the reserved /_e32_main.grp (bundled shareware
+    // /DUKE3D.GRP stays in MEMFS beside it) and selects it with -gamegrp. Scanning
+    // the directory fingerprinted the SHAREWARE while the engine played Atomic --
+    // every registered-GRP match then rendered "paid"/unjoinable. Honor the boot
+    // arguments first; fall back to the scan only when no explicit choice exists.
     let mainPath: string | null = null;
-    for (const cand of ["/" + grps[0].filename, "/data/" + grps[0].filename]) {
-      try { FS.stat(cand); mainPath = cand; break; } catch { /* try the next dir */ }
+    let label: string | null = null;
+    try {
+      const args: string[] = M?.arguments ?? [];
+      const gi = args.lastIndexOf("-gamegrp");
+      const chosen = gi >= 0 ? args[gi + 1] : null;
+      if (chosen) {
+        for (const cand of [chosen.startsWith("/") ? chosen : "/" + chosen, chosen]) {
+          try { FS.stat(cand); mainPath = cand; break; } catch { /* next form */ }
+        }
+        if (mainPath && baseName(mainPath) === "_e32_main.grp") {
+          // Reserved-name import: advertise the ORIGINAL filename, not the slot.
+          try {
+            const marker = JSON.parse(localStorage.getItem("eduke32/mainGrp") || "null") as { name?: string } | null;
+            if (marker?.name) label = marker.name;
+          } catch { /* keep the raw name */ }
+        }
+      }
+    } catch { /* fall through to the scan */ }
+    if (!mainPath) {
+      const grps = scanFsGrps(FS);
+      if (!grps.length) return;
+      for (const cand of ["/" + grps[0].filename, "/data/" + grps[0].filename]) {
+        try { FS.stat(cand); mainPath = cand; break; } catch { /* try the next dir */ }
+      }
     }
-    if (mainPath) await dukeNet.setLocalGrpFromFs(FS, [mainPath]);
+    if (!mainPath) return;
+    const fp = await dukeNet.setLocalGrpFromFs(FS, [mainPath]);
+    if (label && fp) fp.labels[0] = label;
   };
 
   const rowForMenu = (r: LobbyRow) => ({

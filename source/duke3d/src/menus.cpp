@@ -23,6 +23,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "menus.h"
 
 #include "al_midi.h"
+#include "scriplib.h"   // SCRIPT_* config read/write for Menu_NetConfigSave/Load
 #include "cheats.h"
 #include "cmdline.h"
 #include "communityapi.h"
@@ -539,6 +540,12 @@ static MenuEntry_t *MEL_GAMESETUP[] = {
 MAKE_MENU_TOP_ENTRYLINK( "Game Setup", MEF_OptionsMenu, OPTIONS_GAMESETUP, MENU_GAMESETUP );
 #endif
 MAKE_MENU_TOP_ENTRYLINK( "Sound Setup", MEF_OptionsMenu, OPTIONS_SOUNDSETUP, MENU_SOUND );
+#if defined(NETNATIVE) && !defined(__EMSCRIPTEN__)
+// Native GRP selector: pick which game data to load; persisted via SelectedGRP so
+// every later launch uses it (the wasm build's remembered-GRP twin), with an
+// optional immediate restart.
+MAKE_MENU_TOP_ENTRYLINK( "Game Data", MEF_OptionsMenu, OPTIONS_GAMEDATA, MENU_GRPSELECT );
+#endif
 MAKE_MENU_TOP_ENTRYLINK( "Display Setup", MEF_OptionsMenu, OPTIONS_DISPLAYSETUP, MENU_DISPLAYSETUP );
 MAKE_MENU_TOP_ENTRYLINK( "Player Setup", MEF_OptionsMenu, OPTIONS_PLAYERSETUP, MENU_PLAYER );
 #ifndef EDUKE32_ANDROID_MENU
@@ -804,6 +811,9 @@ static MenuEntry_t *MEL_OPTIONS[] = {
 #endif
     &ME_OPTIONS_DISPLAYSETUP,
     &ME_OPTIONS_SOUNDSETUP,
+#if defined(NETNATIVE) && !defined(__EMSCRIPTEN__)
+    &ME_OPTIONS_GAMEDATA,
+#endif
 #ifndef EDUKE32_ANDROID_MENU
 #ifndef EDUKE32_RETAIL_MENU
     &ME_OPTIONS_PLAYERSETUP,
@@ -1720,6 +1730,7 @@ static void netmenu_pull_grp_labels(void)
 // kept resuming; live-reported as "some actions still trigger sound"). Muting
 // stashes the user's real toggles so unmute restores them, not blanket ON.
 static int s_webMutePrevSound = -1, s_webMutePrevMusic = -1;
+extern "C" void Web_SaveConfig(void);   // config.cpp (extern "C" linkage)
 extern "C" void Web_SetMute(int mute)
 {
     if (mute)
@@ -1737,14 +1748,40 @@ extern "C" void Web_SetMute(int mute)
     }
     else
     {
-        ud.config.SoundToggle = (s_webMutePrevSound < 0) ? 1 : s_webMutePrevSound;
-        ud.config.MusicToggle = (s_webMutePrevMusic < 0) ? 1 : s_webMutePrevMusic;
+        // UNMUTE MEANS AUDIBLE, PERIOD. A stashed 0 can only be a poisoned stash:
+        // since settings persist (2026-08-14), closing the tab while page-muted
+        // wrote SoundToggle/MusicToggle 0 into the cfg; the next boot restored
+        // them, and the boot-time re-apply then stashed THOSE zeros as "the
+        // user's real settings" -- so unmute "restored" silence and the button
+        // went permanently dead. Never restore silence from unmute.
+        ud.config.SoundToggle = (s_webMutePrevSound > 0) ? s_webMutePrevSound : 1;
+        ud.config.MusicToggle = (s_webMutePrevMusic > 0) ? s_webMutePrevMusic : 1;
         s_webMutePrevSound = s_webMutePrevMusic = -1;
         if (ud.config.MusicToggle)
         {
             S_RestartMusic();
             S_PauseMusic(false);
         }
+    }
+}
+
+// Config-write guard: while page-muted, the LIVE toggles are 0/0 -- a transient
+// page state, not the user's preference. Web_SaveConfig swaps the stashed real
+// values in around the write so a tab closed while muted can never poison the
+// persisted cfg (the root of the dead-toggle regression).
+extern "C" void Web_MuteCfgGuard(int preWrite)
+{
+    if (s_webMutePrevSound < 0)
+        return;                       // not page-muted: nothing to mask
+    if (preWrite)
+    {
+        ud.config.SoundToggle = (s_webMutePrevSound > 0) ? s_webMutePrevSound : 1;
+        ud.config.MusicToggle = (s_webMutePrevMusic > 0) ? s_webMutePrevMusic : 1;
+    }
+    else
+    {
+        ud.config.SoundToggle = 0;    // re-assert the page mute after the write
+        ud.config.MusicToggle = 0;
     }
 }
 #endif
@@ -1956,6 +1993,49 @@ static MenuEntry_t *MEL_NET_HOSTCFG[] = {
     &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_GAMETYPE, &ME_NET_CFG_EPISODE, &ME_NET_CFG_LEVEL, &ME_NET_CFG_SHARE, &ME_NET_CFG_LOCALONLY, &ME_NET_CFG_BOTS, &ME_NET_CFG_BOTSKILL, &ME_NET_CFG_START,
 };
 
+// Persist the host-setup choices so they survive a restart. Native writes them
+// into eduke32.cfg on disk; the browser mirrors that file to localStorage. Hooked
+// into CONFIG_Write/ReadSetup. A missing key (first run / hand-edited cfg) leaves
+// the compiled default in place, so only genuine prior choices are restored.
+void Menu_NetConfigSave(void)
+{
+    int32_t const h = ud.config.scripthandle;
+    if (h < 0)
+        return;
+    SCRIPT_PutString(h, "Multiplayer", "MatchName",  s_netMatchName);
+    SCRIPT_PutNumber(h, "Multiplayer", "MaxPlayers", s_netMaxPlayers,   FALSE, FALSE);
+    SCRIPT_PutNumber(h, "Multiplayer", "MinPlayers", s_netMinPlayers,   FALSE, FALSE);
+    SCRIPT_PutNumber(h, "Multiplayer", "BotSkill",   s_netBotSkill,     FALSE, FALSE);
+    SCRIPT_PutNumber(h, "Multiplayer", "GameType",   ud.m_coop,         FALSE, FALSE);
+    SCRIPT_PutNumber(h, "Multiplayer", "Episode",    NetEpisode,        FALSE, FALSE);
+    SCRIPT_PutNumber(h, "Multiplayer", "Level",      ud.m_level_number, FALSE, FALSE);
+    SCRIPT_PutNumber(h, "Multiplayer", "GrpSharing", s_netShareGrp,     FALSE, FALSE);
+    SCRIPT_PutNumber(h, "Multiplayer", "LocalOnly",  s_netLocalOnly,    FALSE, FALSE);
+}
+
+void Menu_NetConfigLoad(void)
+{
+    int32_t const h = ud.config.scripthandle;
+    if (h < 0)
+        return;
+    char name[NET_NAME_MAX] = { 0 };
+    SCRIPT_GetString(h, "Multiplayer", "MatchName", name);
+    if (name[0])
+        Bstrncpyz(s_netMatchName, name, sizeof(s_netMatchName));
+    SCRIPT_GetNumber(h, "Multiplayer", "MaxPlayers", &s_netMaxPlayers);
+    SCRIPT_GetNumber(h, "Multiplayer", "MinPlayers", &s_netMinPlayers);
+    SCRIPT_GetNumber(h, "Multiplayer", "BotSkill",   &s_netBotSkill);
+    SCRIPT_GetNumber(h, "Multiplayer", "GameType",   &ud.m_coop);
+    SCRIPT_GetNumber(h, "Multiplayer", "Episode",    &NetEpisode);
+    SCRIPT_GetNumber(h, "Multiplayer", "Level",      &ud.m_level_number);
+    SCRIPT_GetNumber(h, "Multiplayer", "GrpSharing", &s_netShareGrp);
+    SCRIPT_GetNumber(h, "Multiplayer", "LocalOnly",  &s_netLocalOnly);
+    // Guard a hand-edited / stale cfg (ranges mirror the menu widgets).
+    s_netMaxPlayers = clamp(s_netMaxPlayers, 2, 16);
+    s_netMinPlayers = clamp(s_netMinPlayers, 1, 8);
+    s_netBotSkill   = clamp(s_netBotSkill, 0, 3);
+}
+
 // CHANGE MAP (host, in-game): same Episode/Level pickers; Warp relaunches every
 // peer on the chosen map via the NEW_GAME broadcast + tic-0 barrier.
 static MenuEntry_t ME_NET_CHANGEMAP_GO = MAKE_MENUENTRY( "Warp to Map", &MF_Redfont, &MEF_VideoSetup_Apply, &MEO_NULL, Link );
@@ -2111,6 +2191,58 @@ static MenuFileSelect_t M_SOUND_SF2 = MAKE_MENUFILESELECT( "Select Sound Bank", 
 #endif
 
 // MUST be in ascending order of MenuID enum values due to binary search
+#if defined(NETNATIVE) && !defined(__EMSCRIPTEN__)
+// ── Native GRP selector ("Game Data") ─────────────────────────────────────────
+// Lists every GRP grpscan found (pass extra dirs with -j). Selecting one rewrites
+// SelectedGRP + the full cfg immediately, so it loads on EVERY subsequent launch
+// (the native twin of the wasm remembered-GRP flow); "Restart now" applies it on
+// the spot via an execv self-relaunch (game.cpp).
+#define GRPSEL_MAX 14
+static char        s_grpSelName[GRPSEL_MAX][72];
+static grpfile_t  *s_grpSelFile[GRPSEL_MAX];
+static MenuEntry_t ME_GRPSEL_RESTART = MAKE_MENUENTRY( "Restart now with selection", &MF_Redfont, &MEF_VideoSetup, &MEO_NULL, Link );
+static MenuEntry_t ME_GRPSEL_ROW_TEMPLATE = MAKE_MENUENTRY( NULL, &MF_Bluefont, &MEF_VideoSetup, &MEO_NULL, Link );
+static MenuEntry_t ME_GRPSEL_ROW[GRPSEL_MAX];
+static MenuEntry_t ME_GRPSEL_EMPTY = MAKE_MENUENTRY( "No game data found", &MF_Bluefont, &MEF_VideoSetup, &MEO_NULL, Dummy );
+static MenuEntry_t *MEL_GRPSEL[1 + GRPSEL_MAX];
+static MenuMenu_t M_GRPSEL = MAKE_MENUMENU( "Game Data", &MMF_BigOptions, MEL_GRPSEL );
+
+static void grpsel_rebuild(void)
+{
+    static int inited = 0;
+    if (!inited)
+    {
+        for (int i = 0; i < GRPSEL_MAX; ++i)
+            ME_GRPSEL_ROW[i] = ME_GRPSEL_ROW_TEMPLATE;
+        inited = 1;
+    }
+    MEL_GRPSEL[0] = &ME_GRPSEL_RESTART;
+    int n = 0;
+    for (grpfile_t *fg = foundgrps; fg && n < GRPSEL_MAX; fg = fg->next)
+    {
+        if (fg->filename == NULL)
+            continue;
+        int const cur = (g_grpNamePtr && !Bstrcasecmp(g_grpNamePtr, fg->filename));
+        // "TypeName - path", path right-truncated from the LEFT so two same-named
+        // GRPs (the common case: multiple DUKE3D.GRPs) stay distinguishable.
+        char const *tn = (fg->type && fg->type->name) ? fg->type->name : "Unknown";
+        int const flen = Bstrlen(fg->filename);
+        char const *tail = fg->filename + (flen > 34 ? flen - 34 : 0);
+        Bsnprintf(s_grpSelName[n], sizeof(s_grpSelName[n]), "%s%.24s - %s%s",
+                  cur ? "> " : "", tn, (flen > 34) ? "..." : "", tail);
+        ME_GRPSEL_ROW[n].name = s_grpSelName[n];
+        s_grpSelFile[n] = fg;
+        MEL_GRPSEL[1 + n] = &ME_GRPSEL_ROW[n];
+        n++;
+    }
+    if (n == 0) { MEL_GRPSEL[1] = &ME_GRPSEL_EMPTY; n = 1; }
+    M_GRPSEL.entrylist  = MEL_GRPSEL;
+    M_GRPSEL.numEntries = 1 + n;
+    if (M_GRPSEL.currentEntry >= M_GRPSEL.numEntries)
+        M_GRPSEL.currentEntry = 0;
+}
+#endif // native GRP selector
+
 static Menu_t Menus[] = {
     { &M_MAIN, MENU_MAIN, MENU_CLOSE, MA_None, Menu },
     { &M_MAIN_INGAME, MENU_MAIN_INGAME, MENU_CLOSE, MA_None, Menu },
@@ -2210,6 +2342,9 @@ static Menu_t Menus[] = {
     // every entry after the misplacement unfindable (live-reported as "Start says
     // hosting but no lobby appears; Browse goes nowhere").
     { &M_NET_CHANGEMAP, MENU_NET_CHANGEMAP, MENU_NETWORK, MA_Return, Menu },
+#endif
+#if defined(NETNATIVE) && !defined(__EMSCRIPTEN__)
+    { &M_GRPSEL, MENU_GRPSELECT, MENU_OPTIONS, MA_Return, Menu },   // id 20018: keep the array id-sorted
 #endif
     { &M_NETJOIN, MENU_NETJOIN, MENU_NETWORK, MA_Return, Menu },
 };
@@ -4938,6 +5073,28 @@ static void Menu_EntryLinkActivate(MenuEntry_t *entry)
         netmenu_relaunch(NetEpisode, ud.m_level_number);
     }
 #endif
+#if defined(NETNATIVE) && !defined(__EMSCRIPTEN__)
+    else if (entry == &ME_GRPSEL_RESTART)
+    {
+        // Apply the persisted selection right now: clean self-relaunch (game.cpp
+        // execs the same binary+args after shutdown; cfg already carries the pick).
+        extern int32_t g_restartOnExit;
+        g_restartOnExit = 1;
+        G_GameExit(" ");
+    }
+    else if (entry >= &ME_GRPSEL_ROW[0] && entry < &ME_GRPSEL_ROW[GRPSEL_MAX])
+    {
+        int const n = (int)(entry - &ME_GRPSEL_ROW[0]);
+        if (s_grpSelFile[n] != NULL && s_grpSelFile[n]->filename != NULL)
+        {
+            clearGrpNamePtr();
+            g_grpNamePtr = dup_filename(s_grpSelFile[n]->filename);
+            CONFIG_WriteSetup(0);        // SelectedGRP persists: loads on every launch from now on
+            grpsel_rebuild();            // the "> " marker moving to this row IS the feedback
+            LOG_F(INFO, "Game data selection saved: %s (loads on next launch)", g_grpNamePtr);
+        }
+    }
+#endif
     else if (entry == &ME_NETHOST_LAUNCH)
     {
 #ifdef NETMENU
@@ -6161,6 +6318,11 @@ static void Menu_AboutToStartDisplaying(Menu_t * m)
         netmenu_rebuild_browse();
         break;
 #endif
+#if defined(NETNATIVE) && !defined(__EMSCRIPTEN__)
+    case MENU_GRPSELECT:
+        grpsel_rebuild();
+        break;
+#endif
 
     default:
         break;
@@ -6445,6 +6607,18 @@ void Menu_Close(uint8_t playerID)
     auto & gm = g_player[playerID].ps->gm;
     if (gm & (MODE_GAME | MODE_DEMO))
     {
+#ifdef __EMSCRIPTEN__
+        // WEB: flush the full config (incl. settings.cfg, where the sound/music
+        // cvars live) when the local player closes the in-game menu. The browser
+        // never reaches G_Shutdown, so without an in-session flush a changed
+        // setting exists only in C globals -- the tab-hide localStorage snapshot
+        // then persists a STALE file. INSIDE the MODE_GAME|MODE_DEMO branch on
+        // purpose: boot-time menu transitions also call Menu_Close, and flushing
+        // there overwrote the restored-from-localStorage cfg with defaults before
+        // the user's values were even applied.
+        if (playerID == myconnectindex)
+            Web_SaveConfig();   // guarded: masks the page-mute out of the write
+#endif
         if (gm & MODE_MENU)
             I_ClearAllInput();
 
@@ -9146,7 +9320,12 @@ void M_DisplayMenus(void)
             {
                 lastExposed = cur;
                 lastEmitClock = (int32_t)totalclock;
-                char scr[640];
+                // 1024, NOT 640: the payload outgrew the old buffer as counters got
+                // session-sized (plc/pump/ml run 6-7 digits) -- Bsnprintf truncation
+                // made the emitted JS a SYNTAX ERROR, so window.__e32menu silently
+                // stopped existing and everything gated on it (the page mute button,
+                // the harness menu driver) went dead. Live-caught 2026-08-14.
+                char scr[1024];
                 // p0/p1: player positions (>>8) -- input-routing diagnosis: if both
                 // move in lockstep with one player's input, the input fanout is wrong.
                 int32_t p0x = 0, p0y = 0, p1x = 0, p1y = 0, p1z = 0, p1a = 0;
@@ -9242,9 +9421,19 @@ void M_DisplayMenus(void)
             ud.m_volume_number      = (NetEpisode >= 0 && NetEpisode < MAXVOLUMES) ? NetEpisode : 0;
             ud.multimode            = numplayers;
             g_mostConcurrentPlayers = ud.multimode;
-            ud.m_coop               = 0;
-            ud.m_monsters_off       = 1;
-            ud.m_player_skill       = 0;
+            // Headless gametype pick (NN_GAMETYPE; default 0 = DM) so the native
+            // harness can verify COOP too. Same derives as netmenu_relaunch:
+            // monsters/skill/ffire follow the gametype; guests re-derive from the
+            // NEW_GAME packet's m_coop (monsters_off isn't networked).
+            {
+                const char *gt = getenv("NN_GAMETYPE");
+                ud.m_coop = gt ? clamp(atoi(gt), 0, g_gametypeCnt - 1) : 0;
+            }
+            ud.m_monsters_off       = (g_gametypeFlags[ud.m_coop] & GAMETYPE_COOP) ? 0 : 1;
+            ud.m_respawn_monsters   = 0;
+            if (g_gametypeFlags[ud.m_coop] & GAMETYPE_COOP)
+                ud.m_ffire = 0;
+            ud.m_player_skill       = (g_gametypeFlags[ud.m_coop] & GAMETYPE_COOP) ? 2 : 0;
             if (numplayers > 1)
                 Net_SendNewGame(0);
             NetMenu_SetInGame(1);
