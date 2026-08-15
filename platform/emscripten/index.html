@@ -499,7 +499,48 @@
       }).catch(function () {});
     } catch (e) {}
   })();
+  // ── Death certificate ─────────────────────────────────────────────────────
+  // The tab has died mid-session with NOTHING to debug (no crashpad dump, no
+  // coredump, no kernel OOM -- 2026-08-15). Persist every way a session can
+  // end so the NEXT boot (or a leveldb read of this origin) names the killer:
+  //  - lastCrash: JS/wasm error, unhandled rejection, or Emscripten abort.
+  //  - lastAlive: 5s heartbeat. A death with a stale lastCrash but fresh
+  //    lastAlive = the PROCESS was killed (hang watchdog / OOM / discard),
+  //    not a script failure.
+  (function () {
+    var put = function (kind, msg, stack) {
+      try {
+        localStorage.setItem('eduke32/lastCrash', JSON.stringify({
+          t: Date.now(), kind: kind, build: window.__BUILD__ || '',
+          msg: String(msg || '').slice(0, 600), stack: String(stack || '').slice(0, 2000)
+        }));
+      } catch (e) {}
+    };
+    window.addEventListener('error', function (e) {
+      put('error', (e.message || '') + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0),
+          e.error && e.error.stack);
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      var r = e.reason;
+      put('unhandledrejection', r && r.message ? r.message : r, r && r.stack);
+    });
+    window.__e32PutDeath = put;   // Module.onAbort forwards here
+    try {
+      var prev = localStorage.getItem('eduke32/lastCrash');
+      var beat = localStorage.getItem('eduke32/lastAlive');
+      if (prev) console.log('[e32] previous session death certificate: ' + prev);
+      if (beat) console.log('[e32] previous session last heartbeat: ' + beat);
+    } catch (e) {}
+    setInterval(function () {
+      try {
+        var m = window.__e32menu || {};
+        localStorage.setItem('eduke32/lastAlive', JSON.stringify({ t: Date.now(), gm: m.gm | 0, build: window.__BUILD__ || '' }));
+      } catch (e) {}
+    }, 5000);
+  })();
   var Module = {
+    onAbort: function (what) { if (window.__e32PutDeath) window.__e32PutDeath('abort', what, new Error('abort').stack); },
+    onExit: function (code) { if (window.__e32PutDeath) window.__e32PutDeath('exit', 'runtime exited code=' + code, ''); },
     canvas: (function(){ var c = document.getElementById('canvas');
       c.addEventListener('webglcontextlost', function(e){ alert('WebGL context lost.'); e.preventDefault(); }, false);
       return c; })(),
