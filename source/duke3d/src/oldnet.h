@@ -305,6 +305,8 @@ void Net_SendUserMapName(void);
 void Net_SendInitialSettings(void);
 void Net_SendNewGame(uint32_t flags);
 void Net_EndOfLevel(bool secret);
+void Net_SendEol(void);                 // stream host: authoritative level-flip broadcast
+extern int32_t g_netEolFromHost;        // stream guest: current MODE_EOL is host-authorized
 void Net_EnterMessage(void);
 
 void Net_InitiateVote();

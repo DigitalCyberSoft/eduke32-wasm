@@ -522,6 +522,10 @@ int32_t g_netSampleHead;             // slave: absolute tic of the next local sa
 int32_t g_netFillTics;               // master: synthesized tics (deadline/join fill)
 int32_t g_netJoinCatchup;            // joiner/healing guest: applied the snapshot, streaming to live
 int32_t g_netDesyncReporters;        // host: bitmask of guests whose DESYNC_REPORT named them diverged
+int32_t g_netEolFromHost;            // guest: this MODE_EOL was authorized by PACKET_TYPE_EOL
+static int32_t s_eolPending;         // guest: between EOL-received and level entry -- drop
+                                     // unreliable stream packs (a stale E1L1 snap/paint applied
+                                     // in E1L2 teleports the player / corrupts the fresh world)
 
 // Join boundary table, the exact mirror of s_goneTic: >= 0 names the first tic
 // WITH this player. Persists for the session (record membership for tics below
@@ -2786,6 +2790,8 @@ static void Net_ResetProtocolState(void)
     Bmemset(g_netSendRing, 0, sizeof(g_netSendRing));
     g_netJoinCatchup = 0;
     g_netDesyncReporters = 0;
+    g_netEolFromHost = 0;
+    s_eolPending     = 0;
     s_joinAwaitReal  = 0;
     s_fillActive     = 0;
     s_joinFlowSlot   = -1;
@@ -3348,6 +3354,18 @@ void Net_HandleInput(void)
                 s_taDone = 1;
                 g_player[myconnectindex].ps->got_access |= 1;
                 LOG_F(INFO, "[testaccess] guest granted itself the blue card");
+            }
+        }
+        {
+            // Test rig (NN_TESTEOL=1): the guest's own sim hits the exit.
+            // MUST be deferred (P_EndLevel's stream-guest guard) -- the real
+            // transition then arrives from the host via PACKET_TYPE_EOL.
+            static int s_teDone;
+            if (!s_teDone && movefifoplc > 250 && getenv("NN_TESTEOL") != NULL)
+            {
+                s_teDone = 1;
+                LOG_F(INFO, "[testeol] guest firing P_EndLevel");
+                P_EndLevel();
             }
         }
 
@@ -4152,6 +4170,8 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
             }
             case PACKET_TYPE_STATE_SNAP:
             {
+                if (s_eolPending)   // mid level-flip: a stale snap teleports us
+                    break;
                 { extern int32_t g_netDbgPackN; g_netDbgPackN++; }
                 // Host pushed an in-place correction. TIC-STAMPED: stash it and
                 // apply at EXACTLY the stamped consume count (see
@@ -4207,6 +4227,8 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
             }
             case PACKET_TYPE_SPRITE_STREAM:
             {
+                if (s_eolPending)   // mid level-flip: stale paints corrupt the fresh world
+                    break;
                 // Host's continuous authoritative sprite deltas (stream mode).
                 // Applied AT RECEIVE: this is a paint of current truth -- the
                 // sooner it lands the smaller the visible drift. Guests only;
@@ -4223,6 +4245,8 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
             }
             case PACKET_TYPE_SECTOR_STREAM:
             {
+                if (s_eolPending)   // mid level-flip
+                    break;
                 // Host-owned sector heights (doors/elevators). Same guards as
                 // the sprite stream.
                 if (myconnectindex == connecthead || other != connecthead
@@ -4236,6 +4260,8 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
             }
             case PACKET_TYPE_WALL_STREAM:
             {
+                if (s_eolPending)   // mid level-flip
+                    break;
                 // Host-owned wall-motion doors (swing/slide). Same guards.
                 if (myconnectindex == connecthead || other != connecthead
                     || g_netJoinCatchup || !g_netStreamMode)
@@ -4382,10 +4408,29 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
             }
             case PACKET_TYPE_EOL:
             {
-                g_player[myconnectindex].ps->gm = MODE_EOL;
+                // Host-authoritative level transition (stream mode): only the
+                // host may end a level; guests adopt its progression wholesale.
+                // NO gm write here: packets can pump inside the prediction
+                // window, where g_player[].ps is the prediction copy and the
+                // write would be restored away (eoltest-caught: the guest
+                // logged this receive and then never transitioned). The main
+                // loop arms MODE_EOL from g_netEolFromHost at a safe point.
+                if (other != connecthead)
+                    break;
                 ud.level_number = packbuf[1];
                 ud.from_bonus = packbuf[2];
                 ud.secretlevel = packbuf[3];
+                if (packbufleng > 5)
+                {
+                    ud.volume_number   = packbuf[4];
+                    ud.m_volume_number = packbuf[4];
+                    ud.eog             = packbuf[5];
+                }
+                ud.m_level_number = ud.level_number;
+                g_netEolFromHost = 1;
+                s_eolPending     = 1;
+                LOG_F(INFO, "[eol] host says level over -> E%dL%d eog=%d",
+                      ud.volume_number + 1, ud.level_number + 1, (int)ud.eog);
                 break;
             }
 
@@ -6541,6 +6586,26 @@ static void Net_StreamAuthoritativeState(void)
     if (myps == NULL || !(myps->gm & MODE_GAME))
         return;
 
+    {
+        // Test rig (NN_TESTEOL=1): the HOST's sim hits the exit (what a
+        // replayed guest press produces anyway) -> broadcast -> both sides
+        // must enter the next level together. Fires after the guest's own
+        // deferred attempt (plc 250) so the suppression is proven first.
+        static int s_teDoneH;
+        static int s_tePlc = -1;   // NN_TESTEOL_PLC overrides the firing tic (soak runs)
+        if (s_tePlc < 0)
+        {
+            const char *p = getenv("NN_TESTEOL_PLC");
+            s_tePlc = (p && atoi(p) > 0) ? atoi(p) : 500;
+        }
+        if (!s_teDoneH && movefifoplc > s_tePlc && getenv("NN_TESTEOL") != NULL)
+        {
+            s_teDoneH = 1;
+            LOG_F(INFO, "[testeol] host firing P_EndLevel");
+            P_EndLevel();
+        }
+    }
+
     // Level (re)entry: the consume cursor regressed -> shadow is a stale map.
     if (movefifoplc < s_lastPlayerStreamPlc || movefifoplc < s_lastSpriteStreamPlc)
     {
@@ -7273,6 +7338,15 @@ void Net_StreamClearDeadActors(void)
     Bmemset(s_enGlideOn, 0, sizeof(s_enGlideOn));
     s_accSentMask = s_accBcastMask = 0;   // fresh level = fresh shared key ring
     s_wallEligBuiltPlc = -1;              // door-wall eligibility is per-map
+    if (s_eolPending)
+    {
+        // Level flip: drain everything queued during the bonus screen while
+        // the drop guards are still armed (stale pre-flip stream packs must
+        // never touch the fresh world), then let live packs through.
+        Net_GetPackets();
+        s_eolPending = 0;
+        LOG_F(INFO, "[eol] entry flush done");
+    }
 }
 
 static void Net_ApplySectorStream(const char *buf, int len)
@@ -7826,6 +7900,33 @@ void Net_SendNewGame(uint32_t flags)
         if (i != myconnectindex) oldnet_sendpacket(i, (unsigned char*)packbuf,j);
         if (myconnectindex != connecthead) break; //slaves in M/S mode only send to master
     }
+}
+
+// STREAM MODE: the host is the only authority on level transitions. Called at
+// the host's MODE_EOL consumption (game.cpp main loop) BEFORE the bonus/enter
+// flow, so every guest flips levels WITH us. The classic build never sent
+// PACKET_TYPE_EOL (lockstep peers all hit the exit on the same tic); stream
+// guests don't share that symmetry -- 2026-08-15 a guest-side exit split the
+// session (guest transitioned alone, host input-starved in the old level,
+// match tore down to the lobby). ud.* progression is already computed by the
+// trigger (P_EndLevel / fist secret exit / CON) when this runs.
+void Net_SendEol(void)
+{
+    if (!g_netStreamMode || numplayers < 2 || myconnectindex != connecthead)
+        return;
+    char buf[6];
+    buf[0] = PACKET_TYPE_EOL;
+    buf[1] = (char)ud.level_number;
+    buf[2] = (char)ud.from_bonus;
+    buf[3] = (char)ud.secretlevel;
+    buf[4] = (char)ud.volume_number;
+    buf[5] = (char)ud.eog;
+    int32_t i;
+    TRAVERSE_CONNECT(i)
+        if (i != myconnectindex)
+            oldnet_sendpacket(i, (unsigned char *)buf, sizeof(buf));
+    LOG_F(INFO, "[eol] host broadcast: next E%dL%d from_bonus=%d secret=%d eog=%d",
+          ud.volume_number + 1, ud.level_number + 1, ud.from_bonus, ud.secretlevel, (int)ud.eog);
 }
 
 void Net_EndOfLevel(bool secret)

@@ -3839,7 +3839,20 @@ breakfor:
                 insptr++;
                 vm.pPlayer->timebeforeexit  = *insptr++;
                 vm.pPlayer->customexitsound = -1;
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                {
+                    // Stream-mode guest: don't stage end-of-game locally --
+                    // the countdown still plays (timebeforeexit), but its
+                    // P_EndLevel defers and eog arrives in the host's EOL
+                    // packet. A locally staged eog would misroute a later
+                    // host-driven transition into the episode-end path.
+                    extern int32_t g_netStreamMode;
+                    if (!(g_netStreamMode && numplayers > 1 && myconnectindex != connecthead))
+                        ud.eog = 1;
+                }
+#else
                 ud.eog = 1;
+#endif
                 dispatch();
 
             vInstruction(CON_ADDPHEALTH):
@@ -4447,6 +4460,19 @@ breakfor:
 
                     VM_ABORT_IF(((unsigned)volumeNum >= MAXVOLUMES) | ((unsigned)levelNum >= MAXLEVELS), "invalid parameters: %d, %d", volumeNum, levelNum);
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                    {
+                        // Stream-mode guest: CON level jumps are the host's
+                        // call -- its own sim runs the same CON and broadcasts
+                        // PACKET_TYPE_EOL (with the volume byte) back to us.
+                        extern int32_t g_netStreamMode;
+                        if (g_netStreamMode && numplayers > 1 && myconnectindex != connecthead)
+                        {
+                            LOG_F(INFO, "[eol] guest CON level-jump deferred to host");
+                            dispatch();
+                        }
+                    }
+#endif
                     ud.m_volume_number = ud.volume_number = volumeNum;
                     ud.m_level_number = ud.level_number = levelNum;
                     // if (numplayers > 1 && g_netServer)

@@ -7265,6 +7265,27 @@ MAIN_LOOP_RESTART:
 #endif
         if (((g_netClient || g_netServer) || (myplayer.gm & (MODE_MENU|MODE_DEMO)) == 0) && (int32_t)(totalclock - ototalclock) >= TICSPERFRAME)
         {
+#ifdef __EMSCRIPTEN__
+            // A hidden tab's timers are throttled (1 wake/sec after a minute,
+            // 1/min once muted+hidden for 5), but totalclock keeps accruing in
+            // wall time -- and this loop replays the WHOLE backlog in one
+            // synchronous burst with no yield. Past minutes of backlog the
+            // burst outlives Chrome's hang monitor and the browser executes
+            // the renderer ("Crashing because hung" -- the vanishing-window
+            // crashes, crashpad Aug 5-7). Replay only what a live hitch can
+            // produce; snap the clock over the rest. Sim correctness is
+            // untouched: lockstep consumption is fifo-driven (G_MoveLoop) and
+            // this only stops us MINTING input tics for dead time; the
+            // stream-mode world repaints from the host state stream anyway.
+            if ((int32_t)(totalclock - ototalclock) > 2*TICRATE)
+            {
+                static int clampLogged;
+                if ((clampLogged++ & 31) == 0)
+                    LOG_F(INFO, "[clamp] stalled: snapping over %d owed tics",
+                          ((int32_t)(totalclock - ototalclock)) / TICSPERFRAME);
+                ototalclock = totalclock - TICSPERFRAME;
+            }
+#endif
             int spinN = 0;
             (void)spinN;
             do
@@ -7335,6 +7356,36 @@ MAIN_LOOP_RESTART:
 
         if (myplayer.gm & MODE_NEWGAME)
             goto MAIN_LOOP_RESTART;
+
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        // STREAM MODE level transitions are host-authoritative. Host: tell
+        // every guest BEFORE entering the bonus/enter flow. Guest: arm
+        // MODE_EOL HERE from the packet flag (the handler must not write gm
+        // -- it can run inside the prediction window where g_player[].ps is
+        // the prediction copy and the write gets restored away); any other
+        // MODE_EOL is a local-sim artifact that slipped past the source
+        // guards (P_EndLevel / fist / CON) -- clear it and keep playing, the
+        // host's copy of the same trigger will broadcast the real flip.
+        if (g_netStreamMode && numplayers > 1)
+        {
+            if (myconnectindex == connecthead)
+            {
+                if (myplayer.gm & MODE_EOL)
+                    Net_SendEol();
+            }
+            else if (g_netEolFromHost)
+            {
+                g_netEolFromHost = 0;
+                myplayer.gm = MODE_EOL;
+            }
+            else if (myplayer.gm & MODE_EOL)
+            {
+                LOG_F(WARNING, "[eol] backstop: cleared unauthorized guest level-end");
+                for (bssize_t TRAVERSE_CONNECT(i))
+                    g_player[i].ps->gm &= ~MODE_EOL;
+            }
+        }
+#endif
 
         if (myplayer.gm & (MODE_EOL|MODE_RESTART))
         {

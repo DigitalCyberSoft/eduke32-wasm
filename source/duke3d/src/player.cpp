@@ -4985,6 +4985,22 @@ static void P_ProcessWeapon(int playerNum)
 
 void P_EndLevel(void)
 {
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // STREAM MODE, guest: level transitions are HOST-AUTHORITATIVE. Our local
+    // sim hitting an exit (switch, nuke fist, CON countdown) must not split
+    // the session -- the press already replays on the host, whose own exit
+    // runs this same path and broadcasts PACKET_TYPE_EOL back to us
+    // (2026-08-15: a guest-side exit transitioned the guest alone, starved
+    // the host's input gate mid-level, and tore the match down to the lobby).
+    {
+        extern int32_t g_netStreamMode;
+        if (g_netStreamMode && numplayers > 1 && myconnectindex != connecthead)
+        {
+            LOG_F(INFO, "[eol] guest exit deferred to host");
+            return;
+        }
+    }
+#endif
     for (bssize_t TRAVERSE_CONNECT(playerNum))
         g_player[playerNum].ps->gm = MODE_EOL;
 
@@ -5022,15 +5038,25 @@ static int P_DoFist(DukePlayer_t *pPlayer)
     {
         if (pPlayer->buttonpalette && ud.from_bonus == 0)
         {
-            for (bssize_t TRAVERSE_CONNECT(playerNum))
-                g_player[playerNum].ps->gm = MODE_EOL;
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+            // Stream-mode guest: secret exits defer to the host too (the
+            // host's replay of this fist runs the authoritative copy).
+            extern int32_t g_netStreamMode;
+            if (g_netStreamMode && numplayers > 1 && myconnectindex != connecthead)
+                LOG_F(INFO, "[eol] guest secret exit deferred to host");
+            else
+#endif
+            {
+                for (bssize_t TRAVERSE_CONNECT(playerNum))
+                    g_player[playerNum].ps->gm = MODE_EOL;
 
-            ud.from_bonus = ud.level_number + 1;
+                ud.from_bonus = ud.level_number + 1;
 
-            if ((unsigned)ud.secretlevel <= MAXLEVELS)
-                ud.level_number = ud.secretlevel - 1;
+                if ((unsigned)ud.secretlevel <= MAXLEVELS)
+                    ud.level_number = ud.secretlevel - 1;
 
-            ud.m_level_number = ud.level_number;
+                ud.m_level_number = ud.level_number;
+            }
         }
         else
             P_EndLevel();
