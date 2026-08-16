@@ -61,6 +61,7 @@ jobs:
           cp platform/emscripten/index.html _site/index.html
           cp platform/emscripten/eduke32-net.js _site/eduke32-net.js
           cp platform/emscripten/grp-manifest.json _site/grp-manifest.json
+          cp platform/emscripten/og-image.png _site/og-image.png
           BUILD_ID="${{ github.run_number }}-$(git rev-parse --short HEAD)"
           sed -i "s/__BUILD_ID__/${BUILD_ID}/g" _site/index.html
           echo "Assembled _site with BUILD_ID=${BUILD_ID}"
