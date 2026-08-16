@@ -578,6 +578,17 @@ static int32_t s_hostEolClock;  // guest: when the EOL receipt armed the grace
 // NN_TESTSLOWLOAD=<ms> (native builds only): block the game thread at the
 // transition exactly like a slow machine's map/art load, so the grace above is
 // provable in a harness instead of shipping on faith.
+#ifdef NETNATIVE
+// MinGW has no usleep; Sleep comes in via compat.h -> windows_inc.h.
+static void Net_SleepMS(int ms)
+{
+# ifdef _WIN32
+    Sleep((DWORD)ms);
+# else
+    usleep((useconds_t)ms * 1000);
+# endif
+}
+#endif
 static void Net_TestSlowLoad(const char *who)
 {
 #ifdef NETNATIVE
@@ -604,12 +615,12 @@ static void Net_TestSlowLoad(const char *who)
         {
             for (int left = ms; left > 0; left -= 50)
             {
-                usleep((useconds_t)min(left, 50) * 1000);
+                Net_SleepMS(min(left, 50));
                 net_poll();
             }
         }
         else
-            usleep((useconds_t)ms * 1000);
+            Net_SleepMS(ms);
         LOG_F(INFO, "[eol] NN_TESTSLOWLOAD: %s resumed", who);
     }
 #else
@@ -5162,12 +5173,16 @@ extern "C" void Web_SetPredictMode(int mode)
     g_netPredictMode = mode;
     EM_ASM({ console.log('[eng] predictMode=' + $0); }, mode);
 }
+#endif
 // One-line world-truth dump for pair probes: position drift, health/score
 // parity. Two call paths: Web_NetProbe (JS, wall-time cadence) and the
 // tic-aligned site in Net_GetSyncStat (forensics, movefifoplc&255==0) --
 // tic-aligned lines carry the SAME plc on every peer, so the differ compares
 // the same sim tic exactly. This is the OA-model acceptance instrument
-// (there is no CRC verdict to read in stream mode).
+// (there is no CRC verdict to read in stream mode). Defined on EVERY platform
+// (browser logs to the console, native to the logger): the Net_GetSyncStat
+// call site compiles unconditionally, and ld64 rejects the dangling reference
+// even when forensics never turns on (Linux's --gc-sections only masked it).
 extern "C" void Web_NetProbe(void)
 {
     char line[640];
@@ -5185,8 +5200,13 @@ extern "C" void Web_NetProbe(void)
         if (n > (int)sizeof(line) - 96)
             break;
     }
+#ifdef __EMSCRIPTEN__
     EM_ASM({ console.log(UTF8ToString($0)); }, line);
+#else
+    LOG_F(INFO, "%s", line);
+#endif
 }
+#ifdef __EMSCRIPTEN__
 
 extern "C" void Web_SetStreamMode(int on)
 {

@@ -180,22 +180,46 @@ jobs:
           cmake -S ldc-src -B ldc-src/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DNO_EXAMPLES=ON -DNO_TESTS=ON -DNO_MEDIA=ON \
             -DCMAKE_INSTALL_PREFIX="$PREFIX"
-          cmake --build ldc-src/build -j2
+          cmake --build ldc-src/build -j"$(nproc)"
           cmake --install ldc-src/build
           git clone --depth 1 --branch "$SECP256K1_TAG" https://github.com/bitcoin-core/secp256k1 secp-src
           cmake -S secp-src -B secp-src/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DSECP256K1_ENABLE_MODULE_SCHNORRSIG=ON -DSECP256K1_ENABLE_MODULE_EXTRAKEYS=ON \
             -DSECP256K1_BUILD_TESTS=OFF -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF
-          cmake --build secp-src/build -j2
+          cmake --build secp-src/build -j"$(nproc)"
           cmake --install secp-src/build
       - name: Build (NETNATIVE=1)
         # Stage the source-built deps into the MINGW64 prefix (default search
         # paths for compiler, linker, and pkg-config alike). No make-variable
         # overrides: command-line CXXFLAGS would REPLACE the makefile's own.
+        #
+        # secp256k1's CMake install ships NO libsecp256k1.pc (autotools does;
+        # brew's mac formula has one) -- and the makefile queries all three libs
+        # in ONE pkg-config call, so a single missing .pc silently drops
+        # -lsecp256k1 -lminiupnpc -lcrypto together and the link fails 5000
+        # lines later. Synthesize the .pc, then probe loudly so a regression
+        # dies HERE with a readable message.
         run: |
           cp -R deps-prefix/. /mingw64/
-          make NETNATIVE=1 NETDUKE32=1 USE_LIBVPX=0 -j2
+          if ! pkg-config --exists libsecp256k1; then
+            mkdir -p /mingw64/lib/pkgconfig
+            printf '%s\n' \
+              'prefix=/mingw64' \
+              'exec_prefix=${prefix}' \
+              'libdir=${exec_prefix}/lib' \
+              'includedir=${prefix}/include' \
+              '' \
+              'Name: libsecp256k1' \
+              'Description: Optimized C library for EC operations on curve secp256k1 (source-built)' \
+              "Version: ${SECP256K1_TAG#v}" \
+              'Libs: -L${libdir} -lsecp256k1' \
+              'Cflags: -I${includedir}' \
+              > /mingw64/lib/pkgconfig/libsecp256k1.pc
+            echo "synthesized libsecp256k1.pc"
+          fi
+          pkg-config --libs libsecp256k1 miniupnpc libcrypto libcurl
+          make NETNATIVE=1 NETDUKE32=1 USE_LIBVPX=0 -j"$(nproc)"
       - name: Package (binary + runtime DLLs)
         if: success()
         run: |
