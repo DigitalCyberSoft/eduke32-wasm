@@ -7784,7 +7784,21 @@ int G_MoveLoop(void)
 
     int mlSpin = 0;
     (void)mlSpin;
-    while ((g_player[myconnectindex].movefifoend - movefifoplc) > bufferjitter)
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // STREAM FREE-RUN (guest): consume every locally sampled tic the moment it
+    // exists -- zero cushion, zero waiting on the wire. The guest's world
+    // (its own fire, doors, projectiles, enemy sim) used to advance only as
+    // the host's echo confirmed tics, i.e. a full RTT behind the mouse (live
+    // at 80ms: "a lot of input lag on the guest"). Stream mode makes that
+    // gate pointless: the sim is client-first, the host stream repaints world
+    // truth, and POS_REPORT owns this seat on the host.
+    bool const streamFreeRun =
+        (g_netStreamMode && numplayers > 1 && myconnectindex != connecthead && !g_netJoinCatchup);
+    int32_t const fifoCushion = streamFreeRun ? 0 : bufferjitter;
+#else
+    int32_t const fifoCushion = bufferjitter;
+#endif
+    while ((g_player[myconnectindex].movefifoend - movefifoplc) > fifoCushion)
     {
 #if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
         if (++mlSpin == 400)
@@ -7798,6 +7812,21 @@ int G_MoveLoop(void)
                 if ((g_player[i].movefifoend <= movefifoplc) && !g_gameQuit)
                 {
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                    // FREE-RUN INPUT SELECTION: never stall the local world on
+                    // a remote column. Consume the peer's latest REAL input
+                    // for this tic (their cursor is NOT bumped, so the real
+                    // record still lands in the fifo when the wire delivers
+                    // it and the next selection uses it). Remote seats are
+                    // repainted by the host stream anyway -- this only keeps
+                    // their local sim moving between packets.
+                    if (streamFreeRun && i != myconnectindex)
+                    {
+                        input_t src = {};
+                        if (g_player[i].movefifoend > 0)
+                            src = inputfifo[(g_player[i].movefifoend - 1) & (MOVEFIFOSIZ - 1)][i];
+                        inputfifo[movefifoplc & (MOVEFIFOSIZ - 1)][i] = src;
+                        continue;
+                    }
                     // Stall bookkeeping for the interruption HUD (screens.cpp).
                     if (!g_netStallSince || g_netStallSince > (int32_t)totalclock)
                         g_netStallSince = (int32_t)totalclock;

@@ -11,6 +11,9 @@ static void Net_RebuildConnectChain(void);
 #include "chatpipe.h"
 #include "demo.h"  // G_CloseDemoWrite (Net_CheckPlayerQuit)
 #include "savegame.h"  // late-join snapshot: sv_saveandmakesnapshot / G_LoadPlayer
+#if defined(NETNATIVE) && !defined(_WIN32)
+# include <unistd.h>  // usleep (NN_TESTSLOWLOAD harness knob)
+#endif
 #ifdef __EMSCRIPTEN__
 # include <emscripten.h>
 #endif
@@ -480,6 +483,18 @@ enum
                              // art load takes 5-30s) -- reap only after 60s.
                              // Soak-caught: the bare 10s silence axe kicked the
                              // guest mid-level-load on the very first launch.
+    NET_EOL_GRACE   = 14400, // BOTH axes, across a LEVEL TRANSITION: a machine
+                             // loading the next map is provably mute (wasm
+                             // blocks its main thread; native pumps the
+                             // transport from the game thread), and slow
+                             // hardware takes 30s+ over the art cache -- the
+                             // 10s axes tore live cross-machine sessions apart
+                             // at every map switch (live-reported: the faster
+                             // machine dropped before the host finished
+                             // loading). 120s of patience, armed at the EOL
+                             // broadcast/receipt and released by the first
+                             // post-transition packet. True deaths still reap
+                             // instantly via transport peer-downs.
 
     // Canonical-stream synthesis + barrier-free join (see oldnet.h):
     NET_FILL_DEADLINE = 40,   // master: aggregation blocked on one peer this long
@@ -526,6 +541,38 @@ int32_t g_netEolFromHost;            // guest: this MODE_EOL was authorized by P
 static int32_t s_eolPending;         // guest: between EOL-received and level entry -- drop
                                      // unreliable stream packs (a stale E1L1 snap/paint applied
                                      // in E1L2 teleports the player / corrupts the fresh world)
+// Level-transition load grace (see NET_EOL_GRACE). Host side: seats still
+// loading the new map (cleared by their first real post-transition record).
+// Guest side: the host is loading (cleared by the first M2S after OUR entry --
+// residual old-level M2S while s_eolPending must not release it, or a host
+// slower than us would still be axed 10s after we enter).
+static int32_t s_eolWaitMask;   // host: seats inside the transition grace
+static int32_t s_eolGraceClock; // host: when the EOL broadcast armed the grace
+static int32_t s_hostEolWait;   // guest: host presumed loading
+static int32_t s_hostEolClock;  // guest: when the EOL receipt armed the grace
+
+// NN_TESTSLOWLOAD=<ms> (native builds only): block the game thread at the
+// transition exactly like a slow machine's map/art load, so the grace above is
+// provable in a harness instead of shipping on faith.
+static void Net_TestSlowLoad(const char *who)
+{
+#ifdef NETNATIVE
+    static int ms = -1;
+    if (ms < 0)
+    {
+        char const *e = getenv("NN_TESTSLOWLOAD");
+        ms = e ? Batoi(e) : 0;
+    }
+    if (ms > 0)
+    {
+        LOG_F(INFO, "[eol] NN_TESTSLOWLOAD: %s blocking %d ms (simulated map load)", who, ms);
+        usleep((useconds_t)ms * 1000);
+        LOG_F(INFO, "[eol] NN_TESTSLOWLOAD: %s resumed", who);
+    }
+#else
+    UNREFERENCED_PARAMETER(who);
+#endif
+}
 
 // Join boundary table, the exact mirror of s_goneTic: >= 0 names the first tic
 // WITH this player. Persists for the session (record membership for tics below
@@ -2792,6 +2839,10 @@ static void Net_ResetProtocolState(void)
     g_netDesyncReporters = 0;
     g_netEolFromHost = 0;
     s_eolPending     = 0;
+    s_eolWaitMask    = 0;
+    s_eolGraceClock  = 0;
+    s_hostEolWait    = 0;
+    s_hostEolClock   = 0;
     s_joinAwaitReal  = 0;
     s_fillActive     = 0;
     s_joinFlowSlot   = -1;
@@ -2952,6 +3003,20 @@ static void Net_CheckPeerHealth(void)
         if (i == s_joinFlowSlot) { s_lastRealRecvClock[i] = now; continue; }
         // CPU seats have no transport to be silent on.
         if (g_netBotMask & (1 << i)) { s_lastRealRecvClock[i] = now; continue; }
+        // Level-transition grace: this seat is loading the next map (armed at
+        // the EOL broadcast, released by its first real post-transition record
+        // below). A slow machine's map/art load runs way past the 10s axe, and
+        // it is provably mute the whole time. Transport peer-downs (above)
+        // still reap genuine disconnects instantly.
+        if (s_eolWaitMask & (1 << i))
+        {
+            if (s_eolGraceClock > now)   // totalclock reset at OUR level entry
+                s_eolGraceClock = now;
+            if (now - s_eolGraceClock < NET_EOL_GRACE) { s_lastRealRecvClock[i] = now; continue; }
+            LOG_F(WARNING, "[eol] seat %d never resumed after the transition (%ds) -- releasing the axe",
+                  i, NET_EOL_GRACE / 120);
+            s_eolWaitMask &= ~(1 << i);
+        }
         // A guest still inside the NEW_GAME redelivery window is BOOTING its
         // engine -- a real browser can take minutes, and the axe was measured
         // kicking a throttled guest 48s after launch while its entry packets
@@ -3175,6 +3240,22 @@ void Net_HandleInput(void)
             }
             g_netSendRing[g_netSampleHead & (MOVEFIFOSIZ - 1)] = staged;
             g_netSampleHead++;
+            // STREAM FREE-RUN: the guest's OWN column fills at SAMPLE time, so
+            // its sim never waits for the host to echo its own inputs back.
+            // The echo round-trip was the guest's whole-world input latency
+            // (fire/doors/projectiles all ran ~RTT behind the mouse -- live at
+            // 80ms: "a lot of input lag on the guest"). In stream mode the
+            // canonical-timeline argument for echo-consumption is void: the
+            // sim is a client-first predictor, world truth is repainted by the
+            // host stream, POS_REPORT owns this seat on the host, and every
+            // sync/divergence verdict is already stream-gated off. The echo's
+            // copy of this column dup-drops on arrival (t < movefifoend).
+            if (g_netStreamMode)
+            {
+                inputfifo[(g_netSampleHead - 1) & (MOVEFIFOSIZ - 1)][myconnectindex] = staged;
+                if (g_player[myconnectindex].movefifoend < g_netSampleHead)
+                    g_player[myconnectindex].movefifoend = g_netSampleHead;
+            }
         }
         else
         {
@@ -3236,6 +3317,22 @@ void Net_HandleInput(void)
             int32_t const now = (int32_t)totalclock;
             if (lastpackettime > now)   // totalclock reset (level transition)
                 lastpackettime = now;
+            // Transition grace: the host is loading the next map and cannot
+            // send; keep the axe's base fresh until its stream resumes (the
+            // M2S handler releases the wait) or the grace runs out.
+            if (s_hostEolWait)
+            {
+                if (s_hostEolClock > now)   // totalclock reset at OUR level entry
+                    s_hostEolClock = now;
+                if (now - s_hostEolClock < NET_EOL_GRACE)
+                    lastpackettime = now;
+                else
+                {
+                    LOG_F(WARNING, "[eol] host never resumed after the transition (%ds) -- releasing the axe",
+                          NET_EOL_GRACE / 120);
+                    s_hostEolWait = 0;
+                }
+            }
             if (g_player[myconnectindex].ps != NULL
                 && (g_player[myconnectindex].ps->gm & MODE_GAME)
                 && now - lastpackettime > NET_HOST_SILENT)
@@ -3712,6 +3809,14 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 }
 
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                // Host stream landed AFTER our own level entry (residual
+                // old-level M2S arrives while s_eolPending and must not count):
+                // the host survived its load -- release the transition grace.
+                if (s_hostEolWait && !s_eolPending)
+                {
+                    s_hostEolWait = 0;
+                    LOG_F(INFO, "[eol] host stream resumed -- load grace released");
+                }
                 // Tic-indexed window: self-contained, loss/reorder tolerant.
                 {
                     int8_t const d = (int8_t)((uint8_t)packbuf[1] - g_netMoveEpoch);
@@ -3893,6 +3998,11 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     s_fillActive    &= ~(1 << other);
                     s_joinAwaitReal &= ~(1 << other);
                     s_lastRealRecvClock[other] = (int32_t)totalclock;
+                    if (s_eolWaitMask & (1 << other))
+                    {
+                        s_eolWaitMask &= ~(1 << other);
+                        LOG_F(INFO, "[eol] seat %d resumed after the transition -- load grace released", other);
+                    }
                 }
 
                 Net_GetSyncInfoFromPacket(packbuf, &j, other);
@@ -4429,8 +4539,13 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 ud.m_level_number = ud.level_number;
                 g_netEolFromHost = 1;
                 s_eolPending     = 1;
+                // The host unloads its world right after this broadcast (and so
+                // do we): hold the host-silence axe until its stream resumes.
+                s_hostEolWait  = 1;
+                s_hostEolClock = (int32_t)totalclock;
                 LOG_F(INFO, "[eol] host says level over -> E%dL%d eog=%d",
                       ud.volume_number + 1, ud.level_number + 1, (int)ud.eog);
+                Net_TestSlowLoad("guest");
                 break;
             }
 
@@ -5764,7 +5879,15 @@ static void Net_ApplyEnemyHitReport(int attacker, int idxHint, int x, int y, int
         target = idxHint;
     else
     {
-        int64_t best = (int64_t)1200 * 1200;   // resolve radius^2 (build x/y units)
+        // Resolve radius: generous ON PURPOSE. The guest aims at where the
+        // host stream painted the enemy -- up to a full RTT stale -- so the
+        // reported position trails the host's live copy by (enemy speed x
+        // ping). 1200 units was tuned on loopback; at a playable 80-250ms it
+        // silently ate legitimate hits ("MISS ... no live enemy near"). The
+        // index hint (exact in stream mode) still short-circuits this scan;
+        // the radius only decides hint-mismatch cases, so widening it cannot
+        // misattribute at close range (nearest-live still wins).
+        int64_t best = (int64_t)2600 * 2600;   // resolve radius^2 (build x/y units)
         // Scan BOTH the awake (STAT_ACTOR) and DORMANT (STAT_ZOMBIEACTOR) enemy
         // lists. Map monsters SPAWN dormant and only wake when the host's own coarse
         // LOS check to the nearest player clears -- flakier and laggier than the
@@ -7927,6 +8050,14 @@ void Net_SendEol(void)
             oldnet_sendpacket(i, (unsigned char *)buf, sizeof(buf));
     LOG_F(INFO, "[eol] host broadcast: next E%dL%d from_bonus=%d secret=%d eog=%d",
           ud.volume_number + 1, ud.level_number + 1, ud.from_bonus, ud.secretlevel, (int)ud.eog);
+    // Every seat now unloads its world: hold the silence axe for all of them
+    // until their first post-transition record (or NET_EOL_GRACE).
+    s_eolWaitMask = 0;
+    TRAVERSE_CONNECT(i)
+        if (i != myconnectindex && !(g_netBotMask & (1 << i)))
+            s_eolWaitMask |= (1 << i);
+    s_eolGraceClock = (int32_t)totalclock;
+    Net_TestSlowLoad("host");
 }
 
 void Net_EndOfLevel(bool secret)
