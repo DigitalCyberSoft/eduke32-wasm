@@ -85,6 +85,7 @@ jobs:
         run: |
           mkdir -p eduke32-native-linux
           cp eduke32 mapster32 eduke32-native-linux/ 2>/dev/null || true
+          cp assets/shareware/DUKE3D.GRP assets/shareware/LICENSE.TXT eduke32-native-linux/
           ls -la eduke32-native-linux/
       - uses: actions/upload-artifact@v4
         if: success()
@@ -137,6 +138,7 @@ jobs:
           mkdir -p eduke32-native-macos
           cp -R EDuke32.app eduke32 mapster32 eduke32-native-macos/ 2>/dev/null || true
           cp "$HOME/ldc-prefix/lib/"libdatachannel*.dylib eduke32-native-macos/ 2>/dev/null || true
+          cp assets/shareware/DUKE3D.GRP assets/shareware/LICENSE.TXT eduke32-native-macos/
           ls -la eduke32-native-macos/
       - uses: actions/upload-artifact@v4
         if: success()
@@ -226,6 +228,7 @@ jobs:
         run: |
           mkdir -p eduke32-native-windows
           cp eduke32.exe mapster32.exe eduke32-native-windows/ 2>/dev/null || true
+          cp assets/shareware/DUKE3D.GRP assets/shareware/LICENSE.TXT eduke32-native-windows/
           cp deps-prefix/bin/*.dll eduke32-native-windows/ 2>/dev/null || true
           # mingw runtime DLLs the exe links (SDL2, openssl, curl, gcc runtime...)
           for f in $(ldd eduke32.exe | awk '/mingw64/ {print $3}' | sort -u); do cp "$f" eduke32-native-windows/; done

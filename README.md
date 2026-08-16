@@ -74,10 +74,22 @@ that work into a serverless, browser-native model:
 
 ## Game data
 
-No retail assets are included. The **shareware 1.3d episode** is bundled and
-playable immediately (`assets/shareware/LICENSE.TXT`). For the full game, use
-the `DUKE3D.GRP` from a copy you own (GOG, Steam, original CD) — the web
-build imports it once and keeps it in browser storage, local to you.
+No retail assets are included. The **shareware 1.3d episode** is freely
+distributable (`assets/shareware/LICENSE.TXT`) and every build ships playable
+out of the box:
+
+- **Web**: shareware is baked into the engine bundle.
+- **Native releases** (Linux/macOS/Windows): the shareware `DUKE3D.GRP` is
+  packaged beside the binary.
+- **Bare/self-built native binaries**: on first launch with no game data
+  found, the engine downloads the shareware GRP (11 MB) next to itself and
+  boots it — the download is checksum-pinned against the engine's known
+  shareware fingerprint, so a bad or tampered file is discarded.
+
+For the full game, use the `DUKE3D.GRP` from a copy you own (GOG, Steam,
+original CD): drop it beside the binary (native) or import it once through
+the settings panel (web — it stays in browser storage, local to you). Retail
+data always wins the group selection over shareware.
 
 ## Building
 

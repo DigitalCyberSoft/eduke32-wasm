@@ -76,6 +76,13 @@ void net_transport_shutdown(void);
 // guest), which its UI already handles. No-op for the stub.
 void net_kick(int peerToken);
 
+// [additive, NETNATIVE only] First-run helper: download the freely
+// distributable shareware GRP into the profile dir (CRC-pinned against
+// grpscan's entry) so a bare binary boots playable. Returns 1 on success;
+// the caller rescans groups. Callers must guard with #ifdef NETNATIVE --
+// the stub does not implement it.
+int Net_FetchSharewareGrp(void);
+
 //========================================================================
 // Inbound: transport -> netcode   (implemented by the netcode, in oldnet.cpp)
 //========================================================================

@@ -29,6 +29,8 @@
 
 #ifdef NETNATIVE
 
+#include "crc32.h"   // Bcrc32: the shareware fetch pins the download against DUKESW_CRC
+
 #include "nn_grp.hpp"
 #include "nn_relay.hpp"
 #include "nn_signaling.hpp"
@@ -1231,6 +1233,110 @@ void net_native_menu_pump(void)
 {
     if (g_t)
         g_t->menuPump();
+}
+
+// ── First-run shareware fetch ───────────────────────────────────────────────
+// A bare native binary with NO game data downloads the freely distributable
+// 1.3d shareware GRP (the exact file the web build bundles; committed in this
+// repo) into the profile dir -- the desktop build then boots playable out of
+// the box, and the normal group scan picks it up like any other data. Runs on
+// the game thread at startup, long before the transport exists; libcurl is
+// already linked for the Nostr relay client.
+//
+// Integrity is CRC-PINNED against grpscan's shareware entry: TLS here only
+// shields a public demo file, so on a machine with no usable CA bundle (a
+// bare Windows zip without curl's cacert) the fetch retries unverified
+// rather than failing -- a tampered or truncated file cannot pass the pin
+// and is discarded.
+int Net_FetchSharewareGrp(void)
+{
+    static char const kUrl[] =
+        "https://raw.githubusercontent.com/DigitalCyberSoft/eduke32-wasm/master/assets/shareware/DUKE3D.GRP";
+    int32_t  const kSize = 11035779;      // Duke Nukem 3D shareware 1.3d GRP
+    uint32_t const kCrc  = 0x983AD923u;   // DUKESW_CRC (grpscan.h)
+    char const *kPart = "DUKE3D.GRP.part";
+
+    printf("[nnet] no game data found: downloading the shareware episode (11 MB)...\n");
+    fflush(stdout);
+
+    curl_global_init(CURL_GLOBAL_DEFAULT);   // ref-counted; the transport's later init stacks fine
+    CURL *c = curl_easy_init();
+    if (c == nullptr)
+        return 0;
+
+    CURLcode r = CURLE_FAILED_INIT;
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        FILE *f = fopen(kPart, "wb");
+        if (f == nullptr)
+        {
+            printf("[nnet] shareware fetch: cannot write here (%s)\n", kPart);
+            curl_easy_cleanup(c);
+            return 0;
+        }
+        curl_easy_setopt(c, CURLOPT_URL, kUrl);
+        curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(c, CURLOPT_WRITEDATA, f);       // default write callback = fwrite
+        curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 30L);
+        curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 512L);  // abort a stalled link,
+        curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);    // never a slow one
+        curl_easy_setopt(c, CURLOPT_USERAGENT, "eduke32-wasm-native");
+        if (attempt == 1)
+        {
+            printf("[nnet] TLS verification unavailable on this machine; retrying unverified "
+                   "(the CRC pin is the integrity gate)\n");
+            curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
+            curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
+        }
+        r = curl_easy_perform(c);
+        fclose(f);
+        if (r == CURLE_OK || !(r == CURLE_PEER_FAILED_VERIFICATION || r == CURLE_SSL_CACERT_BADFILE))
+            break;   // done, or an error the unverified retry cannot fix
+    }
+    long http = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http);
+    curl_easy_cleanup(c);
+    if (r != CURLE_OK || http != 200)
+    {
+        printf("[nnet] shareware fetch failed (%s, http %ld) -- drop a DUKE3D.GRP beside the binary instead\n",
+               curl_easy_strerror(r), http);
+        unlink(kPart);
+        return 0;
+    }
+
+    // The pin: byte count and CRC must match grpscan's shareware entry.
+    FILE *f = fopen(kPart, "rb");
+    if (f == nullptr)
+        return 0;
+    int32_t  total = 0;
+    int32_t  crc   = 0;
+    static uint8_t buf[65536];
+    for (;;)
+    {
+        size_t const n = fread(buf, 1, sizeof(buf), f);
+        if (n == 0)
+            break;
+        crc = Bcrc32(buf, (int32_t)n, crc);
+        total += (int32_t)n;
+    }
+    fclose(f);
+    if (total != kSize || (uint32_t)crc != kCrc)
+    {
+        printf("[nnet] shareware fetch integrity FAIL (size %d, crc 0x%08x) -- discarded\n",
+               total, (unsigned)crc);
+        unlink(kPart);
+        return 0;
+    }
+
+    unlink("DUKE3D.GRP");                    // stale partial/zero-byte leftovers
+    if (rename(kPart, "DUKE3D.GRP") != 0)
+    {
+        unlink(kPart);
+        return 0;
+    }
+    printf("[nnet] shareware episode installed (DUKE3D.GRP, crc 0x%08x)\n", (unsigned)crc);
+    fflush(stdout);
+    return 1;
 }
 
 } // extern "C"

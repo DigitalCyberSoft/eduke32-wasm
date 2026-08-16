@@ -41,6 +41,10 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #else
 # include "network.h"
 #endif
+#ifdef NETNATIVE
+# include "grpscan.h"        // foundgrps/FreeGroups (first-run shareware fetch)
+# include "net_transport.h"  // Net_FetchSharewareGrp
+#endif
 #ifdef __EMSCRIPTEN__
 # include <emscripten.h>
 #endif
@@ -6857,6 +6861,20 @@ int app_main(int argc, char const* const* argv)
         LOG_F(INFO, "Using config file '%s'.",g_setupFileName);
 
     G_ScanGroups();
+
+#ifdef NETNATIVE
+    // FIRST RUN, BARE BINARY: no game data anywhere -> fetch the freely
+    // distributable shareware episode into the profile dir (CRC-pinned; the
+    // exact file the web build bundles) and rescan. Retail data dropped in
+    // later wins the normal group selection. The release packages BUNDLE the
+    // GRP beside the binary, so this only fires for loose binaries
+    // (self-built, or a single exe copied out of the zip).
+    if (foundgrps == NULL && Net_FetchSharewareGrp())
+    {
+        FreeGroups();
+        G_ScanGroups();
+    }
+#endif
 
 #ifdef STARTUP_SETUP_WINDOW
     if (g_commandSetup || (!Bgetenv("SteamTenfoot") && (readSetup < 0 || (!g_noSetup && (ud.configversion != BYTEVERSION_EDUKE32 || ud.setup.forcesetup)))))
