@@ -28,6 +28,8 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <chrono>
+#include <algorithm>
 
 namespace nn {
 
@@ -42,7 +44,9 @@ class PeerManager
 {
 public:
     // Outbound signaling (owner wires these to publishEphemeral of a signaling msg).
-    std::function<void(const std::string &toDevice, const std::string &sdp, bool isOffer)> sendSdp;
+    // gen: for ANSWERS, the ufrag of the offer generation being answered (pairing
+    // against relay-redelivered stale answers); empty for offers.
+    std::function<void(const std::string &toDevice, const std::string &sdp, bool isOffer, const std::string &gen)> sendSdp;
     std::function<void(const std::string &toDevice, const std::string &cand, const std::string &mid)> sendIce;
 
     // Inbound (invoked on libdatachannel worker threads; consumer must be thread-safe).
@@ -73,31 +77,62 @@ public:
     void connect(const std::string &peerId)
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        ensure(peerId);
-        if (myId_ >= peerId)
-            return; // the larger id waits for the offer
-        Conn *c = conns_[peerId].get();
+        Conn *c = ensure(peerId);
+        if (!c || myId_ >= peerId)
+            return; // pool failure, or the larger id waits for the offer
         if (c->offered || anyChannelOpen(c))
             return;
         c->offered = true;
-        createOffer(peerId, c);
+        createOffer(conns_[peerId]);
     }
 
     void handleOffer(const std::string &peerId, const std::string &sdp)
     {
         std::lock_guard<std::mutex> lk(mtx_);
         Conn *c = ensure(peerId);
-        // Duplicate offer after we already answered: re-send the answer.
-        if (c->remoteSet && c->answered && c->pc && c->pc->localDescription())
+        if (!c)
+            return; // pool exhausted: logged in ensure(); reaper frees ports
+        // Offer GENERATIONS, keyed by the ICE ufrag (unique per RTCPeerConnection):
+        //  - the CURRENT conn's ufrag  -> relay redelivery: re-send our answer.
+        //  - a PREVIOUSLY SEEN ufrag   -> redelivery of a superseded generation: inert.
+        //  - a NEVER-SEEN ufrag        -> the peer built a fresh pc (in-tab reconnect
+        //    after a drop; device ids are per-page-load so the id is reused). The old
+        //    conn is dead BY DEFINITION -- one JS context never runs two sessions.
+        //    Answering re-offers with the dead session's SDP made reconnects
+        //    unjoinable ("Reconnects aren't working", 2026-08-16); health checks
+        //    lose the race (the re-offer can beat the old conn's death detection),
+        //    so generation identity, not liveness, decides.
+        std::string const ufrag = sdpUfrag(sdp);
+        auto &seen = seenOfferUfrags_[peerId];
+        if (c->remoteSet && ufrag == c->offerUfrag)
         {
-            if (sendSdp)
-                sendSdp(peerId, std::string(c->pc->localDescription()->generateSdp()), false);
+            if (c->answered && c->pc && c->pc->localDescription() && sendSdp)
+                sendSdp(peerId, std::string(c->pc->localDescription()->generateSdp()), false, c->offerUfrag);
             return;
+        }
+        if (std::find(seen.begin(), seen.end(), ufrag) != seen.end())
+            return; // superseded generation: never resurrect it
+        if (c->remoteSet)
+        {
+            printf("[nnet] re-offer from %.16s: retiring stale conn, negotiating fresh\n", peerId.c_str());
+            auto it = conns_.find(peerId);
+            if (it != conns_.end())
+            {
+                retired_.push_back(it->second); // torn down by reapDead() outside mtx_
+                conns_.erase(it);
+            }
+            c = ensure(peerId);
+            if (!c)
+                return;
         }
         try
         {
             c->pc->setRemoteDescription(rtc::Description(sdp, "offer"));
             c->remoteSet = true;
+            c->offerUfrag = ufrag;
+            seen.push_back(ufrag);
+            if (seen.size() > 32)
+                seen.erase(seen.begin());
             flushIce(c);
         }
         catch (...)
@@ -105,7 +140,7 @@ public:
         }
     }
 
-    void handleAnswer(const std::string &peerId, const std::string &sdp)
+    void handleAnswer(const std::string &peerId, const std::string &sdp, const std::string &gen = std::string())
     {
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = conns_.find(peerId);
@@ -114,6 +149,17 @@ public:
         Conn *c = it->second.get();
         if (c->remoteSet)
             return; // already applied (duplicate answer resend)
+        // Generation pairing: an answer tagged for a DIFFERENT offer than ours
+        // is a relay-redelivered stale one -- applying it poisons this pc.
+        if (!gen.empty() && c->pc && c->pc->localDescription())
+        {
+            std::string const myUfrag = sdpUfrag(std::string(c->pc->localDescription()->generateSdp()));
+            if (gen != myUfrag)
+            {
+                printf("[nnet] stale answer for %.16s (gen mismatch) -- ignored\n", peerId.c_str());
+                return;
+            }
+        }
         try
         {
             c->pc->setRemoteDescription(rtc::Description(sdp, "answer"));
@@ -202,6 +248,7 @@ public:
         std::shared_ptr<Conn> c;
         {
             std::lock_guard<std::mutex> lk(mtx_);
+            seenOfferUfrags_.erase(peerId);
             auto it = conns_.find(peerId);
             if (it == conns_.end())
                 return;
@@ -224,6 +271,59 @@ public:
             teardown(c.get());
     }
 
+    // Reap connections that died (ICE timeout/failure/close) or never came up.
+    // MUST be called OUTSIDE pc callbacks (the game-thread poll): destroying a
+    // PeerConnection from inside its own callback deadlocks libdatachannel.
+    // Nothing ever closed dead conns before -- every crashed tab and abandoned
+    // join left an rtc::PeerConnection pinning one of the 16 pooled UDP ports
+    // until the pool was exhausted and the host silently stopped answering
+    // offers while still publishing announces (2026-08-15: "I can see the
+    // match, just not join").
+    int reapDead(std::vector<std::string> *reapedOut = nullptr)
+    {
+        std::vector<std::shared_ptr<Conn>> victims;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            for (auto &c : retired_) // conns replaced by a fresh re-offer
+                victims.push_back(c);
+            retired_.clear();
+            for (auto &c : reapConns_)
+            {
+                // Erase from the map ONLY if the id still maps to THIS conn --
+                // a re-offer may have installed a fresh replacement under it.
+                auto it = conns_.find(c->peerId);
+                if (it != conns_.end() && it->second == c)
+                    conns_.erase(it);
+                victims.push_back(c);
+            }
+            reapConns_.clear();
+            // Zombie sweep: a conn whose channels never all opened within 75s
+            // is a corpse -- an abandoned join, a gathering that could not
+            // bind a pooled port (never reaches Failed), or a peer that
+            // vanished mid-handshake. Established conns have readyFired set
+            // and are never swept; their deaths arrive via onStateChange.
+            auto const now = std::chrono::steady_clock::now();
+            for (auto it = conns_.begin(); it != conns_.end();)
+            {
+                Conn *c = it->second.get();
+                if (!c->readyFired && now - c->created > std::chrono::seconds(75))
+                {
+                    victims.push_back(it->second);
+                    it = conns_.erase(it);
+                }
+                else
+                    ++it;
+            }
+        }
+        for (auto &c : victims)
+        {
+            if (reapedOut)
+                reapedOut->push_back(c->peerId);
+            teardown(c.get());
+        }
+        return (int)victims.size();
+    }
+
 private:
     struct Conn
     {
@@ -236,7 +336,20 @@ private:
         bool readyFired = false;
         std::atomic<bool> attached{ false };
         std::vector<std::pair<std::string, std::string>> iceQueue; // (candidate, mid) before remote set
+        std::chrono::steady_clock::time_point created = std::chrono::steady_clock::now();
+        std::string offerUfrag; // ICE ufrag of the offer generation this conn answers
     };
+
+    // First "a=ice-ufrag:" line of an SDP -- the per-RTCPeerConnection identity.
+    static std::string sdpUfrag(const std::string &sdp)
+    {
+        auto p = sdp.find("a=ice-ufrag:");
+        if (p == std::string::npos)
+            return sdp.substr(0, 96); // malformed: fall back to a prefix identity
+        p += 12;
+        auto e = sdp.find_first_of("\r\n", p);
+        return sdp.substr(p, e == std::string::npos ? std::string::npos : e - p);
+    }
 
     static bool anyChannelOpen(Conn *c)
     {
@@ -260,45 +373,86 @@ private:
             return it->second.get();
         auto c = std::make_shared<Conn>();
         c->peerId = peerId;
-        c->pc = std::make_shared<rtc::PeerConnection>(config_);
+        try
+        {
+            c->pc = std::make_shared<rtc::PeerConnection>(config_);
+        }
+        catch (const std::exception &e)
+        {
+            printf("[nnet] peer pool: PeerConnection create FAILED for %.8s: %s\n", peerId.c_str(), e.what());
+            return nullptr; // no map entry: a retry after the reaper runs can succeed
+        }
+        catch (...)
+        {
+            printf("[nnet] peer pool: PeerConnection create FAILED for %.8s\n", peerId.c_str());
+            return nullptr;
+        }
         conns_[peerId] = c;
-        wirePc(c.get());
+        wirePc(c);
         return c.get();
     }
 
-    void wirePc(Conn *c)
+    // Every callback binds to ITS OWN Conn via weak_ptr (strong would cycle:
+    // pc owns callback owns pc). NEVER key callbacks by peerId alone: after a
+    // re-offer retirement the id belongs to a fresh replacement, and a stale
+    // conn's late callbacks must not touch it (reap it, reset its channels).
+    void wirePc(const std::shared_ptr<Conn> &c)
     {
         std::string peerId = c->peerId;
         PeerManager *self = this;
         rtc::PeerConnection *pc = c->pc.get();
+        std::weak_ptr<Conn> wc = c;
 
-        c->pc->onGatheringStateChange([self, peerId, pc](rtc::PeerConnection::GatheringState state) {
+        c->pc->onGatheringStateChange([self, peerId, pc, wc](rtc::PeerConnection::GatheringState state) {
             if (state != rtc::PeerConnection::GatheringState::Complete)
                 return;
             auto desc = pc->localDescription();
             if (!desc || !self->sendSdp)
                 return;
             bool isOffer = desc->typeString() == "offer";
+            std::string gen;
             if (!isOffer)
-                self->markAnswered(peerId);
-            self->sendSdp(peerId, std::string(desc->generateSdp()), isOffer);
+            {
+                if (auto sc = wc.lock())
+                {
+                    std::lock_guard<std::mutex> lk(self->mtx_);
+                    sc->answered = true;
+                    gen = sc->offerUfrag;
+                }
+            }
+            self->sendSdp(peerId, std::string(desc->generateSdp()), isOffer, gen);
         });
         c->pc->onLocalCandidate([self, peerId](rtc::Candidate cand) {
             if (self->sendIce)
                 self->sendIce(peerId, std::string(cand.candidate()), std::string(cand.mid()));
         });
-        c->pc->onStateChange([self, peerId](rtc::PeerConnection::State state) {
+        c->pc->onStateChange([self, peerId, wc](rtc::PeerConnection::State state) {
             bool connected = state == rtc::PeerConnection::State::Connected;
+            if (state == rtc::PeerConnection::State::Failed || state == rtc::PeerConnection::State::Closed)
+            {
+                // Queue THIS conn for the game-thread reaper; never tear down
+                // from here (destroying the pc inside its own callback
+                // deadlocks libdatachannel).
+                if (auto sc = wc.lock())
+                {
+                    std::lock_guard<std::mutex> lk(self->mtx_);
+                    self->reapConns_.push_back(sc);
+                }
+            }
             if (self->onConnectionChange)
                 self->onConnectionChange(peerId, connected);
         });
         // Answerer receives the offerer's channels here.
-        c->pc->onDataChannel([self, peerId](std::shared_ptr<rtc::DataChannel> dc) {
-            self->setupDc(peerId, dc);
+        c->pc->onDataChannel([self, wc](std::shared_ptr<rtc::DataChannel> dc) {
+            if (auto sc = wc.lock())
+            {
+                std::lock_guard<std::mutex> lk(self->mtx_);
+                self->setupDcLocked(sc, dc);
+            }
         });
     }
 
-    void createOffer(const std::string &peerId, Conn *c) // caller holds mtx_
+    void createOffer(const std::shared_ptr<Conn> &c) // caller holds mtx_
     {
         // Offerer creates all three channels synchronously so they ride in one offer.
         for (int ch = 0; ch < CH_MAX; ch++)
@@ -320,24 +474,7 @@ private:
         // gathering-complete -> onGatheringStateChange sends the self-contained offer
     }
 
-    void markAnswered(const std::string &peerId)
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = conns_.find(peerId);
-        if (it != conns_.end())
-            it->second->answered = true;
-    }
-
-    void setupDc(const std::string &peerId, std::shared_ptr<rtc::DataChannel> dc)
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = conns_.find(peerId);
-        if (it == conns_.end())
-            return;
-        setupDcLocked(it->second.get(), dc);
-    }
-
-    void setupDcLocked(Conn *c, std::shared_ptr<rtc::DataChannel> dc) // caller holds mtx_
+    void setupDcLocked(const std::shared_ptr<Conn> &c, std::shared_ptr<rtc::DataChannel> dc) // caller holds mtx_
     {
         int ch = dcChannel(dc->label());
         if (ch < 0)
@@ -348,9 +485,10 @@ private:
         c->dc[ch] = dc;
         std::string peerId = c->peerId;
         PeerManager *self = this;
+        std::weak_ptr<Conn> wc = c;
 
-        dc->onOpen([self, peerId]() { self->onDcOpen(peerId); });
-        dc->onMessage([self, peerId, ch](rtc::message_variant data) {
+        dc->onOpen([self, peerId, wc]() { self->onDcOpen(peerId, wc); });
+        dc->onMessage([self, peerId, wc, ch](rtc::message_variant data) {
             if (std::holds_alternative<std::string>(data))
             {
                 // Strings are ALWAYS control (netcode frames are binary), safe even
@@ -361,23 +499,26 @@ private:
             }
             const auto &bin = std::get<rtc::binary>(data);
             const uint8_t *p = reinterpret_cast<const uint8_t *>(bin.data());
-            self->onDcBinary(peerId, ch, p, bin.size());
+            self->onDcBinary(peerId, wc, ch, p, bin.size());
         });
-        dc->onClosed([self, peerId, ch]() { self->onDcClosed(peerId, ch); });
+        dc->onClosed([self, wc, ch]() {
+            if (auto sc = wc.lock())
+            {
+                std::lock_guard<std::mutex> lk(self->mtx_);
+                sc->dc[ch].reset();
+            }
+        });
     }
 
-    void onDcOpen(const std::string &peerId)
+    void onDcOpen(const std::string &peerId, const std::weak_ptr<Conn> &wc)
     {
         bool ready = false;
+        if (auto sc = wc.lock())
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            auto it = conns_.find(peerId);
-            if (it == conns_.end())
-                return;
-            Conn *c = it->second.get();
-            if (!c->readyFired && allChannelsOpen(c))
+            if (!sc->readyFired && allChannelsOpen(sc.get()))
             {
-                c->readyFired = true;
+                sc->readyFired = true;
                 ready = true;
             }
         }
@@ -385,16 +526,12 @@ private:
             onChannelsReady(peerId);
     }
 
-    void onDcBinary(const std::string &peerId, int ch, const uint8_t *p, size_t len)
+    void onDcBinary(const std::string &peerId, const std::weak_ptr<Conn> &wc, int ch, const uint8_t *p, size_t len)
     {
-        bool attached = false;
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            auto it = conns_.find(peerId);
-            if (it == conns_.end())
-                return;
-            attached = it->second->attached.load();
-        }
+        auto sc = wc.lock();
+        if (!sc)
+            return;
+        bool const attached = sc->attached.load();
         if (attached)
         {
             if (onNetFrame)
@@ -402,14 +539,6 @@ private:
         }
         else if (ch == CH_BULK && onBulkChunk)
             onBulkChunk(peerId, p, len);
-    }
-
-    void onDcClosed(const std::string &peerId, int ch)
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = conns_.find(peerId);
-        if (it != conns_.end())
-            it->second->dc[ch].reset();
     }
 
     void flushIce(Conn *c) // caller holds mtx_
@@ -432,6 +561,9 @@ private:
     rtc::Configuration config_;
     std::mutex mtx_;
     std::map<std::string, std::shared_ptr<Conn>> conns_;
+    std::vector<std::shared_ptr<Conn>> reapConns_; // conns whose pc hit Failed/Closed; drained by reapDead()
+    std::vector<std::shared_ptr<Conn>> retired_;   // conns replaced by re-offers; torn down by reapDead()
+    std::map<std::string, std::vector<std::string>> seenOfferUfrags_; // peerId -> answered offer generations
 };
 
 } // namespace nn

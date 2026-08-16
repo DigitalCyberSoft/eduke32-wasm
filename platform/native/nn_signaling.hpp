@@ -33,10 +33,17 @@ static const char *PUBLIC_LOBBY_KEY = "MqBAIxP3Lwawq+18BL1KSjAdlTxfVtoERfmgszaEK
 
 inline int64_t nowMs() { return (int64_t)nowSec() * 1000; }
 
-inline std::string buildSdpMsg(const std::string &from, const std::string &to, const std::string &sdp, bool isOffer)
+// `gen` (answers only, optional): the ICE ufrag of the OFFER this answer pairs
+// with. Relays redeliver old signaling for minutes; without pairing, a
+// redelivered stale answer can beat the real one to a reconnecting offerer's
+// fresh pc and poison it (wrong ufrag/DTLS fingerprint -> channels never open).
+// Optional JSON field: old receivers ignore it, old senders omit it.
+inline std::string buildSdpMsg(const std::string &from, const std::string &to, const std::string &sdp, bool isOffer,
+                               const std::string &gen = std::string())
 {
     return "{\"type\":" + jsonStr(isOffer ? "offer" : "answer") + ",\"from\":" + jsonStr(from) + ",\"to\":" + jsonStr(to) +
-           ",\"sdp\":" + jsonStr(sdp) + ",\"ts\":" + std::to_string(nowMs()) + "}";
+           ",\"sdp\":" + jsonStr(sdp) + (gen.empty() ? std::string() : ",\"gen\":" + jsonStr(gen)) +
+           ",\"ts\":" + std::to_string(nowMs()) + "}";
 }
 
 inline std::string buildIceMsg(const std::string &from, const std::string &to, const std::string &cand, const std::string &mid)
@@ -62,6 +69,7 @@ struct SignalMsg
     std::string candidate;
     std::string sdpMid;
     std::string name;
+    std::string gen;    // answers: ufrag of the offer generation being answered
     bool host = false;  // presence: is the sender the match host?
 };
 
@@ -83,6 +91,7 @@ inline bool parseSignal(sjson_context *ctx, const std::string &json, SignalMsg &
     out.candidate = get("candidate");
     out.sdpMid = get("sdpMid");
     out.name = get("name");
+    out.gen = get("gen");
     out.host = sjson_get_bool(root, "host", false);
     return true;
 }

@@ -387,6 +387,16 @@ public:
     // ── seam: net_poll drains to the netcode (game thread) ───────────────────
     void poll()
     {
+        // Free dead peer connections (ICE timeouts, crashed tabs, abandoned
+        // joins) so the pinned UDP port pool never exhausts -- the safe place
+        // to destroy pcs (never from their own callbacks).
+        if (pm_)
+        {
+            std::vector<std::string> reaped;
+            if (pm_->reapDead(&reaped) > 0)
+                for (auto &id : reaped)
+                    printf("[nnet] reaped dead peer %.8s (port freed)\n", id.c_str());
+        }
         std::deque<InboundItem> batch;
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -496,8 +506,10 @@ private:
 
     void wire()
     {
-        pm_->sendSdp = [this](const std::string &to, const std::string &sdp, bool isOffer) {
-            nostr_->publishEphemeral(SIGNALING_KIND, roomKey_, buildSdpMsg(myDeviceId_, to, sdp, isOffer));
+        pm_->sendSdp = [this](const std::string &to, const std::string &sdp, bool isOffer, const std::string &gen) {
+            if (!isOffer)
+                printf("[nnet] answer -> %.8s\n", to.c_str());
+            nostr_->publishEphemeral(SIGNALING_KIND, roomKey_, buildSdpMsg(myDeviceId_, to, sdp, isOffer, gen));
         };
         pm_->sendIce = [this](const std::string &to, const std::string &cand, const std::string &mid) {
             nostr_->publishEphemeral(SIGNALING_KIND, roomKey_, buildIceMsg(myDeviceId_, to, cand, mid));
@@ -585,12 +597,31 @@ private:
         }
         if (m.to != myDeviceId_)
             return;
-        if (m.type == "offer")
-            pm_->handleOffer(m.from, m.sdp);
-        else if (m.type == "answer")
-            pm_->handleAnswer(m.from, m.sdp);
-        else if (m.type == "ice")
-            pm_->addIce(m.from, m.candidate, m.sdpMid);
+        // The receive path must SURVIVE anything a handler throws -- a dead
+        // dispatch means a host that announces but never answers (the silent
+        // wedge shape). And log offer receipt: the 2026-08-15 deafness was
+        // invisible precisely because inbound offers left no trace.
+        try
+        {
+            if (m.type == "offer")
+            {
+                printf("[nnet] offer from %.8s\n", m.from.c_str());
+                pm_->handleOffer(m.from, m.sdp);
+            }
+            else if (m.type == "answer")
+                pm_->handleAnswer(m.from, m.sdp, m.gen);
+            else if (m.type == "ice")
+                pm_->addIce(m.from, m.candidate, m.sdpMid);
+        }
+        catch (const std::exception &e)
+        {
+            nnlog(std::string("signaling dispatch caught: ") + e.what());
+            printf("[nnet] signaling dispatch caught: %s\n", e.what());
+        }
+        catch (...)
+        {
+            nnlog("signaling dispatch caught unknown exception");
+        }
     }
 
     void onChannelsReady(const std::string &peer)
