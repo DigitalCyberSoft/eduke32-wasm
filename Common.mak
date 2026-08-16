@@ -562,7 +562,15 @@ ASFORMAT := elf$(BITS)
 ifeq ($(PLATFORM),WINDOWS)
     WINDOWS_MAJOR := 6
     WINDOWS_MINOR := 1
-    LINKERFLAGS += -static -Wl,-subsystem,windows:$(WINDOWS_MAJOR).$(WINDOWS_MINOR),--major-os-version,$(WINDOWS_MAJOR),--minor-os-version,$(WINDOWS_MINOR)
+    # NETNATIVE keeps the Windows link dynamic: the source-built transport deps
+    # (libdatachannel, libsecp256k1) install import libs only, and a -static
+    # link searches .a archives exclusively -- "cannot find -ldatachannel" with
+    # the .dll.a sitting right in /mingw64/lib. The CI package step bundles the
+    # DLLs (deps + mingw runtime via ldd). Classic builds stay fully static.
+    ifneq (1,$(NETNATIVE))
+        LINKERFLAGS += -static
+    endif
+    LINKERFLAGS += -Wl,-subsystem,windows:$(WINDOWS_MAJOR).$(WINDOWS_MINOR),--major-os-version,$(WINDOWS_MAJOR),--minor-os-version,$(WINDOWS_MINOR)
     COMPILERFLAGS += -DUNDERSCORES
     ASFORMAT := win$(BITS)
     ASFLAGS += -DUNDERSCORES
