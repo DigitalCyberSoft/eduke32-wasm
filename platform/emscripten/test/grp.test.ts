@@ -178,6 +178,35 @@ describe("GRP transfer — firewall on send, HASH-BEFORE-USE on receive", () => 
     expect(recv.accept(0, new Uint8Array(64))).toBe(true);
     expect(recv.accept(0, new Uint8Array(64))).toBe(false); // duplicate
   });
+
+  it("resume: contiguousCount is the exact restart point and the tail completes + verifies", async () => {
+    // A partial receiver that lost its connection after N chunks (ordered channel
+    // => the survivor holds exactly a contiguous prefix). A resumed stream from
+    // contiguousCount() must complete to a verifying transfer.
+    const bytes = pattern(GRP_CHUNK_SIZE * 5 + 123);
+    const { offer, chunk } = await offerFor(bytes);
+    const recv = new GrpReceiver(offer);
+    expect(recv.contiguousCount()).toBe(0);
+    for (let i = 0; i < 3; i++) recv.accept(i, chunk(i)); // then the channel died
+    expect(recv.contiguousCount()).toBe(3);
+    expect(recv.complete).toBe(false);
+    for (let i = recv.contiguousCount(); i < offer.nchunks; i++) recv.accept(i, chunk(i)); // host resumes at 3
+    expect(recv.contiguousCount()).toBe(offer.nchunks);
+    expect(recv.complete).toBe(true);
+    const out = await recv.verify();
+    expect(out).not.toBeNull();
+    expect(recv.state).toBe("verified");
+  });
+
+  it("resume: progress reflects the surviving prefix (no restart from 0%)", async () => {
+    const bytes = pattern(GRP_CHUNK_SIZE * 4);
+    const { offer, chunk } = await offerFor(bytes);
+    const recv = new GrpReceiver(offer);
+    recv.accept(0, chunk(0));
+    recv.accept(1, chunk(1));
+    expect(recv.progress).toBeCloseTo(0.5);
+    expect(recv.contiguousCount()).toBe(2);
+  });
 });
 
 describe("startup selector model", () => {

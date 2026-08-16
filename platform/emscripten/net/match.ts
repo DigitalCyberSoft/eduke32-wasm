@@ -346,7 +346,7 @@ export class Match {
           // Guests still answer only the host (STAR).
           if (this.role === "host" || this._acceptsPeer(from)) void this.peers.handleOffer(from, sdp, this.roomKey, this.relays);
         },
-        onAnswer: (from, sdp) => void this.peers.handleAnswer(from, sdp),
+        onAnswer: (from, sdp, gen) => void this.peers.handleAnswer(from, sdp, gen),
         onIce: (from, c) => void this.peers.addIceCandidate(from, c),
         onPresence: (from, name) => this._onPresence(from, name),
       },
@@ -414,7 +414,21 @@ export class Match {
       // (live-reported "1. DUKE (CONNECTING)"). The host evicts it after
       // CONNECT_TIMEOUT_MS; if the peer is really there its presence re-adds it
       // and the connect gets a fresh start.
-      else if (this.role === "host" && !this.peers.isConnected(id) && p.firstSeen < connectCutoff) {
+      //
+      // ONLY conns that never completed a handshake, and only by the CURRENT
+      // pc's age. The old check (`!isConnected && firstSeen old`) also killed
+      // once-connected peers whose pc was in a transient "disconnected" flap —
+      // which is exactly the state a link saturated by a GRP transfer sits in —
+      // so every slow download died at the 60s mark (live-reported at 64-68%
+      // of the shareware GRP). A once-ready conn's lifecycle belongs to the
+      // failed/closed path, never to this eviction.
+      else if (
+        this.role === "host" &&
+        !this.peers.isConnected(id) &&
+        !this.peers.everReady(id) &&
+        this.peers.connAgeMs(id) > CONNECT_TIMEOUT_MS &&
+        p.firstSeen < connectCutoff
+      ) {
         console.log(`[dnet] dropping ${id.slice(0, 8)}: no WebRTC connection after ${Math.round(CONNECT_TIMEOUT_MS / 1000)}s`);
         this.peers.close(id);
         this.roster.delete(id);

@@ -12,13 +12,13 @@ import { publishEphemeral, subscribeEphemeral } from "./nostr";
 
 type SignalMsg =
   | { type: "offer"; from: string; to: string; sdp?: string; ts: number }
-  | { type: "answer"; from: string; to: string; sdp?: string; ts: number }
+  | { type: "answer"; from: string; to: string; sdp?: string; gen?: string; ts: number }
   | { type: "ice"; from: string; to: string; candidate: string; sdpMid: string | null; sdpMLineIndex: number | null; ts: number }
   | { type: "presence"; from: string; name: string; ts: number };
 
 export interface SignalingHandlers {
   onOffer?: (from: string, sdp: RTCSessionDescriptionInit) => void;
-  onAnswer?: (from: string, sdp: RTCSessionDescriptionInit) => void;
+  onAnswer?: (from: string, sdp: RTCSessionDescriptionInit, gen?: string) => void;
   onIce?: (from: string, candidate: RTCIceCandidateInit) => void;
   onPresence?: (from: string, name: string, ts: number) => void;
 }
@@ -27,8 +27,12 @@ export async function sendOffer(encKey: string, to: string, offer: RTCSessionDes
   await publishEphemeral(SIGNALING_KIND, encKey, { type: "offer", from: DEVICE_ID, to, sdp: offer.sdp, ts: Date.now() }, relays);
 }
 
-export async function sendAnswer(encKey: string, to: string, answer: RTCSessionDescriptionInit, relays: readonly string[]): Promise<void> {
-  await publishEphemeral(SIGNALING_KIND, encKey, { type: "answer", from: DEVICE_ID, to, sdp: answer.sdp, ts: Date.now() }, relays);
+// `gen`: ufrag of the OFFER this answer pairs with. Relays redeliver stale
+// signaling for minutes; unpaired, an old session's answer can beat the real
+// one to a reconnecting offerer's fresh pc and poison it (wrong DTLS
+// fingerprint -> channels never open). Optional field: old peers ignore it.
+export async function sendAnswer(encKey: string, to: string, answer: RTCSessionDescriptionInit, relays: readonly string[], gen?: string): Promise<void> {
+  await publishEphemeral(SIGNALING_KIND, encKey, { type: "answer", from: DEVICE_ID, to, sdp: answer.sdp, gen, ts: Date.now() }, relays);
 }
 
 export async function sendIceCandidate(encKey: string, to: string, c: RTCIceCandidate, relays: readonly string[]): Promise<void> {
@@ -55,7 +59,7 @@ export async function subscribeSignaling(encKey: string, handlers: SignalingHand
           if (msg.to === DEVICE_ID) handlers.onOffer?.(msg.from, { type: "offer", sdp: msg.sdp });
           break;
         case "answer":
-          if (msg.to === DEVICE_ID) handlers.onAnswer?.(msg.from, { type: "answer", sdp: msg.sdp });
+          if (msg.to === DEVICE_ID) handlers.onAnswer?.(msg.from, { type: "answer", sdp: msg.sdp }, msg.gen);
           break;
         case "ice":
           if (msg.to === DEVICE_ID)

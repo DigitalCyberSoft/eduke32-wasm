@@ -179,16 +179,40 @@
   } catch (e) {}
 
   // --- eduke32-net addition ---------------------------------------------------
-  // Relaunch on a previously DOWNLOADED GRP (see window.DukeNet GRP transfer). The
-  // player's persisted choice is localStorage['eduke32-net-gamegrp'] = {crc,filename};
-  // absent => normal boot (bundled shareware), so this is a strict no-op for the
-  // common case. Reads the verified GRP bytes straight from the same IndexedDB the
-  // transport wrote them to (no dependency on the deferred net module being loaded
-  // yet), writes them into FS, and appends -gamegrp. Fails safe to a normal boot.
+  // Boot-GRP choice from the net layer. TWO sources, transient first:
+  //   sessionStorage['eduke32-net-gamegrp-session'] — written by a join-driven
+  //     switch/download just before its reload; session-scoped so joining a
+  //     shareware match never permanently changes the player's own game.
+  //   localStorage['eduke32-net-gamegrp'] — the durable choice (legacy installs);
+  //     cleared whenever the Settings panel picks/clears a main game, so a stale
+  //     one can no longer shadow the player's real selection forever.
+  // Shapes: {crc,filename} = boot the verified GRP from eduke32-net IDB;
+  //         {crc,filename,builtin:1} = boot a GRP already in the page bundle;
+  //         {main:1} = boot the registered import (defer to e32RestoreMainGrp).
+  function e32NetGrpChoice() {
+    var c = null;
+    try { c = JSON.parse(sessionStorage.getItem('eduke32-net-gamegrp-session') || 'null'); } catch (e) { c = null; }
+    if (!c) { try { c = JSON.parse(localStorage.getItem('eduke32-net-gamegrp') || 'null'); } catch (e) { c = null; } }
+    if (!c) return null;
+    if (c.main) return { main: true };
+    if (typeof c.crc === 'number') return c;
+    return null;
+  }
+  // Relaunch on a switch/download choice (see window.DukeNet GRP transfer). Absent
+  // choice => normal boot (bundled shareware / registered import), so this is a
+  // strict no-op for the common case. Reads the verified GRP bytes straight from
+  // the same IndexedDB the transport wrote them to (no dependency on the deferred
+  // net module being loaded yet), writes them into FS, and appends -gamegrp.
+  // Fails safe to a normal boot.
   function applyNetGrpChoice() {
-    var choice;
-    try { choice = JSON.parse(localStorage.getItem('eduke32-net-gamegrp') || 'null'); } catch (e) { choice = null; }
-    if (!choice || typeof choice.crc !== 'number') return;
+    var choice = e32NetGrpChoice();
+    if (!choice || choice.main) return; // none, or deferring to the registered import
+    if (choice.builtin && choice.filename) {
+      // Already shipped inside the page's preloaded FS (e.g. the shareware
+      // /DUKE3D.GRP): nothing to restore, just select it.
+      Module.arguments.push('-gamegrp', String(choice.filename));
+      return;
+    }
     if (typeof indexedDB === 'undefined' || !Module.FS || !Module.addRunDependency) return;
     Module.addRunDependency('duke-net-grp');
     var done = function () { try { Module.removeRunDependency('duke-net-grp'); } catch (e) {} };
@@ -378,6 +402,7 @@
         t.oncomplete = function () {
           try { db.close(); } catch (e) {}
           try { localStorage.setItem('eduke32/mainGrp', JSON.stringify({ crc: crc >>> 0, size: bytes.length, name: name })); } catch (e) {}
+          e32ClearNetGrpChoice(); // a deliberate Settings choice overrides any net switch
           cb && cb(null);
         };
         t.onerror = function () { try { db.close(); } catch (e) {} cb && cb(t.error || new Error('put failed')); };
@@ -385,9 +410,17 @@
     }, function (e) { cb && cb(e || new Error('idb unavailable')); });
   }
 
+  // Drop any net-layer boot-GRP choice (durable + session). Without this a stale
+  // choice outranked the Settings selection FOREVER (nothing ever cleared it).
+  function e32ClearNetGrpChoice() {
+    try { localStorage.removeItem('eduke32-net-gamegrp'); } catch (e) {}
+    try { sessionStorage.removeItem('eduke32-net-gamegrp-session'); } catch (e) {}
+  }
+
   // Forget the preferred main GRP -> next boot falls back to bundled shareware.
   function e32ClearMainGrp(cb) {
     try { localStorage.removeItem('eduke32/mainGrp'); } catch (e) {}
+    e32ClearNetGrpChoice();
     e32OpenUserDb(function (db) {
       try {
         var t = db.transaction('main', 'readwrite');
@@ -407,7 +440,10 @@
     var marker = null;
     try { marker = JSON.parse(localStorage.getItem('eduke32/mainGrp') || 'null'); } catch (e) { marker = null; }
     if (!marker) return;
-    try { var nc = JSON.parse(localStorage.getItem('eduke32-net-gamegrp') || 'null'); if (nc && typeof nc.crc === 'number') return; } catch (e) {}
+    // An active net choice owns the boot — EXCEPT {main:1}, which is the net
+    // layer explicitly asking for this registered import (join-driven switch).
+    var nc = e32NetGrpChoice();
+    if (nc && !nc.main) return;
     if (typeof indexedDB === 'undefined' || !Module.FS || !Module.addRunDependency) return;
     Module.addRunDependency('e32-maingrp');
     var fired = false;
@@ -448,7 +484,8 @@
     if (typeof indexedDB === 'undefined' || !Module.FS || !Module.addRunDependency) return;
     var hasMain = false;
     try { hasMain = !!JSON.parse(localStorage.getItem('eduke32/mainGrp') || 'null'); } catch (e) {}
-    try { var nc = JSON.parse(localStorage.getItem('eduke32-net-gamegrp') || 'null'); if (nc && typeof nc.crc === 'number') hasMain = true; } catch (e) {}
+    var nc = e32NetGrpChoice();
+    if (nc && !nc.main) hasMain = true;
     Module.addRunDependency('e32-userdata');
     var fired = false;
     var done = function () { if (fired) return; fired = true; try { Module.removeRunDependency('e32-userdata'); } catch (e) {} };

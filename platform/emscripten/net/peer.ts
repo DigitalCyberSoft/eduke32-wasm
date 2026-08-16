@@ -21,6 +21,13 @@ import { rtcConfig, DC_INIT, DC_LABELS, CHANNEL_TO_LABEL, type DcLabel } from ".
 import { DEVICE_ID } from "./identity";
 import { sendOffer, sendAnswer, sendIceCandidate } from "./signaling";
 
+/** First a=ice-ufrag of an SDP — the per-RTCPeerConnection generation identity. */
+function sdpUfrag(sdp: string | undefined): string {
+  if (!sdp) return "";
+  const m = /a=ice-ufrag:([^\r\n]+)/.exec(sdp);
+  return m ? m[1] : sdp.slice(0, 96);
+}
+
 const MAX_BACKOFF_MS = 60_000;
 // Non-trickle resend: a lost ephemeral offer/answer on a public relay would otherwise
 // stall the handshake until ICE times out (~30 s). Wait for ICE gathering so the SDP
@@ -28,6 +35,23 @@ const MAX_BACKOFF_MS = 60_000;
 // until a channel opens. Reproduced + verified in test/net (LOSS=0.6).
 const RESEND_INTERVAL_MS = 1200;
 const RESEND_MAX = 12; // ~14 s of resends before deferring to _scheduleReconnect
+// "disconnected" is TRANSIENT by spec: ICE consent blips under load (a saturating
+// GRP transfer bufferbloats the uplink and delays STUN checks) flip a healthy pc
+// to "disconnected" for a few seconds and back. Acting on it immediately killed
+// recoverable connections — live-reported as GRP downloads dying ~60s in. Only
+// after this grace (still disconnected) is the pc treated as failed.
+//
+// 45s, NOT ~10: a slow machine loading the next map stalls WHOLE-SYSTEM (CPU +
+// swap), starving even its network process — consent lapses for the entire
+// load and the fast side flaps to "disconnected" (live-reported: the faster
+// machine dropped the session before the slow host finished loading a map).
+// Chrome escalates a genuinely dead pc to "failed" on its own after ~30s of
+// continuous outage, so true deaths surface BEFORE this timer; the synthetic
+// escalation only reaps pcs stuck in "disconnected" forever, and being more
+// trigger-happy than Chrome here only ever kills recoverable sessions. In-game
+// responsiveness does not come from this timer either way — the engine's own
+// silence axes (10s, MODE_GAME-gated) own that.
+const DISCONNECTED_GRACE_MS = 45_000;
 
 // Test-harness fault injection for the duke-move channel (see sendNet). Parsed
 // once; 0/absent = disabled (the production default).
@@ -56,12 +80,20 @@ interface Conn {
   readyFired: boolean; // onChannelsReady emitted once all 3 channels opened
   resendTimer: ReturnType<typeof setInterval> | null; // periodic offer/answer resend until connected
   lastHeard: number;
+  created: number; // pc birth (drives the never-connected eviction in match._prune)
+  offerUfrag: string; // ice-ufrag of the remote OFFER we answered ("" = we offered)
+  discoTimer: ReturnType<typeof setTimeout> | null; // "disconnected" grace escalation
 }
 
 export type ConnState = RTCPeerConnectionState;
 
 export class PeerManager {
   private _conns = new Map<string, Conn>();
+  /** Offer ufrags already negotiated per peer. A relay can redeliver a superseded
+   *  generation's offer for minutes; answering it would resurrect a dead session
+   *  over a live one. Survives conn replacement (that is the point); cleared only
+   *  on a deliberate close(). Mirrors the native host's nn_peer seenOfferUfrags_. */
+  private _seenOfferUfrags = new Map<string, string[]>();
   /** Set by the owning Match: local-only matches build STUN-less peer connections
    *  (host candidates only -> same-network pairs only). See netconfig.rtcConfig. */
   localOnly = false;
@@ -80,7 +112,10 @@ export class PeerManager {
     const existing = this._conns.get(peerId);
     if (existing) {
       const s = existing.pc.connectionState;
-      if (s === "connected" || s === "connecting" || s === "new") return existing;
+      // "disconnected" is a recovering pc, not a dead one — destroying it here
+      // (this runs on every ~5s presence tick via connect()) was one of the
+      // mid-transfer killers. Only failed/closed conns get rebuilt.
+      if (s === "connected" || s === "connecting" || s === "new" || s === "disconnected") return existing;
       this._cleanup(peerId, false);
     }
     const pc = new RTCPeerConnection(rtcConfig(this.localOnly));
@@ -97,6 +132,9 @@ export class PeerManager {
       readyFired: false,
       resendTimer: null,
       lastHeard: Date.now(),
+      created: Date.now(),
+      offerUfrag: "",
+      discoTimer: null,
     };
     this._conns.set(peerId, conn);
 
@@ -106,9 +144,25 @@ export class PeerManager {
     pc.onconnectionstatechange = () => {
       const s = pc.connectionState;
       console.log(`[dnet] pc ${peerId.slice(0, 8)} connectionState=${s}`);
+      if (s === "disconnected") {
+        // Hold the flap back from upper layers and give ICE its recovery window;
+        // escalate to a real failure only if it sticks past the grace.
+        if (!conn.discoTimer)
+          conn.discoTimer = setTimeout(() => {
+            conn.discoTimer = null;
+            if (this._conns.get(peerId) !== conn) return; // replaced meanwhile
+            const now = conn.pc.connectionState;
+            if (now === "connected" || now === "connecting" || now === "new") return; // recovered
+            console.log(`[dnet] pc ${peerId.slice(0, 8)} disconnected > ${DISCONNECTED_GRACE_MS / 1000}s — treating as failed`);
+            this.onConnectionChange?.(peerId, "failed");
+            this._scheduleReconnect(peerId);
+          }, DISCONNECTED_GRACE_MS);
+        return;
+      }
+      if (conn.discoTimer) { clearTimeout(conn.discoTimer); conn.discoTimer = null; }
       this.onConnectionChange?.(peerId, s);
       if (s === "connected") conn.backoff = 2000;
-      else if (s === "failed" || s === "disconnected") this._scheduleReconnect(peerId);
+      else if (s === "failed") this._scheduleReconnect(peerId);
     };
     pc.oniceconnectionstatechange = () => console.log(`[dnet] pc ${peerId.slice(0, 8)} iceConnectionState=${pc.iceConnectionState}`);
     pc.ondatachannel = (e) => this._setupDc(peerId, e.channel);
@@ -195,6 +249,10 @@ export class PeerManager {
   private async _createOffer(peerId: string): Promise<void> {
     const conn = this._conns.get(peerId);
     if (!conn) return;
+    // Never renegotiate a live pair: a reconnect timer can fire after the pc
+    // recovered on its own (disconnected-grace), and a second channel set on the
+    // same pc wedges the handshake (see connect()).
+    if (conn.dcs.size > 0 || conn.pc.signalingState !== "stable" || conn.pc.connectionState === "connected") return;
     // The offerer creates all three channels in one SDP; the answerer receives them
     // via ondatachannel and matches by label.
     for (const label of DC_LABELS) this._setupDc(peerId, conn.pc.createDataChannel(label, DC_INIT[label]));
@@ -211,30 +269,64 @@ export class PeerManager {
   }
 
   async handleOffer(peerId: string, offer: RTCSessionDescriptionInit, encKey: string, relays: readonly string[]): Promise<void> {
-    const conn = this._ensure(peerId, encKey, relays);
-    // Duplicate offer (relay resent it, or our answer was the lost message): if we
-    // already answered, just re-send that answer rather than renegotiating.
-    if (conn.remoteDescSet && conn.pc.signalingState === "stable" && conn.pc.localDescription?.type === "answer") {
-      void sendAnswer(encKey, peerId, { type: "answer", sdp: conn.pc.localDescription.sdp }, relays).catch(() => {});
+    // Offer GENERATIONS, keyed by the offer's own ice-ufrag (mirrors the native
+    // host's nn_peer logic — the two sides must agree on this protocol):
+    //   * same ufrag we already answered  -> resend that answer, paired (gen) to
+    //     THE OFFER IT ANSWERS. The old code stamped the OLD answer with the NEW
+    //     offer's ufrag, defeating the receiver's staleness guard and poisoning
+    //     a reconnecting peer's fresh pc (wrong DTLS fingerprint, ~6s death loop).
+    //   * a previously-seen other ufrag   -> a relay redelivered a superseded
+    //     generation; answering would resurrect a dead session. Ignore.
+    //   * a never-seen ufrag on a conn we already negotiated -> the peer rebuilt
+    //     its pc (reload / reconnect). Retire ours, negotiate fresh.
+    const ufrag = sdpUfrag(offer.sdp);
+    const existing = this._conns.get(peerId);
+    if (existing && existing.remoteDescSet && ufrag === existing.offerUfrag) {
+      if (existing.pc.localDescription?.type === "answer")
+        void sendAnswer(encKey, peerId, { type: "answer", sdp: existing.pc.localDescription.sdp }, relays, existing.offerUfrag).catch(() => {});
       return;
     }
+    const seen = this._seenOfferUfrags.get(peerId) ?? [];
+    if (seen.includes(ufrag)) return; // superseded generation: never resurrect it
+    if (existing && existing.remoteDescSet) {
+      console.log(`[dnet] re-offer from ${peerId.slice(0, 8)}: retiring stale conn, negotiating fresh`);
+      this._cleanup(peerId, true);
+      this.onConnectionChange?.(peerId, "closed"); // upstream frees seat/slot state
+    }
+    const conn = this._ensure(peerId, encKey, relays);
     console.log(`[dnet] <- offer from ${peerId.slice(0, 8)}, answering`);
-    await conn.pc.setRemoteDescription(new RTCSessionDescription(offer));
-    conn.remoteDescSet = true;
-    await this._flushIce(peerId);
-    const answer = await conn.pc.createAnswer();
-    await conn.pc.setLocalDescription(answer);
-    await this._awaitIceGathering(conn.pc);
-    const send = () =>
-      void sendAnswer(encKey, peerId, { type: "answer", sdp: conn.pc.localDescription?.sdp ?? answer.sdp }, relays).catch(() => {});
-    send();
-    this._armResend(peerId, send);
+    try {
+      await conn.pc.setRemoteDescription(new RTCSessionDescription(offer));
+      conn.remoteDescSet = true;
+      conn.offerUfrag = ufrag;
+      seen.push(ufrag);
+      if (seen.length > 32) seen.shift();
+      this._seenOfferUfrags.set(peerId, seen);
+      await this._flushIce(peerId);
+      const answer = await conn.pc.createAnswer();
+      await conn.pc.setLocalDescription(answer);
+      await this._awaitIceGathering(conn.pc);
+      const send = () =>
+        void sendAnswer(encKey, peerId, { type: "answer", sdp: conn.pc.localDescription?.sdp ?? answer.sdp }, relays, ufrag).catch(() => {});
+      send();
+      this._armResend(peerId, send);
+    } catch (e) {
+      // A malformed/mismatched SDP must never kill the signaling receive path.
+      console.log(`[dnet] handleOffer ${peerId.slice(0, 8)} failed: ${String(e)}`);
+    }
   }
 
-  async handleAnswer(peerId: string, answer: RTCSessionDescriptionInit): Promise<void> {
+  async handleAnswer(peerId: string, answer: RTCSessionDescriptionInit, gen?: string): Promise<void> {
     const conn = this._conns.get(peerId);
     if (!conn) return;
     if (conn.pc.signalingState === "stable") return; // duplicate answer (resend); already applied
+    // Generation pairing: relays redeliver old answers for minutes; an answer
+    // tagged for a different offer than ours belongs to a dead session and
+    // would poison this pc (wrong DTLS fingerprint -> channels never open).
+    if (gen && sdpUfrag(conn.pc.localDescription?.sdp) !== gen) {
+      console.log(`[dnet] <- stale answer from ${peerId.slice(0, 8)} (gen mismatch) — ignored`);
+      return;
+    }
     console.log(`[dnet] <- answer from ${peerId.slice(0, 8)}`);
     this._clearResend(peerId); // answer arrived; stop resending our offer
     await conn.pc.setRemoteDescription(new RTCSessionDescription(answer));
@@ -316,9 +408,15 @@ export class PeerManager {
     }
   }
 
-  /** JSON control message (pre-attach) over duke-rel. */
-  sendControl(peerId: string, msg: unknown): boolean {
-    const dc = this._dc(peerId, "duke-rel");
+  /** JSON control message (pre-attach) over duke-rel — or any channel: strings
+   *  are control on EVERY channel (see onmessage). GRP framing (grp_begin/end)
+   *  must ride duke-bulk WITH the chunks: separate SCTP streams are round-robin
+   *  scheduled, so a tiny control message on duke-rel OVERTAKES megabytes of
+   *  queued chunks — grp_end then reached the receiver mid-stream and the
+   *  transfer "failed verification" at whatever fraction had landed
+   *  (live-reported dying at 64-68%). Same-stream ordering ends that race. */
+  sendControl(peerId: string, msg: unknown, label: DcLabel = "duke-rel"): boolean {
+    const dc = this._dc(peerId, label);
     if (!dc) return false;
     try {
       dc.send(JSON.stringify(msg));
@@ -358,6 +456,20 @@ export class PeerManager {
     const conn = this._conns.get(peerId);
     if (!conn || !this.channelsReady(peerId)) return Infinity;
     return Date.now() - conn.lastHeard;
+  }
+
+  /** True if the CURRENT conn to this peer has ever had all three channels open.
+   *  Distinguishes "never completed a handshake" (evictable as stuck) from "was
+   *  connected, currently flapping" (recoverable — must NOT be evicted). */
+  everReady(peerId: string): boolean {
+    return this._conns.get(peerId)?.readyFired ?? false;
+  }
+
+  /** Age of the current conn's pc in ms (Infinity when no conn exists), for
+   *  never-connected eviction timers. A replacement conn restarts the clock. */
+  connAgeMs(peerId: string): number {
+    const conn = this._conns.get(peerId);
+    return conn ? Date.now() - conn.created : Infinity;
   }
 
   /** Resolve when ICE gathering completes (all candidates in the SDP) or a timeout, so
@@ -404,6 +516,11 @@ export class PeerManager {
     conn.backoff = Math.min(conn.backoff * 2, MAX_BACKOFF_MS);
     conn.reconnectTimer = setTimeout(() => {
       conn.reconnectTimer = null;
+      const cur = this._conns.get(peerId);
+      if (cur && cur.pc.connectionState === "connected") return; // recovered on its own
+      // A stuck-disconnected pc would be REUSED by _ensure (deliberately, see
+      // above) — but a reconnect needs a genuinely fresh pc, so retire it first.
+      if (cur) this._cleanup(peerId, true);
       this._ensure(peerId, conn.encKey, conn.relays);
       this._createOffer(peerId).catch(() => {});
     }, delay);
@@ -414,6 +531,7 @@ export class PeerManager {
     if (!conn) return;
     if (conn.reconnectTimer) clearTimeout(conn.reconnectTimer);
     if (conn.resendTimer) clearInterval(conn.resendTimer);
+    if (conn.discoTimer) clearTimeout(conn.discoTimer);
     for (const dc of conn.dcs.values())
       try {
         dc.close();
@@ -430,10 +548,12 @@ export class PeerManager {
 
   close(peerId: string): void {
     this._cleanup(peerId, true);
+    this._seenOfferUfrags.delete(peerId); // deliberate close: forget generations too
     this.onConnectionChange?.(peerId, "closed");
   }
 
   closeAll(): void {
     for (const id of [...this._conns.keys()]) this._cleanup(id, true);
+    this._seenOfferUfrags.clear();
   }
 }

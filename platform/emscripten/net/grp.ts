@@ -239,6 +239,15 @@ export class GrpReceiver {
     return this.got.every(Boolean);
   }
 
+  /** Number of LEADING chunks held (the resume point). duke-bulk is ordered, so
+   *  after a connection loss the receiver holds exactly a contiguous prefix; a
+   *  re-request asks the host to stream from here instead of restarting at 0. */
+  contiguousCount(): number {
+    let n = 0;
+    while (n < this.offer.nchunks && this.got[n]) n++;
+    return n;
+  }
+
   /**
    * Verify the assembled bytes against the offer's crc AND sha256. Only on success
    * are the bytes returned; otherwise state -> "failed" and null is returned. HASH

@@ -52,8 +52,8 @@ type Ctl =
   | { t: "join"; name: string; grp: GrpFingerprint }
   | { t: "join_ok"; yourSlot: number; hostSlot: number; name: string }
   | { t: "join_deny"; reason: "grpmismatch" | "full" | "closed" | "started"; hostGrp?: GrpFingerprint }
-  | { t: "grp_req" }
-  | { t: "grp_begin"; offer: GrpOffer }
+  | { t: "grp_req"; from?: number } // from = resume chunk index (optional; old hosts ignore it)
+  | { t: "grp_begin"; offer: GrpOffer; from?: number } // from echoes the actual start (absent = 0)
   | { t: "grp_end" }
   | { t: "grp_deny"; reason: "paid" | "optout" | "notplaying" | "mismatch" }
   | { t: "sav_begin"; size: number; mask: number; plc?: number; join?: number; spawns?: string }
@@ -64,13 +64,25 @@ type Ctl =
   | { t: "kick"; reason: string };
 
 // Persistence keys:
-//   GAMEGRP_KEY (localStorage): the player's CURRENT GRP choice {crc, filename}. A
-//     downloaded GRP sets it so the engine relaunches on that GRP and STAYS on it
-//     across restarts until the selector changes it. Absent => default shareware.
-//   REJOIN_KEY (sessionStorage): the match to auto-rejoin THIS session after a
-//     download+reload; transient so a later cold start returns to normal.
+//   SESSION_GRP_KEY (sessionStorage): the TRANSIENT boot-GRP override a join-driven
+//     switch/download writes before reloading. Shapes (read by index.html preRun):
+//       {crc, filename}             -> boot the verified GRP stored in eduke32-net IDB
+//       {crc, filename, builtin:1}  -> boot a GRP already bundled in Module.FS
+//       {main:1}                    -> boot the registered import (eduke32/mainGrp)
+//     Session-scoped ON PURPOSE: joining a shareware match must not permanently
+//     reset the player's chosen game — a later cold start boots their own choice.
+//   GAMEGRP_KEY (localStorage): the player's DURABLE GRP choice. No longer written
+//     by the join flow; still honored at boot (legacy installs / future selector)
+//     and cleared whenever the Settings panel picks a main game.
+//   REJOIN_KEY (sessionStorage): legacy; superseded by reloading into ?join=<blob>
+//     (consumePendingJoin still reads it for older pages).
+const SESSION_GRP_KEY = "eduke32-net-gamegrp-session";
 const GAMEGRP_KEY = "eduke32-net-gamegrp";
 const REJOIN_KEY = "eduke32-net-rejoin";
+// One switch-and-reload attempt per host GRP crc per session: if we reload
+// claiming to have the GRP and the host STILL denies us, the local copy is not
+// what we thought — fall through to a real download instead of reload-looping.
+const SWITCHTRY_KEY = "eduke32-net-switchtry";
 
 // Local-only matches boot a guest whose real data-channel RTT exceeds this. LAN is
 // <1 ms, same-region fiber <~20 ms; 30 ms keeps it "local/regional" without being so
@@ -125,7 +137,12 @@ class DukeNet {
   private grpRecv: GrpReceiver | null = null;
   private grpRecvIndex = 0;
   private grpRecvFrom: string | null = null;
+  private grpTailRetries = 0; // bounded grp_end-but-incomplete re-requests
   private pendingJoinInfo: MatchInfo | null = null; // the match we want after a download
+  // GRP send state (host side): one live stream per peer. A newer grp_req bumps the
+  // generation so the superseded loop stops — two loops interleaving chunks on the
+  // same ordered channel would scramble the receiver's arrival-order indexing.
+  private grpSendGen = new Map<string, number>();
 
   // The seam surface the js-library (seam_library.js) calls. Bound in ctor.
   readonly _seamSend = (peerToken: number, channel: number, reliable: number, bytes: Uint8Array) =>
@@ -513,10 +530,10 @@ class DukeNet {
         this.leave();
         break;
       case "grp_req":
-        this._hostHandleGrpReq(peerId);
+        this._hostHandleGrpReq(peerId, msg);
         break;
       case "grp_begin":
-        this._guestGrpBegin(peerId, msg.offer);
+        this._guestGrpBegin(peerId, msg.offer, msg.from ?? 0);
         break;
       case "grp_end":
         void this._guestGrpEnd(peerId);
@@ -661,6 +678,13 @@ class DukeNet {
     this.seam.enqueuePeerEventByDevice(peerId, true);
     this.pendingJoinInfo = null;
     clearRejoin();
+    // Seated: a future GRP switch (e.g. a different host later this session) must
+    // be allowed to try again, so the one-shot switch guard resets on success.
+    try {
+      sessionStorage.removeItem(SWITCHTRY_KEY);
+    } catch {
+      /* ignore */
+    }
     this.events.onJoined?.({ matchId: m.matchId, myConnectIndex: this.myConnectIndex });
     this.events.onStatus?.("Joined");
   }
@@ -670,15 +694,7 @@ class DukeNet {
     if (!m || peerId !== m.hostId) return;
     console.log(`[dnet] <- join_deny reason=${msg.reason}`);
     if (msg.reason === "grpmismatch" && msg.hostGrp) {
-      const cls = classifyByCrc(msg.hostGrp.mainGrp.crc);
-      if (cls.shareable) {
-        // We lack the host's GRP but it is shareable — ask for it (the host still
-        // enforces its own opt-out + the firewall before sending).
-        this.events.onStatus?.("Downloading the host's GRP…");
-        m.peers.sendControl(peerId, { t: "grp_req" } as Ctl);
-        return;
-      }
-      this.events.onError?.("This match needs a paid GRP you do not have.");
+      void this._resolveGrpMismatch(peerId, msg.hostGrp);
     } else if (msg.reason === "started") {
       // The match launched before our join completed. There is no mid-game join in
       // lockstep, so land back in Browse with an honest message instead of the old
@@ -690,9 +706,99 @@ class DukeNet {
     }
   }
 
+  // ── Guest: turn a grpmismatch deny into the cheapest path to the host's GRP ──
+
+  /** Order matters: (1) resume a surviving partial download; (2) find the host's
+   *  exact GRP ALREADY ON THIS MACHINE — the registered import, a previously
+   *  downloaded copy, or a GRP bundled in the page (every build ships shareware!)
+   *  — and switch to it with a reload instead of re-downloading megabytes we
+   *  have; (3) only then a real download (shareable GRPs only). Live-reported:
+   *  a guest owning the host's shareware GRP was forced through an 11 MB
+   *  download that its own connection then choked on. */
+  private async _resolveGrpMismatch(peerId: string, hostFp: GrpFingerprint): Promise<void> {
+    const m = this.match;
+    if (!m || peerId !== m.hostId) return;
+    const crc = hostFp.mainGrp.crc >>> 0;
+    const cls = classifyByCrc(crc);
+
+    const recv = this.grpRecv;
+    if (recv && this.grpRecvFrom === peerId && recv.state === "receiving" && (recv.offer.crc >>> 0) === crc) {
+      const from = recv.contiguousCount();
+      console.log(`[dnet] resuming GRP download at chunk ${from}/${recv.offer.nchunks}`);
+      this.events.onStatus?.("Resuming the GRP download…");
+      m.peers.sendControl(peerId, { t: "grp_req", from } as Ctl);
+      return;
+    }
+
+    // Local switch: single-GRP host sets only (a set with mods stacked cannot be
+    // reproduced by swapping the main GRP), once per crc per session (a second
+    // deny after a switch-reload means our local copy was NOT equivalent — fall
+    // through to the download instead of reload-looping). ?noswitch=1 is the
+    // test-harness override that forces the transfer path.
+    const single = (hostFp.labels?.length ?? 1) <= 1;
+    const tried = safeSessionGet(SWITCHTRY_KEY) === String(crc);
+    if (single && !tried && !noSwitchRequested()) {
+      const sw = await this._findLocalGrp(hostFp);
+      if (sw) {
+        safeSessionSet(SWITCHTRY_KEY, String(crc));
+        setSessionGrpChoice(sw);
+        console.log(`[dnet] host GRP found locally (${describeChoice(sw)}) — switching and rejoining`);
+        this.events.onStatus?.("You already have this game — switching and rejoining…");
+        reloadIntoMatch(this.pendingJoinInfo);
+        return;
+      }
+    }
+
+    if (cls.shareable) {
+      // We lack the host's GRP but it is shareable — ask for it (the host still
+      // enforces its own opt-out + the firewall before sending).
+      this.events.onStatus?.("Downloading the host's GRP…");
+      m.peers.sendControl(peerId, { t: "grp_req" } as Ctl);
+      return;
+    }
+    this.events.onError?.(
+      cls.known ? "This match needs a paid GRP you do not have." : "This match runs a GRP you do not have (not shareable).",
+    );
+  }
+
+  /** Search this machine for a GRP byte-identical to the host's main GRP. Returns
+   *  the session boot-choice that would launch it, or null. */
+  private async _findLocalGrp(hostFp: GrpFingerprint): Promise<SessionGrpChoice | null> {
+    const crc = hostFp.mainGrp.crc >>> 0;
+    const want = hostFp.mainGrp;
+    // The registered import (e.g. Atomic): its marker carries the crc, no IDB read.
+    try {
+      const marker = JSON.parse(safeLocalGet("eduke32/mainGrp") || "null") as { crc?: number } | null;
+      if (marker && typeof marker.crc === "number" && (marker.crc >>> 0) === crc) return { main: 1 };
+    } catch {
+      /* no marker */
+    }
+    // A previously downloaded copy (verified when stored; sha re-checked anyway).
+    const stored = await getGrp(crc);
+    if (stored && stored.sha256 === want.sha256 && stored.size === want.size) return { crc, filename: stored.filename };
+    // A GRP present in Module.FS (the bundled shareware, always shipped). Size
+    // prefilter first — hashing is 11 MB of work we only spend on a plausible hit.
+    const FS = (globalThis as unknown as { Module?: { FS?: EmscriptenFS } }).Module?.FS;
+    if (FS) {
+      for (const f of scanFsGrps(FS)) {
+        if (f.size !== want.size) continue;
+        if (/^_e32_main\.grp$/i.test(f.filename)) continue; // the import's slot — covered by the marker case
+        for (const p of ["/" + f.filename, "/data/" + f.filename]) {
+          try {
+            const fp = await fingerprintFsFile(FS, p);
+            if ((fp.crc >>> 0) === crc && fp.sha256 === want.sha256) return { crc, filename: f.filename, builtin: 1 };
+          } catch {
+            /* not at this path */
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   // ── Host: serve the single in-play GRP (firewall + opt-out enforced here) ───
 
-  private _hostHandleGrpReq(peerId: string): void {
+  private _hostHandleGrpReq(peerId: string, req?: { from?: number }): void {
     const m = this.match;
     if (!m || m.role !== "host") return;
     const fp = m.grpFingerprint();
@@ -706,41 +812,81 @@ class DukeNet {
       m.peers.sendControl(peerId, { t: "grp_deny", reason: prep.reason } as Ctl);
       return;
     }
-    m.peers.sendControl(peerId, { t: "grp_begin", offer: prep.offer } as Ctl);
-    void this._streamGrp(peerId, prep.offer, prep.chunk);
+    const from = Math.max(0, Math.min(prep.offer.nchunks, (req?.from ?? 0) | 0));
+    const gen = (this.grpSendGen.get(peerId) ?? 0) + 1;
+    this.grpSendGen.set(peerId, gen);
+    // grp_begin rides DUKE-BULK, in front of its own chunks: on a separate
+    // channel it can lose (or win) a cross-stream race against the chunk
+    // backlog. Same stream => begin < chunk 0 < ... < grp_end, always.
+    m.peers.sendControl(peerId, { t: "grp_begin", offer: prep.offer, from } as Ctl, "duke-bulk");
+    void this._streamGrp(peerId, prep.offer, prep.chunk, from, gen);
   }
 
   /** Stream chunks over duke-bulk with backpressure so a big transfer never wedges
    *  the channel. Ordered+reliable duke-bulk means the receiver can index by arrival
-   *  order (no per-chunk header). */
-  private async _streamGrp(peerId: string, offer: GrpOffer, chunk: (i: number) => Uint8Array): Promise<void> {
+   *  order (no per-chunk header). `from` resumes a partial transfer (the guest kept
+   *  its contiguous prefix across a reconnect). */
+  private async _streamGrp(peerId: string, offer: GrpOffer, chunk: (i: number) => Uint8Array, from = 0, gen = 0): Promise<void> {
     const m = this.match;
     if (!m) return;
-    const HIGH = 4 * 1024 * 1024; // pause if >4 MB buffered
-    for (let i = 0; i < offer.nchunks; i++) {
+    // Keep the standing queue SHALLOW: everything buffered here adds seconds of
+    // bufferbloat on a slow uplink, which delays ICE consent checks and flaps the
+    // pc into "disconnected" mid-transfer. 512 KB keeps the pipe full at any
+    // realistic rate (refilled every 20 ms) without drowning the STUN traffic.
+    const HIGH = 512 * 1024;
+    const superseded = () => gen !== 0 && this.grpSendGen.get(peerId) !== gen;
+    for (let i = from; i < offer.nchunks; i++) {
       while (m.peers.bulkBufferedAmount(peerId) > HIGH) {
         await sleep(20);
-        if (!this.match) return; // left mid-transfer
+        if (!this.match || superseded()) return; // left / newer request took over
       }
+      if (superseded()) return;
       if (!m.peers.sendBulkChunk(peerId, chunk(i))) return; // channel gone
       if ((i & 63) === 0) this.events.onGrpProgress?.(i / offer.nchunks, "Uploading GRP");
     }
-    m.peers.sendControl(peerId, { t: "grp_end" } as Ctl);
+    if (superseded()) return;
+    m.peers.sendControl(peerId, { t: "grp_end" } as Ctl, "duke-bulk"); // ordered AFTER the last chunk
     this.events.onGrpProgress?.(1, "Upload complete");
   }
 
   // ── Guest: receive + verify (HASH-BEFORE-USE) + persist + reload ────────────
 
-  private _guestGrpBegin(peerId: string, offer: GrpOffer): void {
+  private _guestGrpBegin(peerId: string, offer: GrpOffer, from = 0): void {
     // Only accept a GRP whose CRC is shareable — a second firewall on the RECEIVER,
     // so a malicious host cannot push paid/unknown content onto us.
     if (!classifyByCrc(offer.crc).shareable) {
       this.events.onError?.("Refused a non-shareable GRP offer.");
       return;
     }
+    // Resume: the host echoes the start chunk we asked for. Accept only if our
+    // surviving partial is EXACTLY the same offer and our contiguous prefix ends
+    // where the host will start — anything else gets a clean from-0 restart.
+    const prev = this.grpRecv;
+    if (from > 0) {
+      const resumable =
+        !!prev &&
+        this.grpRecvFrom === peerId &&
+        prev.state === "receiving" &&
+        (prev.offer.crc >>> 0) === (offer.crc >>> 0) &&
+        prev.offer.sha256 === offer.sha256 &&
+        prev.offer.size === offer.size &&
+        prev.offer.chunkSize === offer.chunkSize &&
+        from === prev.contiguousCount();
+      if (resumable) {
+        this.grpRecvIndex = from;
+        console.log(`[dnet] GRP download resumed at chunk ${from}/${offer.nchunks}`);
+        return;
+      }
+      console.log(`[dnet] cannot resume GRP at chunk ${from} — requesting a fresh transfer`);
+      this.grpRecv = null;
+      this.grpRecvFrom = null;
+      this.match?.peers.sendControl(peerId, { t: "grp_req" } as Ctl); // from absent = 0
+      return;
+    }
     this.grpRecv = new GrpReceiver(offer);
     this.grpRecvIndex = 0;
     this.grpRecvFrom = peerId;
+    this.grpTailRetries = 0;
   }
 
   private _onBulkChunk(peerId: string, bytes: Uint8Array): void {
@@ -752,6 +898,23 @@ class DukeNet {
   private async _guestGrpEnd(peerId: string): Promise<void> {
     const recv = this.grpRecv;
     if (!recv || this.grpRecvFrom !== peerId) return;
+    if (!recv.complete) {
+      // Ended short (a reconnect ate part of the stream, or the end marker of a
+      // superseded send). The prefix is intact (ordered channel) — ask for the
+      // tail instead of discarding megabytes. Bounded so a hostile/broken host
+      // can't loop us forever.
+      const from = recv.contiguousCount();
+      if (++this.grpTailRetries <= 3) {
+        console.log(`[dnet] grp_end at ${from}/${recv.offer.nchunks} chunks — requesting the tail (try ${this.grpTailRetries})`);
+        this.events.onStatus?.("Resuming the GRP download…");
+        this.match?.peers.sendControl(peerId, { t: "grp_req", from } as Ctl);
+        return;
+      }
+      this.grpRecv = null;
+      this.grpRecvFrom = null;
+      this.events.onError?.("GRP download kept ending short — giving up.");
+      return;
+    }
     this.grpRecv = null;
     this.grpRecvFrom = null;
     const bytes = await recv.verify(); // HASH-BEFORE-USE: crc + sha256 must match
@@ -759,8 +922,12 @@ class DukeNet {
       this.events.onError?.("Downloaded GRP failed verification — discarded.");
       return;
     }
-    // Persist the verified bytes and queue a rejoin, then reload so the engine
-    // relaunches with -gamegrp on the new GRP.
+    // Persist the verified bytes, set the TRANSIENT boot choice, and reload
+    // straight into ?join=<invite> so the page auto-rejoins this exact match
+    // (with its banner + retry plumbing). The bytes are durable in IDB; the boot
+    // choice is session-only so a later cold start returns to the player's own
+    // game. (The old path wrote a sessionStorage rejoin key NOTHING consumed —
+    // a completed download landed the player at the main menu, joined nothing.)
     try {
       const filename = sanitizeFilename(recv.offer.name);
       await putGrp({
@@ -772,10 +939,9 @@ class DukeNet {
         bytes,
         savedAt: Date.now(),
       });
-      persistGrpChoice(recv.offer.crc >>> 0, filename);
-      if (this.pendingJoinInfo) saveRejoin(this.pendingJoinInfo);
+      setSessionGrpChoice({ crc: recv.offer.crc >>> 0, filename });
       this.events.onStatus?.("GRP downloaded — reloading to apply…");
-      reloadPage();
+      reloadIntoMatch(this.pendingJoinInfo);
     } catch (e) {
       this.events.onError?.("Could not persist the GRP: " + String(e));
     }
@@ -791,7 +957,11 @@ class DukeNet {
     // surface the handshake stage on-screen so a stall is diagnosable from the status.
     if (m.role === "guest" && peerId === m.hostId && !m.peers.isAttached(peerId))
       this.events.onStatus?.(`Connecting to host… (${state})`);
-    if (state === "failed" || state === "closed" || state === "disconnected") {
+    // "disconnected" never arrives here anymore: peer.ts holds transient flaps
+    // back for a grace window and escalates a stuck one to "failed" itself.
+    // Acting on the raw flap tore down seats (and mid-download transfers) that
+    // ICE would have recovered on its own.
+    if (state === "failed" || state === "closed") {
       if (m.peers.isAttached(peerId)) {
         this.seam.enqueuePeerEventByDevice(peerId, false);
         this.seam.unregisterPeer(peerId);
@@ -912,23 +1082,31 @@ function safeLocalSet(k: string, v: string): void {
     /* ignore */
   }
 }
-function persistGrpChoice(crc: number, filename: string): void {
-  safeLocalSet(GAMEGRP_KEY, JSON.stringify({ crc: crc >>> 0, filename }));
+/** The transient (session-scoped) boot-GRP override a switch/download writes.
+ *  Read by index.html's preRun blocks; see the SESSION_GRP_KEY comment above. */
+type SessionGrpChoice = { crc: number; filename: string; builtin?: 1 } | { main: 1 };
+function setSessionGrpChoice(c: SessionGrpChoice): void {
+  safeSessionSet(SESSION_GRP_KEY, JSON.stringify(c));
+}
+function describeChoice(c: SessionGrpChoice): string {
+  return "main" in c ? "registered import" : (c.builtin ? "bundled " : "downloaded ") + c.filename;
+}
+/** ?noswitch=1: test-harness override that forces the transfer path even when the
+ *  host's GRP is available locally (never set by product UI). */
+function noSwitchRequested(): boolean {
+  try {
+    return typeof location !== "undefined" && new URLSearchParams(location.search).has("noswitch");
+  } catch {
+    return false;
+  }
 }
 function loadGrpChoice(): { crc: number; filename: string } | null {
-  const raw = safeLocalGet(GAMEGRP_KEY);
+  const raw = safeSessionGet(SESSION_GRP_KEY) ?? safeLocalGet(GAMEGRP_KEY);
   if (!raw) return null;
   try {
     return JSON.parse(raw) as { crc: number; filename: string };
   } catch {
     return null;
-  }
-}
-function saveRejoin(info: MatchInfo): void {
-  try {
-    sessionStorage.setItem(REJOIN_KEY, JSON.stringify(info));
-  } catch {
-    /* ignore */
   }
 }
 function loadRejoin(): MatchInfo | null {
@@ -946,10 +1124,44 @@ function clearRejoin(): void {
     /* ignore */
   }
 }
-function reloadPage(): void {
+/** Same encoding as Match.inviteBlob(), for a raw MatchInfo we hold (the match we
+ *  were trying to join when the GRP switch/download forced a reload). */
+function inviteBlobFor(info: MatchInfo): string {
+  return btoa(JSON.stringify(info)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+/** Reload the page INTO a match: sets ?join=<blob> so the boot flow (banner,
+ *  engine gating, retries — index.html's ?join= handler) drives the rejoin.
+ *  Falls back to a plain reload when there is no match to return to. */
+function reloadIntoMatch(info: MatchInfo | null): void {
   if (typeof location === "undefined") return;
   try {
+    if (info) {
+      const qs = new URLSearchParams(location.search);
+      qs.delete("join");
+      qs.delete("bot"); // never re-arm a bot flag across a GRP switch
+      qs.set("join", inviteBlobFor(info));
+      location.href = location.pathname + "?" + qs.toString();
+      return;
+    }
+  } catch {
+    /* fall through to a plain reload */
+  }
+  try {
     location.reload();
+  } catch {
+    /* ignore */
+  }
+}
+function safeSessionGet(k: string): string | null {
+  try {
+    return sessionStorage.getItem(k);
+  } catch {
+    return null;
+  }
+}
+function safeSessionSet(k: string, v: string): void {
+  try {
+    sessionStorage.setItem(k, v);
   } catch {
     /* ignore */
   }
