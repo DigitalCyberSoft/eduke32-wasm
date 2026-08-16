@@ -6,9 +6,9 @@ name: Build & Release (web + native)
 # NETNATIVE=1 -- wire-compatible with the browser, so native <-> browser peers
 # interoperate. The Linux job builds green (verified locally on Fedora 42: the
 # stream-mode netcode is #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)).
-# macOS/Windows stay continue-on-error until their libdatachannel toolchains are
-# confirmed on the runners -- and all native jobs are non-blocking so a runner
-# hiccup never holds back the web release.
+# macOS/Windows build libdatachannel (and, on Windows, libsecp256k1) from
+# source -- neither is packaged by Homebrew or MSYS2. All native jobs are
+# non-blocking so a runner hiccup never holds back the web release.
 #
 # Push a tag like v0.1.0 to cut a Release with the web bundle attached; every
 # push to the integration branch just builds + uploads artifacts.
@@ -94,17 +94,47 @@ jobs:
     name: native (macos)
     runs-on: macos-latest
     continue-on-error: true
+    env:
+      LIBDATACHANNEL_TAG: v0.24.5
     steps:
       - uses: actions/checkout@v4
-      - name: Install deps
-        run: brew install sdl2 sdl2_mixer libdatachannel libsecp256k1 miniupnpc openssl curl flac libvorbis pkg-config
+      - name: Install deps (Homebrew)
+        # secp256k1 is the formula name (installs libsecp256k1.pc); there is NO
+        # libdatachannel formula -- it is built from source below.
+        run: brew install sdl2 sdl2_mixer secp256k1 miniupnpc openssl@3 flac libvorbis pkg-config cmake ninja
+      - name: Cache libdatachannel
+        id: cache-ldc
+        uses: actions/cache@v4
+        with:
+          path: ~/ldc-prefix
+          key: ldc-macos-${{ env.LIBDATACHANNEL_TAG }}
+      - name: Build libdatachannel from source (no Homebrew formula exists)
+        if: steps.cache-ldc.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$LIBDATACHANNEL_TAG" --recurse-submodules --shallow-submodules \
+            https://github.com/paullouisageneau/libdatachannel ldc-src
+          cmake -S ldc-src -B ldc-src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DNO_EXAMPLES=ON -DNO_TESTS=ON \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+            -DCMAKE_INSTALL_PREFIX="$HOME/ldc-prefix"
+          cmake --build ldc-src/build -j"$(sysctl -n hw.ncpu)"
+          cmake --install ldc-src/build
       - name: Build (NETNATIVE=1)
-        run: make NETNATIVE=1 NETDUKE32=1 USE_LIBVPX=0 RENDERTYPE=SDL SDL_TARGET=2 -j"$(sysctl -n hw.ncpu)"
+        # openssl@3 is keg-only: its libcrypto.pc must be on PKG_CONFIG_PATH.
+        # The makefile links -ldatachannel directly, so hand it the prefix too.
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$HOME/ldc-prefix/lib/pkgconfig:$PKG_CONFIG_PATH"
+          export LDFLAGS="-L$HOME/ldc-prefix/lib"
+          export CPPFLAGS="-I$HOME/ldc-prefix/include"
+          make NETNATIVE=1 NETDUKE32=1 USE_LIBVPX=0 RENDERTYPE=SDL SDL_TARGET=2 \
+            CXXFLAGS="-I$HOME/ldc-prefix/include" LDFLAGS="-L$HOME/ldc-prefix/lib" \
+            -j"$(sysctl -n hw.ncpu)"
       - name: Package
         if: success()
         run: |
           mkdir -p eduke32-native-macos
-          cp -R EDuke32.app eduke32 eduke32-native-macos/ 2>/dev/null || true
+          cp -R EDuke32.app eduke32 mapster32 eduke32-native-macos/ 2>/dev/null || true
+          cp "$HOME/ldc-prefix/lib/"libdatachannel*.dylib eduke32-native-macos/ 2>/dev/null || true
           ls -la eduke32-native-macos/
       - uses: actions/upload-artifact@v4
         if: success()
@@ -114,6 +144,9 @@ jobs:
     name: native (windows)
     runs-on: windows-latest
     continue-on-error: true
+    env:
+      LIBDATACHANNEL_TAG: v0.24.5
+      SECP256K1_TAG: v0.8.0
     defaults:
       run:
         shell: msys2 {0}
@@ -123,17 +156,52 @@ jobs:
         with:
           msystem: MINGW64
           update: true
+          # MSYS2 packages NEITHER libdatachannel NOR libsecp256k1 -- both are
+          # built from source below and installed into the MINGW64 prefix.
           install: >-
             mingw-w64-x86_64-toolchain mingw-w64-x86_64-SDL2 mingw-w64-x86_64-SDL2_mixer
-            mingw-w64-x86_64-libdatachannel mingw-w64-x86_64-libsecp256k1
-            mingw-w64-x86_64-miniupnpc mingw-w64-x86_64-openssl mingw-w64-x86_64-curl mingw-w64-x86_64-flac make git
+            mingw-w64-x86_64-miniupnpc mingw-w64-x86_64-openssl mingw-w64-x86_64-curl
+            mingw-w64-x86_64-flac mingw-w64-x86_64-libvorbis
+            mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja make git
+      - name: Cache source-built deps
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: deps-prefix
+          key: win-deps-${{ env.LIBDATACHANNEL_TAG }}-${{ env.SECP256K1_TAG }}
+      - name: Build libdatachannel + libsecp256k1 from source
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          PREFIX="$PWD/deps-prefix"
+          git clone --depth 1 --branch "$LIBDATACHANNEL_TAG" --recurse-submodules --shallow-submodules \
+            https://github.com/paullouisageneau/libdatachannel ldc-src
+          cmake -S ldc-src -B ldc-src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DNO_EXAMPLES=ON -DNO_TESTS=ON \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX"
+          cmake --build ldc-src/build -j2
+          cmake --install ldc-src/build
+          git clone --depth 1 --branch "$SECP256K1_TAG" https://github.com/bitcoin-core/secp256k1 secp-src
+          cmake -S secp-src -B secp-src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DSECP256K1_ENABLE_MODULE_SCHNORRSIG=ON -DSECP256K1_ENABLE_MODULE_EXTRAKEYS=ON \
+            -DSECP256K1_BUILD_TESTS=OFF -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF
+          cmake --build secp-src/build -j2
+          cmake --install secp-src/build
       - name: Build (NETNATIVE=1)
-        run: make NETNATIVE=1 NETDUKE32=1 USE_LIBVPX=0 -j2
-      - name: Package
+        run: |
+          PREFIX="$PWD/deps-prefix"
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
+          make NETNATIVE=1 NETDUKE32=1 USE_LIBVPX=0 \
+            CXXFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib" \
+            -j2
+      - name: Package (binary + runtime DLLs)
         if: success()
         run: |
           mkdir -p eduke32-native-windows
           cp eduke32.exe mapster32.exe eduke32-native-windows/ 2>/dev/null || true
+          cp deps-prefix/bin/*.dll eduke32-native-windows/ 2>/dev/null || true
+          # mingw runtime DLLs the exe links (SDL2, openssl, curl, gcc runtime...)
+          for f in $(ldd eduke32.exe | awk '/mingw64/ {print $3}' | sort -u); do cp "$f" eduke32-native-windows/; done
           ls -la eduke32-native-windows/
       - uses: actions/upload-artifact@v4
         if: success()
