@@ -301,6 +301,22 @@ void Net_GetPackets(void)
     // stuck at 1, and the host can never reach the >1 state its lobby/launch gate needs.
     net_poll();
 
+    if (g_netJoinCatchup)
+    {
+        // Joiner-side catchup heartbeat (~2s), placed on the ALWAYS-pumped
+        // path: the live-reported 3rd-seat wedge froze the move loop, so a
+        // beat inside gm-gated code went silent exactly when it mattered.
+        static int32_t nextBeat;
+        if ((int32_t)totalclock - nextBeat >= 0)
+        {
+            auto const ps = g_player[myconnectindex].ps;
+            nextBeat = (int32_t)totalclock + 240;
+            LOG_F(INFO, "[join] catchup: plc=%d send=%d r2s=%d gm=%d dead=%d np=%d",
+                  movefifoplc, movefifosendplc, (int)ready2send,
+                  ps ? (int)ps->gm : -1, ps ? (int)ps->dead_flag : -1, numplayers);
+        }
+    }
+
     if (numplayers < 2 || g_networkBroadcastMode == NETMODE_OFFLINE)
         return;
 
@@ -3187,10 +3203,48 @@ void Net_HandleInput(void)
     // echo exactly like every other player's; that way master-side synthesis
     // (deadline-fill, joiner zero-fill) reaches every sim identically and lag
     // can never fork anyone. A joiner mid-catchup samples nothing at all.
+    {
+        // NN_LOCALBOT=1: this seat plays itself through the full human input
+        // pipeline (native twin of Web_SetLocalBot) -- live public test
+        // matches need seats that move and fight, not statues.
+        static int s_lbInit;
+        if (!s_lbInit)
+        {
+            s_lbInit = 1;
+            const char *e = getenv("NN_LOCALBOT");
+            if (e && Batoi(e))
+                g_netLocalBot = 1;
+        }
+    }
     bool const isSlave = (numplayers > 1 && myconnectindex != connecthead);
     bool const seated  = g_player[myconnectindex].connected && !g_netJoinCatchup;
     int32_t const localHead = isSlave ? g_netSampleHead : g_player[myconnectindex].movefifoend;
     bool const capped = (localHead - movefifoplc >= 100);
+
+    if (isSlave && !seated)
+    {
+        // CATCHUP ACK (unseated joiner / healing guest): the join and heal
+        // flows pace on s_slaveAck -- and the only writer used to be the
+        // seated-gated SLAVE_TO_MASTER, so these peers were silent, the host
+        // saw ack==base forever, never announced the seat, and re-streamed
+        // snapshots in a loop (live-reported 3rd DM seat, 2026-08-16).
+        // RELIABLE by design: it rides the control channel (S2M is the lossy
+        // move channel, and a joiner's early move-channel packets can vanish
+        // while the SCTP stream is young); low-rate, tiny, and the flow
+        // deadlocks without it -- reliability is correctness here.
+        packbuf[0] = PACKET_TYPE_JOIN_ACK;
+        packbuf[1] = (char)g_netMoveEpoch;
+        j = 2;
+        B_BUF32(&packbuf[j], movefifosendplc); j += 4;
+        oldnet_sendpacket(connecthead, (unsigned char *)packbuf, j);
+        {
+            static int32_t s_caLogged;
+            if (s_caLogged++ == 0)
+                LOG_F(INFO, "[join] first catchup ack sent: epoch=%d ack=%d",
+                      (int)(uint8_t)packbuf[1], movefifosendplc);
+        }
+        return;
+    }
 
     if (!capped && seated)
     {
@@ -4036,7 +4090,18 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 // Tic-indexed window for the sending slave's own input stream.
                 {
                     int8_t const d = (int8_t)((uint8_t)packbuf[1] - g_netMoveEpoch);
-                    if (d != 0) { g_netEpochDrops++; break; }   // wrong generation either way
+                    if (d != 0)
+                    {
+                        g_netEpochDrops++;
+                        static int32_t nextEd;
+                        if ((int32_t)totalclock - nextEd >= 0 || (int32_t)totalclock + 480 < nextEd)
+                        {
+                            nextEd = (int32_t)totalclock + 240;
+                            LOG_F(INFO, "[join] S2M epoch drop: from=%d theirs=%d ours=%d",
+                                  other, (int)(uint8_t)packbuf[1], (int)g_netMoveEpoch);
+                        }
+                        break;   // wrong generation either way
+                    }
                 }
                 if ((unsigned)other >= MAXPLAYERS)
                     break;
@@ -4527,6 +4592,27 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 LOG_F(INFO, "[barrier] host GO crossing=%d", go);
                 return;
             }
+            case PACKET_TYPE_JOIN_ACK:
+            {
+                // Catchup peer's reliable progress ack (see the sender in
+                // Net_HandleInput). Paces Net_HostJoinFlow: seat/heal
+                // completion fires when this passes the stream base.
+                if (myconnectindex != connecthead || (unsigned)other >= MAXPLAYERS
+                    || packbufleng < 6)
+                    return;
+                {
+                    int8_t const d = (int8_t)((uint8_t)packbuf[1] - g_netMoveEpoch);
+                    if (d != 0)
+                        return;   // stale generation
+                }
+                int32_t const ack = (int32_t)B_UNBUF32(&packbuf[2]);
+                if (s_joinFlowIsHeal && other == s_joinFlowSlot)
+                    s_healAckFence = 1;   // post-apply by construction
+                if (ack > s_slaveAck[other])
+                    s_slaveAck[other] = ack;
+                s_lastRealRecvClock[other] = (int32_t)totalclock;
+                return;
+            }
             case PACKET_TYPE_PLAYER_READY:
             {
                 // STREAM MODE: a bare READY from the host is NOT a release.
@@ -4558,6 +4644,22 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                                other, guestNp, numplayers);
 #endif
                     }
+                }
+                // STREAM GO-ECHO (mid-game join rendezvous): a joiner's seat
+                // restores the snapshot's zeroed readyflags, so any barrier it
+                // crosses afterwards waits for a release that was broadcast
+                // before it existed ("stuck waiting for the go which had
+                // already been given" -- live-reported 3rd DM seat,
+                // 2026-08-16). Value gate keeps the load-leak fix intact: we
+                // answer ONLY for crossings we have genuinely released
+                // (our flag >= the reporter's); mid-load our flag is 0 (EOL
+                // fence), so a loading host still answers nobody.
+                if (myconnectindex == connecthead && other != myconnectindex && g_netStreamMode
+                    && g_player[myconnectindex].playerreadyflag >= g_player[other].playerreadyflag)
+                {
+                    packbuf[0] = PACKET_TYPE_LEVEL_GO;
+                    packbuf[1] = g_player[myconnectindex].playerreadyflag;
+                    oldnet_sendpacket(other, (unsigned char *)packbuf, 2);
                 }
                 // MASTER ECHO (late-join rendezvous), LEGACY CLASSIC MODE ONLY:
                 // the master's one-shot READY broadcast can land while a late
@@ -5507,6 +5609,7 @@ void Net_ApplyPendingJoins(void)
         || !(g_player[myconnectindex].ps->gm & MODE_GAME))
         return;
 
+
     for (int k = 0; k < MAXPLAYERS; k++)
     {
         if (s_joinTic[k] < 0 || g_player[k].connected || movefifoplc < s_joinTic[k])
@@ -5627,6 +5730,17 @@ void Net_HostJoinFlow(void)
             return;
 
         int32_t const gap = movefifosendplc - s_slaveAck[k];
+        {
+            // Host-side join-flow heartbeat (~2s), the other half of the
+            // joiner's [join] catchup beat.
+            static int32_t nextBeat;
+            if (now - nextBeat >= 0)
+            {
+                nextBeat = now + 240;
+                LOG_F(INFO, "[join] flow slot=%d ack=%d base=%d send=%d gap=%d tries=%d",
+                      k, s_slaveAck[k], s_joinFlowBase, movefifosendplc, gap, s_joinFlowTries);
+            }
+        }
         if (s_slaveAck[k] > s_joinFlowBase && gap <= 8)
         {
             if (s_joinFlowIsHeal)
@@ -7896,7 +8010,19 @@ void Net_CheckHealResume(void)
         || myconnectindex == connecthead || s_healBasePlc < 0)
         return;
     if (movefifoplc <= s_healBasePlc || movefifosendplc - movefifoplc > 8)
+    {
+        // Catchup progress heartbeat (~2s): a wedged join stalls RIGHT HERE
+        // (live-reported 3rd DM seat never seated while the host re-streamed
+        // snapshots) -- name the cursors so the wedge is diagnosable.
+        static int32_t nextBeat;
+        if ((int32_t)totalclock - nextBeat >= 0)
+        {
+            nextBeat = (int32_t)totalclock + 240;
+            LOG_F(INFO, "[join] catching up: plc=%d send=%d base=%d",
+                  movefifoplc, movefifosendplc, s_healBasePlc);
+        }
         return;
+    }
 
     g_netJoinCatchup = 0;
     s_healBasePlc    = -1;

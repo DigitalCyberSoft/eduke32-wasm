@@ -7236,6 +7236,24 @@ MAIN_LOOP_RESTART:
         if (gameHandleEvents() && quitevent)
             G_CloseWindowQuit();   // window X: clean immediate quit (see game.h)
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        if (g_netJoinCatchup)
+        {
+            // Frame-top trajectory beat for the 3rd-seat wedge, WALL-CLOCK
+            // rate-limited: a totalclock-limited beat goes silent exactly
+            // when the engine clock freezes -- the very failure under test.
+            static uint32_t nextFb;
+            uint32_t const wallNow = timerGetTicks();
+            if (wallNow >= nextFb)
+            {
+                nextFb = wallNow + 2000;
+                LOG_F(INFO, "[join] frame: gm=%d warp=%d tc=%d otc=%d lock=%d plc=%d send=%d r2s=%d",
+                      (int)myplayer.gm, (int)ud.warp_on, (int32_t)totalclock, (int32_t)ototalclock,
+                      (int32_t)lockclock, movefifoplc, movefifosendplc, ready2send);
+            }
+        }
+#endif
+
         // NOTE: the native WebRTC host launch lives in M_DisplayMenus (menus.cpp), NOT here.
         // At the menu the engine runs the attract-mode loop (G_PlaybackDemo), which calls
         // M_DisplayMenus but never reaches this app_main do-loop, so a launch check here is
@@ -7298,6 +7316,22 @@ MAIN_LOOP_RESTART:
                         EM_ASM({ console.log('[spin] mainloop tc=' + $0 + ' otc=' + $1 + ' plc=' + $2 + ' r2s=' + $3); },
                                (int32_t)totalclock, (int32_t)ototalclock, movefifoplc, ready2send);
 #endif
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+                    if (g_netJoinCatchup)
+                    {
+                        // Pre-gate catchup beat (~2s): names which main-loop
+                        // gate is starving the fast-forward (the 3rd-seat
+                        // wedge idled HERE, pumping events, consuming nothing).
+                        static int32_t nextJb;
+                        if ((int32_t)totalclock - nextJb >= 0 || (int32_t)totalclock + 480 < nextJb)
+                        {
+                            nextJb = (int32_t)totalclock + 240;
+                            LOG_F(INFO, "[join] gate: r2s=%d gm=%d tc=%d otc=%d plc=%d send=%d",
+                                  ready2send, (int)myplayer.gm, (int32_t)totalclock, (int32_t)ototalclock,
+                                  movefifoplc, movefifosendplc);
+                        }
+                    }
+#endif
                     if (g_frameJustDrawn && g_networkMode != NET_DEDICATED_SERVER && (myplayer.gm & (MODE_MENU | MODE_DEMO)) == 0)
                         dukeFillInputForTic();
 
@@ -7352,6 +7386,16 @@ MAIN_LOOP_RESTART:
 
         g_gameUpdateAndDrawTime = g_gameUpdateTime + (double)g_lastFrameDuration * 1000.0 / (double)timerGetNanoTickRate();
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        if (g_netJoinCatchup)
+        {
+            static uint32_t nextB;
+            uint32_t const wb = timerGetTicks();
+            if (wb >= nextB) { nextB = wb + 2000;
+                LOG_F(INFO, "[join] postmove: gm=%d tc=%d otc=%d plc=%d", (int)myplayer.gm,
+                      (int32_t)totalclock, (int32_t)ototalclock, movefifoplc); }
+        }
+#endif
         G_DoCheats();
 
         if (myplayer.gm & MODE_NEWGAME)
@@ -7430,6 +7474,15 @@ MAIN_LOOP_RESTART:
             walock[TILE_SAVESHOT] = CACHE1D_UNLOCKED;
         }
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+        if (g_netJoinCatchup)
+        {
+            static uint32_t nextC;
+            uint32_t const wc = timerGetTicks();
+            if (wc >= nextC) { nextC = wc + 2000;
+                LOG_F(INFO, "[join] frameend: gm=%d tc=%d", (int)myplayer.gm, (int32_t)totalclock); }
+        }
+#endif
         if (myplayer.gm & MODE_DEMO)
             goto MAIN_LOOP_RESTART;
     }
@@ -7798,7 +7851,21 @@ int G_MoveLoop(void)
 #else
     int32_t const fifoCushion = bufferjitter;
 #endif
-    while ((g_player[myconnectindex].movefifoend - movefifoplc) > fifoCushion)
+    int32_t consumeEdge = g_player[myconnectindex].movefifoend;
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // CATCHUP PACING: a pre-seat joiner's OWN column never fills (it is not
+    // in the roster and its sampler starts at the seat), so pacing the gate
+    // on it froze the fast-forward at the snapshot base forever -- the acks
+    // never advanced, the host never announced a joinTic, and the join flow
+    // re-streamed snapshots in a loop (live-reported 3rd DM seat,
+    // 2026-08-16). Pace catchup on the contiguous M2S high-water instead:
+    // every tic below movefifosendplc carries records for every seated peer
+    // by construction, and Net_ApplyPendingJoins inside the loop still lands
+    // the seat exactly at its announced tic.
+    if (g_netJoinCatchup)
+        consumeEdge = movefifosendplc;
+#endif
+    while ((consumeEdge - movefifoplc) > fifoCushion)
     {
 #if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
         if (++mlSpin == 400)
@@ -7831,6 +7898,18 @@ int G_MoveLoop(void)
                     if (!g_netStallSince || g_netStallSince > (int32_t)totalclock)
                         g_netStallSince = (int32_t)totalclock;
                     g_netStallMask |= (1 << i);
+                    if (g_netJoinCatchup)
+                    {
+                        // Catchup must never starve on a column (the M2S
+                        // stream is self-contained): name the seat if it does.
+                        static int32_t nextSb;
+                        if ((int32_t)totalclock - nextSb >= 0 || (int32_t)totalclock + 480 < nextSb)
+                        {
+                            nextSb = (int32_t)totalclock + 240;
+                            LOG_F(INFO, "[join] stall: seat=%d end=%d plc=%d send=%d",
+                                  (int)i, g_player[i].movefifoend, movefifoplc, movefifosendplc);
+                        }
+                    }
 #endif
                     return 0;
                 }

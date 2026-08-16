@@ -1176,6 +1176,16 @@ static uint8_t savegame_comprthres;
 // the narrow-on-save / widen-on-load is lossless.
 #define SV_PORTABLE_PTRSIZE 4
 static int sv_wirePtrSize = sizeof(intptr_t);
+// Set for the duration of a PORTABLE snapshot save. Gv_WriteSave consults it:
+// the label-matched gamevar section serializes raw gamevar_t structs and
+// native-width intptr blocks -- unreadable across pointer widths (a wasm
+// third seat joining a native-hosted match died at Gv_ReadSave -171, the host
+// re-streamed snapshots in a loop; live-reported 2026-08-16). Portable
+// snapshots omit the section (count=0 self-describes to any reader): stream
+// mode repaints authoritative state, per-player vars re-init at the seat.
+// The full fix -- portable transcode of the Gv section -- can replace this.
+int sv_portableSave;
+int sv_saveIsPortable(void) { return sv_portableSave; }
 
 static int32_t ds_getcnt(const dataspec_t *spec)
 {
@@ -1936,6 +1946,7 @@ int32_t sv_saveandmakesnapshot(buildvfs_FILE fil, char const *name, int8_t spot,
     // width so a native (64-bit) host and a wasm (32-bit) guest exchange
     // byte-identical late-join snapshots. Native disk saves stay native-width.
     sv_wirePtrSize = portable ? SV_PORTABLE_PTRSIZE : (int)sizeof(intptr_t);
+    sv_portableSave = portable ? 1 : 0;
 
     // set a few savegame system globals
     savegame_comprthres = SV_DEFAULTCOMPRTHRES;
@@ -2043,11 +2054,13 @@ int32_t sv_saveandmakesnapshot(buildvfs_FILE fil, char const *name, int8_t spot,
         {
             OSD_Printf("sv_saveandmakesnapshot: ptr-(snapshot end)=%d!\n", (int32_t)(p - (svsnapshot + svsnapsiz)));
             sv_wirePtrSize = sizeof(intptr_t);
+            sv_portableSave = 0;
             return 1;
         }
     }
 
     sv_wirePtrSize = sizeof(intptr_t);   // restore native width for subsequent disk saves
+    sv_portableSave = 0;
     return 0;
 }
 

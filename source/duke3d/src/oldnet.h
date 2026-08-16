@@ -277,6 +277,7 @@ enum DukePacket_t
     PACKET_TYPE_WALL_STREAM,   // host -> guest: wall-vertex positions of wall-motion doors (swing/slide) -- heights alone missed them
     PACKET_TYPE_READY_ROSTER,  // host -> guests, ~1Hz while at the entry barrier: bitmask of seats already in (display only)
     PACKET_TYPE_LEVEL_GO,      // host -> guests, stream mode: EXPLICIT entry release ([1] = host crossing number); the only signal that opens a guest's barrier
+    PACKET_TYPE_JOIN_ACK,      // catchup peer -> host, RELIABLE: [1]=epoch, [2..5]=contiguous M2S applied; paces the join/heal flow (s_slaveAck)
     PACKET_END, // Should remain last in list.
 };
 

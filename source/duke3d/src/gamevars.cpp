@@ -684,6 +684,22 @@ void Gv_WriteSave(buildvfs_FILE fil)
 #ifndef NDEBUG
     int const startofs = buildvfs_ftell(fil);
 #endif
+    {
+        // PORTABLE (network) snapshot: this section writes raw gamevar_t
+        // structs and native-intptr value blocks -- not readable across
+        // 32/64-bit (see sv_portableSave in savegame.cpp). Omit it: zero
+        // var and array counts parse cleanly on any peer.
+        extern int sv_saveIsPortable(void);
+        if (sv_saveIsPortable())
+        {
+            int32_t const zero = 0;
+            buildvfs_fwrite(&zero, sizeof(zero), 1, fil);   // savedVarCount
+            buildvfs_fwrite(&zero, sizeof(zero), 1, fil);   // savedArrayCount
+            buildvfs_fwrite(&zero, sizeof(zero), 1, fil);   // worldStateCount
+            buildvfs_fwrite(s_EOF, Bstrlen(s_EOF), 1, fil); // section end marker
+            return;
+        }
+    }
     int32_t savedVarCount = 0;
     for (native_t i = 0; i < g_gameVarCount; i++)
     {

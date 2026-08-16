@@ -163,7 +163,14 @@ public:
         // Headless auto-start via env (the interactive menu uses net_native_host/join).
         const char *role = getenv("NN_ROLE");
         if (role && std::string(role) == "host")
-            hostMatch(envOr("NN_PUBLIC", "0") == "1" ? 1 : 0, envOr("NN_NAME", "Duke Match"), minPlayers_, myName_, 0);
+        {
+            // NN_MAXPLAYERS decouples the seat cap from the launch threshold
+            // (mid-game-join tests: start at NN_PLAYERS, still accept more --
+            // the interactive menu's MaxPlayers works the same way).
+            int maxSeats = std::atoi(envOr("NN_MAXPLAYERS", "0").c_str());
+            if (maxSeats < minPlayers_) maxSeats = minPlayers_;
+            hostMatch(envOr("NN_PUBLIC", "0") == "1" ? 1 : 0, envOr("NN_NAME", "Duke Match"), maxSeats, myName_, 0);
+        }
         else if (role && std::string(role) == "guest")
         {
             std::string key = envOr("NN_KEY", ""), hid = envOr("NN_HOSTID", "");

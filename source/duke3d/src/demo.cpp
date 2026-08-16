@@ -511,6 +511,7 @@ RECHECK:
             kclose(g_demo_recFilePtr);
             g_demo_recFilePtr = buildvfs_kfd_invalid;
         }
+        initprintf("net: attract loop yields to live netgame (recheck)\n");
         return 0;
     }
 
@@ -990,6 +991,7 @@ nextdemo_nomenu:
         if (g_player[myconnectindex].ps->gm == MODE_GAME)
         {
             // user wants to play a game, quit showing demo!
+            initprintf("net: attract loop yields to live game (frame check)\n");
 
             if (foundemo)
             {
