@@ -287,5 +287,8 @@ jobs:
             libdatachannel transport, wire-compatible with the browser
             (native <-> browser interop; either side can host). The Windows zip
             bundles its DLLs; on Linux/macOS run the binary from the archive
-            (`./eduke32`). No game data included: the browser build bundles
-            shareware, native builds need a DUKE3D.GRP (shareware or retail).
+            (`./eduke32`). Playable out of the box: the browser build bakes the
+            shareware episode in and every native archive ships the shareware
+            DUKE3D.GRP beside the binary (a bare binary with no game data
+            self-downloads it, checksum-pinned). For the full game, drop your
+            own retail DUKE3D.GRP beside the binary. No retail data included.
