@@ -29,7 +29,11 @@
 
 #ifdef NETNATIVE
 
-#include "crc32.h"   // Bcrc32: the shareware fetch pins the download against DUKESW_CRC
+// Bcrc32 (build/crc32.h), declared directly: this TU deliberately includes NO
+// engine headers -- crc32.h drags in compat.h + the mimalloc override, whose
+// valloc rename collides with the macOS SDK's noexcept valloc declaration
+// when <unistd.h> is included after it (Xcode 26 CI break).
+extern "C" uint32_t Bcrc32(const void *data, int length, uint32_t crc);
 
 #include "nn_grp.hpp"
 #include "nn_relay.hpp"
