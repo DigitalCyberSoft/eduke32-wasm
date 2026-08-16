@@ -1,7 +1,13 @@
 # EDuke32-WASM
 
-**[▶ Play it in your browser](https://digitalcybersoft.github.io/eduke32-wasm/)** —
 Duke Nukem 3D on WebAssembly, with serverless peer-to-peer multiplayer.
+
+[![Duke Nukem 3D main menu running in a browser](platform/emscripten/og-image.png)](https://digitalcybersoft.github.io/eduke32-wasm/)
+
+### [▶ PLAY NOW — digitalcybersoft.github.io/eduke32-wasm](https://digitalcybersoft.github.io/eduke32-wasm/)
+
+No install, no account — the shareware episode is bundled and multiplayer
+works straight from the page.
 
 This is a downstream fork. The game engine is **[EDuke32](https://www.eduke32.com/)**,
 the long-running open-source Duke Nukem 3D port — all engine, renderer, and
