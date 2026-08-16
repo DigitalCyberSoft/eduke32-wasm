@@ -557,16 +557,35 @@ static int32_t s_hostEolClock;  // guest: when the EOL receipt armed the grace
 static void Net_TestSlowLoad(const char *who)
 {
 #ifdef NETNATIVE
-    static int ms = -1;
+    static int ms = -1, pump = -1;
     if (ms < 0)
     {
         char const *e = getenv("NN_TESTSLOWLOAD");
         ms = e ? Batoi(e) : 0;
+        e = getenv("NN_TESTSLOWLOAD_PUMP");
+        pump = (e && Batoi(e)) ? 1 : 0;
     }
     if (ms > 0)
     {
-        LOG_F(INFO, "[eol] NN_TESTSLOWLOAD: %s blocking %d ms (simulated map load)", who, ms);
-        usleep((useconds_t)ms * 1000);
+        // PUMP mode (host only) mimics a REAL load: G_DoLoadScreen/the bonus
+        // screen keep pumping events and the packet drain runs long before the
+        // host is ready. The dead usleep hid the master-echo leak (a fast
+        // guest's READY was answered mid-load and released its barrier;
+        // live-reported 2026-08-16). Guest side never pumps here: this runs
+        // inside the packet switch and net_poll() would recurse.
+        int const doPump = pump && Bstrcmp(who, "host") == 0;
+        LOG_F(INFO, "[eol] NN_TESTSLOWLOAD: %s blocking %d ms (simulated map load%s)",
+              who, ms, doPump ? ", pumping" : "");
+        if (doPump)
+        {
+            for (int left = ms; left > 0; left -= 50)
+            {
+                usleep((useconds_t)min(left, 50) * 1000);
+                net_poll();
+            }
+        }
+        else
+            usleep((useconds_t)ms * 1000);
         LOG_F(INFO, "[eol] NN_TESTSLOWLOAD: %s resumed", who);
     }
 #else
@@ -4492,8 +4511,32 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     g_netBarrierReadyMask = (uint32_t)B_UNBUF32(&packbuf[1]);
                 return;
             }
+            case PACKET_TYPE_LEVEL_GO:
+            {
+                // STREAM MODE: the host's EXPLICIT entry release ("there
+                // should be explicit signaling from the host", 2026-08-16) --
+                // sent ONLY from its genuine barrier release (loaded + all
+                // seats reported). Value-carrying (the host's crossing number
+                // this entry), so duplicates/ordering can never inflate; the
+                // EOL fence zeroes both sides before the next entry.
+                if (other != connecthead || packbufleng < 2)
+                    return;
+                int const go = (uint8_t)packbuf[1];
+                if (go > g_player[connecthead].playerreadyflag)
+                    g_player[connecthead].playerreadyflag = (char)go;
+                LOG_F(INFO, "[barrier] host GO crossing=%d", go);
+                return;
+            }
             case PACKET_TYPE_PLAYER_READY:
             {
+                // STREAM MODE: a bare READY from the host is NOT a release.
+                // The master echo below answers a guest's READY from ANY
+                // pre-barrier packet drain (bonus screen, load screen) -- a
+                // fast guest's barrier released while the host was half
+                // loaded and it free-ran into the level (live-reported
+                // 2026-08-16). Host readiness travels ONLY via LEVEL_GO.
+                if (g_netStreamMode && myconnectindex != connecthead && other == connecthead)
+                    return;
                 if (g_player[other].playerreadyflag == 0)
                     LOG_F(INFO, "Player %d is ready", other);
                 g_player[other].playerreadyflag++;
@@ -4516,13 +4559,16 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
 #endif
                     }
                 }
-                // MASTER ECHO (late-join rendezvous): the master's one-shot READY
-                // broadcast can land while a late joiner is still LOADING the
-                // snapshot -- the load then restores the saved (zero) readyflags
-                // over it and the joiner waits forever for a packet that already
-                // came. Echoing READY back at the sender is idempotent (flags are
-                // >= comparisons) and makes the rendezvous order-independent.
-                if (myconnectindex == connecthead && other != myconnectindex)
+                // MASTER ECHO (late-join rendezvous), LEGACY CLASSIC MODE ONLY:
+                // the master's one-shot READY broadcast can land while a late
+                // joiner is still LOADING the snapshot -- the load then restores
+                // the saved (zero) readyflags over it and the joiner waits
+                // forever for a packet that already came. Echoing READY back is
+                // idempotent there. In STREAM mode this echo was the leak that
+                // released loading-gate guests early (any pre-barrier drain
+                // answered them); stream release is LEVEL_GO exclusively, and
+                // stream late-joiners skip the barrier via g_netJoinCatchup.
+                if (myconnectindex == connecthead && other != myconnectindex && !g_netStreamMode)
                 {
                     packbuf[0] = PACKET_TYPE_PLAYER_READY;
                     oldnet_sendpacket(other, (unsigned char *)packbuf, 1);
@@ -8906,15 +8952,28 @@ void Net_WaitForPlayers()
         // -1 Means we iterated through all players without breaking in above loop. All players ready.
         if (i <= -1)
         {
-            // master sends ready packet once it hears from all slaves
+            // master signals release once it hears from all slaves. STREAM
+            // MODE: an EXPLICIT, value-carrying LEVEL_GO -- the ONLY packet a
+            // stream guest's barrier accepts, and it cannot exist before this
+            // point (loaded + every seat reported). Classic mode keeps the
+            // legacy READY broadcast.
             if (myconnectindex == connecthead)
             {
                 TRAVERSE_CONNECT(i)
                 {
-                    packbuf[0] = PACKET_TYPE_PLAYER_READY;
-
-                    if (i != myconnectindex)
-                        oldnet_sendpacket(i, (unsigned char*)packbuf, 1);
+                    if (i == myconnectindex || (g_netBotMask & (1 << i)))
+                        continue;
+                    if (g_netStreamMode)
+                    {
+                        packbuf[0] = PACKET_TYPE_LEVEL_GO;
+                        packbuf[1] = g_player[myconnectindex].playerreadyflag;
+                        oldnet_sendpacket(i, (unsigned char *)packbuf, 2);
+                    }
+                    else
+                    {
+                        packbuf[0] = PACKET_TYPE_PLAYER_READY;
+                        oldnet_sendpacket(i, (unsigned char *)packbuf, 1);
+                    }
                 }
             }
 

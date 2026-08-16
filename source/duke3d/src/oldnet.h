@@ -276,6 +276,7 @@ enum DukePacket_t
     PACKET_TYPE_ACCESS_STATE,  // both ways (coop): shared key-card bits -- any player's card unlocks for everyone
     PACKET_TYPE_WALL_STREAM,   // host -> guest: wall-vertex positions of wall-motion doors (swing/slide) -- heights alone missed them
     PACKET_TYPE_READY_ROSTER,  // host -> guests, ~1Hz while at the entry barrier: bitmask of seats already in (display only)
+    PACKET_TYPE_LEVEL_GO,      // host -> guests, stream mode: EXPLICIT entry release ([1] = host crossing number); the only signal that opens a guest's barrier
     PACKET_END, // Should remain last in list.
 };
 
