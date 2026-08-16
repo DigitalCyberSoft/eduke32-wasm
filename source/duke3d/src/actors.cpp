@@ -1367,6 +1367,25 @@ int A_IncurDamage(int const spriteNum)
 
         pSprite->extra -= pActor->htextra;
 
+#if defined(NETDUKE32) && (defined(__EMSCRIPTEN__) || defined(NETNATIVE))
+        // Stream-coop guest: enemy DEATH is host-authoritative (the replay-kill
+        // latch runs the real one). Local damage stays live for instant pain
+        // feedback -- the stream repaints extra with host truth within a lap --
+        // but the killing blow must not run the irreversible CON death off a
+        // local roll the host may not confirm (krand fuzz, real-ping skew): a
+        // host-blind local kill is a corpse whose authoritative original keeps
+        // attacking. Clamp to 1hp; the host's kill lands it moments later.
+        if (pSprite->extra <= 0 && A_CheckEnemySprite(pSprite))
+        {
+            extern int32_t Net_StreamGuestBlocksLethal(int spriteNum);
+            if (Net_StreamGuestBlocksLethal(spriteNum))
+            {
+                pSprite->extra = 1;
+                LOG_F(INFO, "[lethal] clamped local kill idx=%d pic=%d (death is host-owned)", spriteNum, (int)pSprite->picnum);
+            }
+        }
+#endif
+
         if ((unsigned)pSprite->owner < MAXSPRITES && sprite[pSprite->owner].statnum < MAXSTATUS && STANDALONE_EVAL(true, pSprite->picnum != RECON))
             pSprite->owner = pActor->htowner;
 

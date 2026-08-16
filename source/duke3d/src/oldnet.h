@@ -275,6 +275,7 @@ enum DukePacket_t
     PACKET_TYPE_POS_REPORT,    // guest -> host: CLIENT-AUTHORITATIVE self position/facing ("trust the client where it ended up")
     PACKET_TYPE_ACCESS_STATE,  // both ways (coop): shared key-card bits -- any player's card unlocks for everyone
     PACKET_TYPE_WALL_STREAM,   // host -> guest: wall-vertex positions of wall-motion doors (swing/slide) -- heights alone missed them
+    PACKET_TYPE_READY_ROSTER,  // host -> guests, ~1Hz while at the entry barrier: bitmask of seats already in (display only)
     PACKET_END, // Should remain last in list.
 };
 
