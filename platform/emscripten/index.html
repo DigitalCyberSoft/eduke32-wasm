@@ -42,12 +42,13 @@
   #err { color:#ff7a5c; max-width:640px; font-size:13px; white-space:pre-wrap; }
 
   /* --- Web-wrapper settings panel (separate from the in-game menu) --- */
-  #gear, #mute { position:fixed; top:12px; right:12px; z-index:20; width:40px; height:40px; border-radius:8px;
+  #gear, #mute, #fs { position:fixed; top:12px; right:12px; z-index:20; width:40px; height:40px; border-radius:8px;
     border:1px solid #3a3a42; background:rgba(20,20,24,.7); color:#e8e2d6; font-size:20px; line-height:1; cursor:pointer;
     display:none; align-items:center; justify-content:center; }
-  #gear:hover, #mute:hover { background:rgba(42,42,50,.92); }
+  #gear:hover, #mute:hover, #fs:hover { background:rgba(42,42,50,.92); }
   #mute { right:60px; }
   #mute.muted { opacity:.55; }
+  #fs { right:108px; }
   #diag { position:fixed; top:10px; left:10px; z-index:15; font-family:monospace; font-size:12px; color:#9effa0;
     background:rgba(0,0,0,.5); padding:4px 8px; border-radius:6px; display:none; white-space:pre; pointer-events:none; }
   #settings { position:fixed; inset:0; z-index:30; display:none; align-items:center; justify-content:center;
@@ -91,6 +92,7 @@
 </div>
 <button id="gear" title="Settings" aria-label="Settings">&#9881;</button>
 <button id="mute" title="Sound on/off" aria-label="Sound on/off">&#128266;</button>
+<button id="fs" title="Fullscreen" aria-label="Fullscreen">&#x26F6;</button>
 <div id="diag"></div>
 <div id="settings" role="dialog" aria-modal="true">
   <div class="panel">
@@ -575,6 +577,74 @@
       } catch (e) {}
     }, 5000);
   })();
+  // ── Accidental-close guard ────────────────────────────────────────────────
+  // Ctrl is DUCK: Ctrl+W while crouching closes the tab and kills the match
+  // (user 2026-08-16). A page cannot swallow Ctrl+W in a window -- it is a
+  // browser-level shortcut that never reaches the page -- so the windowed
+  // defense is the browser's own "Leave site?" confirmation, armed only while
+  // it matters: engine in gameplay or bonus screen (gm & (MODE_GAME|MODE_EOL)),
+  // or a live net match (DukeNet.debugLine() != null covers hosting a lobby
+  // from the menu). Menus/loader never nag. In FULLSCREEN, Keyboard Lock
+  // captures browser shortcuts outright (Chromium; harmless elsewhere), so
+  // Ctrl+W just reaches the game as duck+W and nothing closes.
+  // Programmatic navigations we initiate (auto-rejoin after a GRP download,
+  // settings-driven reloads) stamp __e32AllowUnloadT to bypass the prompt.
+  (function () {
+    function guarded() {
+      if (Date.now() - (window.__e32AllowUnloadT || 0) < 10000) return false;
+      var m = window.__e32menu || {};
+      if ((m.gm | 0) & 0xC) return true;   // MODE_GAME | MODE_EOL
+      try {
+        if (window.DukeNet && window.DukeNet.debugLine && window.DukeNet.debugLine() != null) return true;
+      } catch (e) {}
+      return false;
+    }
+    window.addEventListener('beforeunload', function (e) {
+      if (!guarded()) return;
+      e.preventDefault();
+      e.returnValue = '';   // legacy engines require a string to show the prompt
+    });
+    // Keyboard Lock engages only in JS-initiated fullscreen (F11 browser
+    // fullscreen can never capture). Full lock() beats the MDN WASD-subset
+    // example for this game: Duke leans on F2/F5/F9 (browser: refresh!) and a
+    // TAP of Esc must reach the game menu -- hold-Esc still exits fullscreen.
+    // Chrome 130+ can refuse capture (permission); then fall back to pinning
+    // just the movement keys so duck+W (Ctrl+W) still cannot close the tab.
+    // __e32KbLock: 'full' | 'wasd' | 'denied' | 'unlocked' | 'unsupported'.
+    document.addEventListener('fullscreenchange', function () {
+      var kb = navigator.keyboard;
+      if (!kb || !kb.lock) { window.__e32KbLock = 'unsupported'; return; }
+      if (document.fullscreenElement) {
+        try {
+          kb.lock().then(function () { window.__e32KbLock = 'full'; }, function () {
+            kb.lock(['KeyW', 'KeyA', 'KeyS', 'KeyD']).then(
+              function () { window.__e32KbLock = 'wasd'; },
+              function () { window.__e32KbLock = 'denied'; });
+          });
+        } catch (e) { window.__e32KbLock = 'denied'; }
+      } else {
+        try { kb.unlock(); } catch (e) {}
+        window.__e32KbLock = 'unlocked';
+      }
+      var b = document.getElementById('fs');
+      if (b) {
+        b.title = document.fullscreenElement ? 'Exit fullscreen' : 'Fullscreen';
+        b.setAttribute('aria-pressed', document.fullscreenElement ? 'true' : 'false');
+      }
+    });
+    // Top-level fullscreen shortcut (user 2026-08-16): the settings panel's
+    // display row was the only way in. Lock BEFORE requesting (Chrome's
+    // recommended order) so capture engages the instant fullscreen activates;
+    // the fullscreenchange handler above re-locks as the catch-all for other
+    // entry paths (e.g. the in-game video-mode toggle).
+    document.getElementById('fs').addEventListener('click', function () {
+      if (document.fullscreenElement) { (document.exitFullscreen || function () {}).call(document); return; }
+      try { if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock().catch(function () {}); } catch (e) {}
+      var el = document.documentElement;
+      ((el.requestFullscreen || el.webkitRequestFullscreen || function () {}).call(el) || Promise.resolve())
+        .catch(function () {});
+    });
+  })();
   var Module = {
     onAbort: function (what) { if (window.__e32PutDeath) window.__e32PutDeath('abort', what, new Error('abort').stack); },
     onExit: function (code) { if (window.__e32PutDeath) window.__e32PutDeath('exit', 'runtime exited code=' + code, ''); },
@@ -604,7 +674,7 @@
     monitorRunDependencies: function (left) {
       if (left === 0) { setPct(100); statusEl.textContent = 'Starting…'; }
     },
-    onRuntimeInitialized: function () { started = true; fitCanvas(); document.getElementById('gear').style.display = 'flex'; document.getElementById('mute').style.display = 'flex'; setTimeout(hideLoader, 400); },
+    onRuntimeInitialized: function () { started = true; fitCanvas(); document.getElementById('gear').style.display = 'flex'; document.getElementById('mute').style.display = 'flex'; document.getElementById('fs').style.display = 'flex'; setTimeout(hideLoader, 400); },
     printErr: function (t) {
       console.error(t);
       if (!window.__e32ver) { var m = /EDuke32\s+\S+/.exec(t); if (m) { window.__e32ver = m[0]; var v = document.getElementById('ver'); if (v) v.textContent = m[0]; } }
@@ -821,7 +891,7 @@
     function clearData() {
       if (!confirm('Clear saved settings and local data, then reload?')) return;
       try { localStorage.clear(); } catch (e) {}
-      var done = function () { location.reload(); };
+      var done = function () { window.__e32AllowUnloadT = Date.now(); location.reload(); };
       try {
         if (window.indexedDB && indexedDB.databases) {
           indexedDB.databases().then(function (dbs) {
@@ -848,6 +918,7 @@
       if (cap === e32ResCap()) return;
       localStorage.setItem('e32_res', String(cap));
       // The engine reads the render resolution once at boot, so reload to apply it.
+      window.__e32AllowUnloadT = Date.now();
       location.reload();
     });
     $('diagChk').addEventListener('change', function () { setDiag(this.checked); });
@@ -865,7 +936,7 @@
     }
     $('btnUseShareware').addEventListener('click', function () {
       if (!confirm('Revert to the shareware game and reload?')) return;
-      e32ClearMainGrp(function () { location.reload(); });
+      e32ClearMainGrp(function () { window.__e32AllowUnloadT = Date.now(); location.reload(); });
     });
 
     // Import extra game data (GRPs / mods): write into the engine FS now and persist

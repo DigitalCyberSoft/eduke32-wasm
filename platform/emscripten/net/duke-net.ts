@@ -1134,6 +1134,9 @@ function inviteBlobFor(info: MatchInfo): string {
  *  Falls back to a plain reload when there is no match to return to. */
 function reloadIntoMatch(info: MatchInfo | null): void {
   if (typeof location === "undefined") return;
+  // Our own navigation: bypass the shell's accidental-close confirm (a match
+  // is live here by definition -- the prompt would stall the auto-rejoin).
+  try { (window as unknown as { __e32AllowUnloadT?: number }).__e32AllowUnloadT = Date.now(); } catch { /* shell absent in tests */ }
   try {
     if (info) {
       const qs = new URLSearchParams(location.search);
