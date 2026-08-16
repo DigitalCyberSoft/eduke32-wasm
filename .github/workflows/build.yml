@@ -245,19 +245,44 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+      - name: Package release assets (one archive per platform)
+        # Release assets are FLAT files: the linux and mac artifacts both
+        # contain "eduke32"/"mapster32" (basename collision), Windows is ~25
+        # loose DLLs, and upload-artifact strips unix exec bits -- so restore
+        # +x and roll one archive per platform. tar.gz for unix (keeps modes),
+        # zip for Windows.
+        run: |
+          mkdir -p assets
+          cp dist/eduke32-wasm-web/eduke32-wasm-web.zip assets/ 2>/dev/null || true
+          if [ -d dist/eduke32-native-linux ]; then
+            chmod +x dist/eduke32-native-linux/eduke32 dist/eduke32-native-linux/mapster32 2>/dev/null || true
+            tar -C dist -czf assets/eduke32-native-linux-x86_64.tar.gz eduke32-native-linux
+          fi
+          if [ -d dist/eduke32-native-macos ]; then
+            chmod +x dist/eduke32-native-macos/eduke32 dist/eduke32-native-macos/mapster32 2>/dev/null || true
+            [ -d dist/eduke32-native-macos/EDuke32.app/Contents/MacOS ] && chmod +x dist/eduke32-native-macos/EDuke32.app/Contents/MacOS/* || true
+            tar -C dist -czf assets/eduke32-native-macos-arm64.tar.gz eduke32-native-macos
+          fi
+          if [ -d dist/eduke32-native-windows ]; then
+            (cd dist && zip -r ../assets/eduke32-native-windows-x86_64.zip eduke32-native-windows)
+          fi
+          ls -la assets/
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*
+          files: assets/*
           generate_release_notes: true
           body: |
             eduke32-wasm ${{ github.ref_name }}
 
             **Web build** (`eduke32-wasm-web.zip`): the browser/WASM Duke3D with
             serverless WebRTC+Nostr P2P multiplayer -- runs on macOS/Windows/Linux
-            via any browser. Also live on GitHub Pages.
+            via any browser. Also live on [GitHub Pages](https://digitalcybersoft.github.io/eduke32-wasm/).
 
-            **Native desktop builds** carry the SAME serverless WebRTC+Nostr
-            multiplayer via a native libdatachannel transport, wire-compatible
-            with the browser (native <-> browser interop). Binaries attach here
-            per platform as their build jobs go green.
+            **Native desktop builds** (Linux x86_64, macOS arm64, Windows x86_64)
+            carry the SAME serverless WebRTC+Nostr multiplayer via a native
+            libdatachannel transport, wire-compatible with the browser
+            (native <-> browser interop; either side can host). The Windows zip
+            bundles its DLLs; on Linux/macOS run the binary from the archive
+            (`./eduke32`). No game data included: the browser build bundles
+            shareware, native builds need a DUKE3D.GRP (shareware or retail).
