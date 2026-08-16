@@ -1,85 +1,101 @@
 # EDuke32-WASM
 
-Duke Nukem 3D in the browser — a fork of [EDuke32](https://www.eduke32.com/)
-that compiles the engine to WebAssembly and adds serverless peer-to-peer
-multiplayer, with cross-play between browser players and a matching native
-Linux build.
+**[▶ Play it in your browser](https://digitalcybersoft.github.io/eduke32-wasm/)** —
+Duke Nukem 3D on WebAssembly, with serverless peer-to-peer multiplayer.
 
-## What it does
+This is a downstream fork. The game engine is **[EDuke32](https://www.eduke32.com/)**,
+the long-running open-source Duke Nukem 3D port — all engine, renderer, and
+gameplay credit belongs to the EDuke32 team and the lineage it builds on:
+Ken Silverman's BUILD engine, Jonathon Fowler's JFDuke3D, 3D Realms' original
+Duke Nukem 3D, and StrikerTheHedgefox's NetDuke32, whose lockstep multiplayer
+revival is the foundation this fork's netcode grew from. This repository
+changes none of what makes the game the game; it adds the two things below.
 
-- **Runs in the browser.** The full EDuke32 engine built with Emscripten:
-  classic Build renderer, sound, music, savegames and settings persisted
-  locally (IndexedDB / localStorage). No plugins, no install.
-- **Multiplayer without servers.** Matches connect peer-to-peer over WebRTC
-  data channels; public Nostr relays carry only the signaling (offers,
-  answers, match discovery). There is no game server to run or pay for.
-- **Co-op and deathmatch** on a host-authoritative netcode: the host streams
-  authoritative world state continuously while guests run a responsive local
-  simulation (client-side prediction, free-run input, position reports). Built
-  on the NetDuke32 lockstep lineage, evolved into an OpenArena-style
-  state-streaming model.
-- **Cross-play.** A native Linux build speaks the same WebRTC transport and
-  wire protocol, so browser guests can join a natively-hosted match and vice
-  versa — including mid-game joins into a running match (late joiners receive
-  a state snapshot, catch up, and are seated deterministically).
-- **Lobby system.** Host public or private matches, share invite codes or
-  `?join=` links, browse the public match list, transfer game data
-  peer-to-peer where licensing permits (shareware).
-- **Game data stays yours.** GRP files are fingerprinted (CRC-32 + SHA-256),
-  stored locally, and never uploaded anywhere except direct peer-to-peer
-  transfer between players of the same match.
-- **Browser quality-of-life.** Fullscreen with Keyboard Lock (Ctrl+W while
-  crouching no longer closes the tab), accidental-close confirmation during
-  live matches, a lobby-style wait screen while all players load each level,
-  a web settings panel (resolution, display mode, game data management), and
-  crash forensics for bug reports.
+## 1. It runs in your browser
+
+The full EDuke32 engine compiled to WebAssembly with Emscripten — no install,
+no plugins, playable immediately with the bundled shareware episode:
+
+- Classic Build renderer, sound, and music in a canvas; the engine's blocking
+  main loop runs under ASYNCIFY so menus, loads, and network waits never
+  freeze the tab.
+- Saves, settings, and game data persist locally (IndexedDB / localStorage).
+  Import your own retail `DUKE3D.GRP` once through the settings panel and the
+  full game lives in your browser.
+- A web shell tuned for actually playing an FPS in a tab: one-click
+  fullscreen with the Keyboard Lock API (holding Ctrl to crouch and tapping W
+  no longer closes the tab), a leave-confirmation that only arms during live
+  play, display modes, a mute toggle, and crash forensics that survive a dead
+  tab to make bug reports useful.
+
+## 2. Multiplayer, rebuilt for the open web
+
+NetDuke32 proved classic lockstep netplay could live again; this fork extends
+that work into a serverless, browser-native model:
+
+- **No servers.** Players connect directly over WebRTC data channels. Public
+  Nostr relays carry only signaling and match discovery — there is no game
+  server, no accounts, nothing to host or pay for.
+- **Host-authoritative streaming.** Instead of pure lockstep, the host
+  continuously streams authoritative world state (enemy health and deaths,
+  doors, walls, pickups, positions) while guests run a responsive free-run
+  local simulation with client-side prediction. Guest input lag no longer
+  scales with ping, and world truth is always the host's: enemy kills are
+  host-owned, so desync artifacts like "the corpse that keeps shooting"
+  self-heal instead of accumulating.
+- **Cross-play.** A native Linux build speaks the identical transport and
+  wire protocol, so browser players and native players share matches freely —
+  either side can host.
+- **Mid-game joins.** Join a running deathmatch or co-op: the host streams a
+  state snapshot, a reliable catch-up handshake paces you to the live edge,
+  and you're seated deterministically on every peer's timeline. Snapshots are
+  serialized portably, so a 64-bit native host and a 32-bit browser guest
+  exchange them byte-for-byte.
+- **Explicit level-transition gating.** The host alone signals "load the next
+  level" and "enter now"; everyone else holds at a lobby-style wait screen
+  with a per-player Ready/Loading roster. Nobody enters a level while someone
+  is still loading textures.
+- **Resilient connections.** Offer/answer generation tracking, dead-peer
+  reaping, disconnect grace windows (45 s in-game, 120 s across level loads),
+  and in-order GRP transfer with resume — matches survive the hiccups real
+  links have.
+- **Game data handled honestly.** GRPs are fingerprinted (CRC-32 + SHA-256)
+  and matched between peers; the freely distributable shareware episode can
+  be transferred player-to-player so a friend can join in one click, while
+  retail data is never redistributed.
+- **Lobbies.** Host public matches (discoverable in the in-page browser) or
+  private ones via invite codes and `?join=` links.
 
 ## Game data
 
-No copyrighted game assets are included. You need a `DUKE3D.GRP`:
-
-- **Shareware**: the freely distributable 1.3d shareware episode works out of
-  the box (see `assets/shareware/LICENSE.TXT`).
-- **Retail / Atomic Edition**: use the GRP from a copy you own (GOG, Steam,
-  original CD). The web build imports it once via the settings panel and keeps
-  it in browser storage.
+No retail assets are included. The **shareware 1.3d episode** is bundled and
+playable immediately (`assets/shareware/LICENSE.TXT`). For the full game, use
+the `DUKE3D.GRP` from a copy you own (GOG, Steam, original CD) — the web
+build imports it once and keeps it in browser storage, local to you.
 
 ## Building
 
-### Native (Linux)
+Native Linux (cross-play host/guest):
 
 ```sh
 make NETNATIVE=1 NETDUKE32=1 USE_LIBVPX=0 RENDERTYPE=SDL SDL_TARGET=2 obj=obj-native -j8
 ```
 
-Produces `eduke32` with the WebRTC/Nostr transport built in. Run with
-`-j /path/to/game/data`.
-
-### WebAssembly
+WebAssembly engine:
 
 ```sh
 source /path/to/emsdk/emsdk_env.sh
 make PLATFORM=EMSCRIPTEN EM_SINGLE_FILE=0 NETDUKE32=1 obj=obj-em -j8
 ```
 
-Produces `eduke32.js` / `eduke32.wasm` / `eduke32.data`.
-
-### Web networking bundle
+Web networking bundle, then serve `platform/emscripten/index.html` with the
+engine artifacts from any static HTTPS server:
 
 ```sh
-cd platform/emscripten
-npm install
-npm run build:net       # bundles net/ into eduke32-net.js
+cd platform/emscripten && npm install && npm run build:net
 ```
 
-Serve `platform/emscripten/index.html` together with the engine artifacts
-from any static web server (a secure context — HTTPS or localhost — is
-required for WebRTC and the Keyboard Lock API).
-
 ## Headless / testing knobs (native)
-
-The native build can host and join matches without a display, driven by
-environment variables — useful for automated testing and dedicated-ish hosts:
 
 | Variable | Meaning |
 | --- | --- |
@@ -95,18 +111,21 @@ environment variables — useful for automated testing and dedicated-ish hosts:
 
 ## More documentation
 
-- `platform/emscripten/README-netplay.md` — the browser transport (WebRTC
-  channels, Nostr signaling, GRP gating/transfer, the JS↔C seam).
+- `platform/emscripten/README-netplay.md` — the browser transport in depth
+  (WebRTC channels, Nostr signaling, GRP gating/transfer, the JS↔C seam).
 - `platform/emscripten/docs/` — integration notes and menu specs.
 
-## Credits & licenses
+## Credit where it's due
 
-This project stands on:
+This fork is a thin layer on decades of other people's work:
 
-- **[EDuke32](https://www.eduke32.com/)** — GPL-2.0 (`source/duke3d/gpl-2.0.txt`)
-  plus the BUILD engine license (`source/build/buildlic.txt`).
-- **NetDuke32** — the lockstep netcode lineage this fork's netplay grew from.
-- **Ken Silverman's BUILD engine** and 3D Realms' Duke Nukem 3D.
-
-Duke Nukem 3D is a trademark of its respective owners. Game assets are not
-included and remain the property of their copyright holders.
+- **[EDuke32](https://www.eduke32.com/)** — the engine itself: the EDuke32
+  team's port, renderer, scripting, and years of maintenance. GPL-2.0
+  (`source/duke3d/gpl-2.0.txt`) plus the BUILD license
+  (`source/build/buildlic.txt`).
+- **NetDuke32** (StrikerTheHedgefox) — the revived classic lockstep netcode
+  this fork's multiplayer started from.
+- **BUILD engine** — Ken Silverman.
+- **JFDuke3D** — Jonathon Fowler's foundational source port.
+- **Duke Nukem 3D** — 3D Realms. The game, its name, and its retail assets
+  remain the property of their copyright holders and are not included here.
