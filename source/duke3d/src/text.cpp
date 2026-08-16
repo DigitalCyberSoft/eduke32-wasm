@@ -535,6 +535,10 @@ void G_PrintGameQuotes(int32_t snum)
     }
 }
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+extern "C" int Net_PendingSpawnSeat(int playerNum);   // oldnet.cpp
+#endif
+
 void P_DoQuote(int32_t q, DukePlayer_t *p)
 {
     int32_t cq = 0;
@@ -547,6 +551,16 @@ void P_DoQuote(int32_t q, DukePlayer_t *p)
         cq = 1;
         q &= ~MAXQUOTES;
     }
+
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // Pending late-join seat: CON's dead-state re-pushes QUOTE_DEAD ("PRESS
+    // OPEN TO RESTART LEVEL") every beat -- wrong words for a seat that was
+    // never in the level, and it painted OVER the waiting-room line (the
+    // live "the start status is not correct"). Keep the seat's own text up.
+    if (q == QUOTE_DEAD && numplayers > 1 && p == g_player[myconnectindex].ps
+        && Net_PendingSpawnSeat(myconnectindex) && apStrings[QUOTE_RESERVED3] != NULL)
+        q = QUOTE_RESERVED3;
+#endif
 
     if (EDUKE32_PREDICT_FALSE(apStrings[q] == NULL))
     {

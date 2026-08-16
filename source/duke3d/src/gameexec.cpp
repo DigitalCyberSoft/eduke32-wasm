@@ -1210,22 +1210,31 @@ static int32_t VM_ResetPlayer(int const playerNum, int32_t vmFlags, int32_t cons
 
         if (g_fakeMultiMode)
             P_ResetMultiPlayer(playerNum);
-#ifndef NETCODE_DISABLE
+#if !defined(NETCODE_DISABLE) && !defined(NETDUKE32)
         if (g_netServer)
         {
             P_ResetMultiPlayer(playerNum);
             Net_SpawnPlayer(playerNum);
         }
-        else if (numplayers > 1)
+        else
+#endif
+#ifndef NETCODE_DISABLE
+        if (numplayers > 1)
         {
-            // Lockstep/stream MP (g_netServer is the dormant client/server
-            // macro, FALSE here): without this branch a dead MP player was
-            // NEVER reset -- the CON resetplayer landed in a no-op and every
-            // death was permanent (measured: 6/8 seats corpses with
-            // dead_flag>1200 while one surviving bot farmed an empty map;
-            // live: "I am the only player in the match"). Every peer runs
-            // this same opcode at the same consumed tic, so the reset is
-            // deterministic like any sim step.
+            // Lockstep/stream MP: ONE gated path for EVERY peer. g_netServer
+            // is a MACRO in this tree ("I am the master", oldnet.h) -- the
+            // classic mainline branch above believed it dormant, so the HOST
+            // silently took the UNGATED enet path (P_ResetMultiPlayer +
+            // Net_SpawnPlayer, no LMS/no-respawn gates) while guests ran the
+            // gates below: a host-vs-guest fork on every gated death. The
+            // branch is now compiled out for NETDUKE32 builds entirely.
+            //
+            // Without THIS branch a dead MP player was never reset -- the CON
+            // resetplayer landed in a no-op and every death was permanent
+            // (measured: 6/8 seats corpses with dead_flag>1200 while one
+            // surviving bot farmed an empty map; live: "I am the only player
+            // in the match"). Every peer runs this same opcode at the same
+            // consumed tic, so the reset is deterministic like any sim step.
             // LAST MAN STANDING: the host spends a life and refuses the respawn
             // when the seat is out of lives (elimination). Guests pass through
             // (Net_LmsAllowRespawn returns 1 off-host) and mirror the host's

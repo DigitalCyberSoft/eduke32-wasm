@@ -225,6 +225,7 @@ void Net_SendStateSnap(int k);    // host: in-place RNG+player correction to one
 int  Net_CorrectDivergence(int k);// host: correction ladder (soft snaps -> snapshot heal)
 void Net_ApplyPendingStateSnap(void);
 void Net_SmoothRemoteSeats(void); // guest: consume stashed snap at its stamped tic
+void Net_SelfPosWatch(const char *tag); // forensics: names the tic phase that yanked OUR pos
 
 //OLDNET_EXTERN PredictBackup_t predictBackup[MOVEFIFOSIZ];
 

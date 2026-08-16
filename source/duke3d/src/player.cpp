@@ -5210,12 +5210,15 @@ static void P_DoJetpack(int const playerNum, int const playerBits, int const pla
 extern "C" int Net_PendingSpawnSeat(int playerNum);
 extern "C" void Net_PendingSpawnDone(int playerNum);
 extern int Net_LmsAllowRespawn(int playerNum);
+void Net_InitializePrediction(void);   // net_predict.h
+void Net_ResetSyncCheck(void);         // sync.h
 #endif
 
 static void P_Dead(int const playerNum, int const sectorLotag, int const floorZ, int const ceilZ)
 {
     auto const pPlayer = g_player[playerNum].ps;
     auto const pSprite = &sprite[pPlayer->i];
+
 
     if (ud.recstat == 1 && (!g_netServer && ud.multimode < 2))
         G_CloseDemoWrite();
@@ -5230,33 +5233,76 @@ static void P_Dead(int const playerNum, int const sectorLotag, int const floorZ,
     // CON_RESETPLAYER's MP branch applies (LMS lives, no-respawn co-op).
     // The input column replicates, so every peer spawns the seat on the
     // same consumed tic.
+    //
+    // NO !g_netServer HERE: in this tree g_netServer is a MACRO for "I am
+    // the master" (oldnet.h), so the classic idiom silently made this hook
+    // GUESTS-ONLY -- the host spawned the seat via CON RESETPLAYER instead,
+    // one engine phase later and with a different krand order: a world fork
+    // at the spawn tic (Sync_Random/PlayerPos screamed), the host's pending
+    // mask never cleared, and the joiner was live-reported frozen at the
+    // seat point while everyone disagreed where it stood.
     {
-        if (numplayers > 1 && !g_netServer && Net_PendingSpawnSeat(playerNum)
-            && playerNum == myconnectindex)
+        // NEVER during the prediction replay: the replay runs this same code
+        // with swapped pointers off LOCALLY-STAGED input (the press arrives
+        // there ~RTT before the echo), so the hook fired EARLY there -- it
+        // cleared the REAL pending mask (the real sim's spawn then never ran,
+        // CON limped it back), and Net_InitializePrediction from INSIDE
+        // prediction corrupted the pointer swap ("Prediction Code Error" +
+        // an engine wedge, harness-caught). The real sim pass is the only
+        // place a seat may spawn: every peer consumes the same echo tic.
+        if (numplayers > 1 && !oldnet_predicting && Net_PendingSpawnSeat(playerNum))
         {
-            // Pending-seat input probe (~2s): names the consumed bits so a
-            // spawn press that never lands is visible in the log.
+            // Pending-seat input probe (~2s, EVERY peer/seat): names the
+            // consumed bits so a spawn press that never lands -- or a peer
+            // whose P_Dead never runs for the seat -- is visible in the log.
             static int32_t nextPb;
             if ((int32_t)totalclock - nextPb >= 0 || (int32_t)totalclock + 480 < nextPb)
             {
                 nextPb = (int32_t)totalclock + 240;
-                LOG_F(INFO, "[seat] pending: consumed bits=0x%x staged bits=0x%x",
-                      (unsigned)g_player[playerNum].input.bits, (unsigned)netInput.bits);
+                LOG_F(INFO, "[seat] pending p%d: consumed bits=0x%x extra=%d dead=%d me=%d",
+                      playerNum, (unsigned)g_player[playerNum].input.bits,
+                      (int)pSprite->extra, (int)pPlayer->dead_flag,
+                      (int)(playerNum == myconnectindex));
+                // Keep the waiting-room line on screen for the whole pending
+                // phase (quotes fade after ~3s; this beat renews it). It must
+                // land on the SCREENPEEK player: the HUD draws that seat's
+                // quote, and while spectating that is not us.
+                if (playerNum == myconnectindex && apStrings[QUOTE_RESERVED3] != NULL
+                    && g_player[screenpeek].ps != NULL)
+                    P_DoQuote(QUOTE_RESERVED3, g_player[screenpeek].ps);
             }
-        }
-        if (numplayers > 1 && !g_netServer && Net_PendingSpawnSeat(playerNum)
-            && (TEST_SYNC_KEY(g_player[playerNum].input.bits, SK_OPEN)
-                || TEST_SYNC_KEY(g_player[playerNum].input.bits, SK_FIRE)))
-        {
-            bool const allowSpawn =
-                !(g_gametypeFlags[ud.coop] & GAMETYPE_NORESPAWN)
-                && (!(g_gametypeFlags[ud.coop] & GAMETYPE_LMS) || Net_LmsAllowRespawn(playerNum));
-            if (allowSpawn)
+            if (TEST_SYNC_KEY(g_player[playerNum].input.bits, SK_OPEN)
+                || TEST_SYNC_KEY(g_player[playerNum].input.bits, SK_FIRE))
             {
-                Net_PendingSpawnDone(playerNum);
-                P_ResetMultiPlayer(playerNum);
-                LOG_F(INFO, "[seat] player %d spawned on demand", playerNum);
-                return;
+                bool const allowSpawn =
+                    !(g_gametypeFlags[ud.coop] & GAMETYPE_NORESPAWN)
+                    && (!(g_gametypeFlags[ud.coop] & GAMETYPE_LMS) || Net_LmsAllowRespawn(playerNum));
+                if (allowSpawn)
+                {
+                    Net_PendingSpawnDone(playerNum);
+                    P_ResetMultiPlayer(playerNum);
+                    LOG_F(INFO, "[seat] player %d spawned on demand", playerNum);
+                    if (playerNum == myconnectindex)
+                    {
+                        // Leave the waiting room: the pending phase spectated
+                        // another seat, and the prediction base still describes
+                        // the corpse -- without the re-base the closed loop
+                        // drags the fresh spawn back to the seat point every
+                        // tic (the live "I can fire but I can't move").
+                        screenpeek = myconnectindex;
+                        Net_InitializePrediction();
+                        Net_ResetSyncCheck();
+                        // Stale-pack kill guard: host packs STAMPED before this
+                        // tic still carry extra=0 for this seat -- the selfpain
+                        // replay read that as a 100-damage hit the instant we
+                        // spawned (live: "asked to press open to start and
+                        // immediately dies"). The pack applier skips self
+                        // health from packs older than this stamp.
+                        extern int32_t g_netSelfSpawnTic;
+                        g_netSelfSpawnTic = movefifoplc;
+                    }
+                    return;
+                }
             }
         }
     }
@@ -6390,21 +6436,22 @@ RECHECK:
     // eats y). This prints what the SIM consumed and produced for seat 1.
     {
         extern int32_t g_netForensics;
-        if (g_netForensics && playerNum == 1 && !oldnet_predicting && (movefifoplc % 26) == 0)
+        if (g_netForensics && (playerNum == 1 || playerNum == myconnectindex)
+            && !oldnet_predicting && (movefifoplc % 26) == 0)
         {
-            EM_ASM({ console.log('[sim1] plc=' + $0 + ' infv=' + $1 + ' insv=' + $2 + ' inav=' + $3
+            EM_ASM({ console.log('[sim' + $10 + '] plc=' + $0 + ' infv=' + $1 + ' insv=' + $2 + ' inav=' + $3
                      + ' ang=' + $4 + ' vx=' + $5 + ' vy=' + $6 + ' x=' + $7 + ' y=' + $8 + ' og=' + $9); },
                    movefifoplc, (int)thisPlayer.input.fvel, (int)thisPlayer.input.svel,
                    fix16_to_int(thisPlayer.input.q16avel), fix16_to_int(pPlayer->q16ang),
                    pPlayer->vel.x, pPlayer->vel.y, pPlayer->pos.x, pPlayer->pos.y,
-                   (int)pPlayer->on_ground);
+                   (int)pPlayer->on_ground, playerNum);
             if ((unsigned)pPlayer->cursectnum < (unsigned)numsectors)
-                EM_ASM({ console.log('[sim1s] plc=' + $0 + ' sect=' + $1 + ' lot=' + $2 + ' hit=' + $3
+                EM_ASM({ console.log('[sim' + $8 + 's] plc=' + $0 + ' sect=' + $1 + ' lot=' + $2 + ' hit=' + $3
                          + ' flz=' + $4 + ' clz=' + $5 + ' eyez=' + $6 + ' bodz=' + $7); },
                        movefifoplc, (int)pPlayer->cursectnum,
                        (int)sector[pPlayer->cursectnum].lotag, (int)sector[pPlayer->cursectnum].hitag,
                        sector[pPlayer->cursectnum].floorz, sector[pPlayer->cursectnum].ceilingz,
-                       pPlayer->pos.z, sprite[pPlayer->i].z);
+                       pPlayer->pos.z, sprite[pPlayer->i].z, playerNum);
         }
     }
 #endif

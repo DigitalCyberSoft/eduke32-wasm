@@ -5167,6 +5167,35 @@ int32_t g_netForensics = 0;
 // exist unconditionally (else the native link fails on these two symbols).
 int32_t g_testFire  = 0;
 int32_t g_testDrive = 0;
+// Consume tic of our own most recent spawn (P_Dead spawn hook, respawns too):
+// the pack applier ignores SELF health from packs stamped before it -- a stale
+// in-flight pack carrying the pre-spawn extra=0 armed selfpain for a full
+// 100-damage hit the instant the seat spawned ("presses open and immediately
+// dies", live-reported).
+int32_t g_netSelfSpawnTic = -1;
+
+// Forensics: OUR OWN position watchdog. Called between the tic pipeline's
+// phases (game.cpp); any >512-unit jump of the LOCAL seat between two calls
+// names the segment that moved it -- built for the late-join hunt where the
+// joiner's sim was yanked back to the seat point every tic by an unknown
+// writer while every audited authority path checked out clean on paper.
+void Net_SelfPosWatch(const char *tag)
+{
+    extern int32_t g_netForensics;
+    if (!g_netForensics || numplayers < 2 || g_player[myconnectindex].ps == NULL)
+        return;
+    static vec3_t s_last;
+    static int    s_valid;
+    vec3_t const now = g_player[myconnectindex].ps->pos;
+    if (s_valid)
+    {
+        int32_t const d = klabs(now.x - s_last.x) + klabs(now.y - s_last.y);
+        if (d > 512)
+            LOG_F(INFO, "[pw] %s moved %d -> (%d,%d) plc=%d", tag, d, now.x, now.y, movefifoplc);
+    }
+    s_last  = now;
+    s_valid = 1;
+}
 #ifdef __EMSCRIPTEN__
 extern "C" void Web_SetPredictMode(int mode)
 {
@@ -5453,6 +5482,29 @@ void Net_InsertLatePlayer(int k)
     Bmemcpy(plr.ps, g_player[connecthead].ps, sizeof(DukePlayer_t));
     Bmemset(plr.frags, 0, sizeof(plr.frags));
 
+    // CLAIM THE SEAT'S PREMAP START SPRITE. The level premaps ud.multimode
+    // seats (every JOINABLE seat, so mid-game joins can materialize), which
+    // parks an APLAYER start sprite per unconnected seat at its spawn row --
+    // statnum STAT_PLAYER, yvel = the seat number, extra 0. G_MovePlayers
+    // reads yvel as the seat: the orphan SHADOWED the freshly inserted body,
+    // and its extra=0 dead-branch copied the start-row position over the
+    // seat's ps EVERY TIC on EVERY peer -- the live 3rd-seat "I am stuck in
+    // one place, I can't move, however I can fire" (fire rides the guest
+    // weapon report, position rides the stomped ps). owner >= 0 spares
+    // holoduke decoys (also APLAYER+yvel on STAT_PLAYER, but owner < 0).
+    // Deterministic: identical world and tic on every peer.
+    for (int spr = headspritestat[STAT_PLAYER]; spr >= 0; )
+    {
+        int const nextspr = nextspritestat[spr];
+        if (sprite[spr].picnum == APLAYER && (int)sprite[spr].yvel == k
+            && sprite[spr].owner >= 0)
+        {
+            LOG_F(INFO, "[seat] seat %d claims its premap start: orphan sprite %d deleted", k, spr);
+            A_DeleteSprite(spr);
+        }
+        spr = nextspr;
+    }
+
     // Farthest row from the living: a late joiner must not materialize into
     // the fight pit (index-keyed rows concentrated on E1L1's start street).
     extern int G_PickFarSpawnRow(void);
@@ -5737,7 +5789,12 @@ void Net_ApplyPendingJoins(void)
             // ahead of it lands our first real records beyond the fill, which
             // clears joinerNoReal and hands the column back to us.
             g_netJoinCatchup = 0;
-            screenpeek       = myconnectindex;
+            // WAITING STATE (live directive: "make the new guest join in a
+            // waiting state"): the seat's own camera is a synthetic corpse at
+            // ankle height in a far spawn row -- as a first-person view it
+            // reads as a broken death screen. Spectate the host's seat until
+            // the spawn press; the P_Dead spawn hook flips the view back.
+            screenpeek       = connecthead;
             g_netSampleHead  = max(movefifoplc, movefifosendplc + 4);
             s_ackOfMyInput   = g_netSampleHead;
             g_seatDiagUntil  = timerGetTicks() + 40000;
@@ -5751,8 +5808,12 @@ void Net_ApplyPendingJoins(void)
                 C_AllocQuote(QUOTE_RESERVED3);
             if (apStrings[QUOTE_RESERVED3] != NULL)
             {
-                Bstrcpy(apStrings[QUOTE_RESERVED3], "PRESS OPEN TO SPAWN");
-                P_DoQuote(QUOTE_RESERVED3, g_player[myconnectindex].ps);
+                Bstrcpy(apStrings[QUOTE_RESERVED3], "SPECTATING - PRESS OPEN TO SPAWN");
+                // The HUD draws quotes from the SCREENPEEK player -- while
+                // spectating that is the host's replica, so the line must
+                // land on ITS fta/ftq (cosmetic-only local fields).
+                if (g_player[screenpeek].ps != NULL)
+                    P_DoQuote(QUOTE_RESERVED3, g_player[screenpeek].ps);
             }
             // The pre-seat sampler never ran, so the lag/jitter bookkeeping
             // accumulated garbage (localNow was -1): reset it or the first
@@ -6478,9 +6539,12 @@ void Net_ApplyGuestPos(int seat)
     vec3_t sp = { ps->pos.x, ps->pos.y, s_gpSprZ[seat] };
     setsprite(ps->i, &sp);                // relinks the sprite's sector too
     // Low-rate liveness proof for the wire (send -> stash -> on-tick adopt).
-    static int32_t s_gpApplied;
-    if ((++s_gpApplied & 511) == 1)
-        LOG_F(INFO, "[gpos] seat=%d applies=%d at (%d,%d)", seat, s_gpApplied, ps->pos.x, ps->pos.y);
+    // PER SEAT: a global counter with two strictly-interleaving guests aliased
+    // to one seat forever (511&+1 always hit the same parity) -- the harness
+    // read "seat 2 never applies" from a healthy wire.
+    static int32_t s_gpApplied[MAXPLAYERS];
+    if ((++s_gpApplied[seat] & 511) == 1)
+        LOG_F(INFO, "[gpos] seat=%d applies=%d at (%d,%d)", seat, s_gpApplied[seat], ps->pos.x, ps->pos.y);
 }
 
 // GUEST: report newly earned key cards upstream (reliable channel; idempotent).
@@ -6881,6 +6945,13 @@ void Net_ApplyPendingStateSnap(void)
             // CON addphealth) matched the host's number, so its delta is 0
             // here -- no double pain.
             int const oldExtra = sprite[ps->i].extra;
+            // Stale-pack kill guard: a pack STAMPED before our own (re)spawn
+            // still carries the pre-spawn extra (0 for a pending seat, low for
+            // a corpse) -- replaying that as damage killed the fresh spawn on
+            // the spot. Self health only from packs at/after the spawn tic.
+            if (self && g_netStreamMode && s_pendingSnapTic < g_netSelfSpawnTic)
+                ;   // skip both the selfpain arm and the raw write below
+            else
             if (self && g_netStreamMode && !ps->dead_flag && oldExtra > 0
                 && sprExtra < oldExtra && actor[ps->i].htextra < 0)
             {

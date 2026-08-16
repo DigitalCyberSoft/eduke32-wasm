@@ -7589,8 +7589,10 @@ int G_DoMoveThings(void)
     // reads exactly what it wrote and leaves movefifoplc untouched -- no desync.
     if (numplayers > 1)
     {
+        Net_SelfPosWatch("tic-in");   // forensics: names the phase that yanks OUR pos
         Net_ApplyPendingStateSnap();  // tic-aligned soft snap (oldnet.cpp)
         Net_SmoothRemoteSeats();      // remote seats glide to pack targets
+        Net_SelfPosWatch("postsnap");
         // Seats and drops must ALSO bind to the tic being consumed, not the
         // frame: a catching-up joiner consumes dozens of tics per G_MoveLoop
         // pass, so its frame-top boundary processing excised the yielded bot
@@ -7719,6 +7721,11 @@ int G_DoMoveThings(void)
         }
     }
 
+#ifdef NETDUKE32
+    if (numplayers > 1)
+        Net_SelfPosWatch("postinput");
+#endif
+
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
     // Host: apply guests' reported breakable/object AND enemy hits ON-TICK (right
     // after the weapon-fire phase, before the world moves), so their A_DamageObject /
@@ -7774,6 +7781,11 @@ int G_DoMoveThings(void)
 #endif
         )
         Net_CorrectPrediction();
+#endif
+
+#ifdef NETDUKE32
+    if (numplayers > 1)
+        Net_SelfPosWatch("tic-out");
 #endif
 
     if (g_netServer)

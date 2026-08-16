@@ -1869,6 +1869,18 @@ ACTOR_STATIC void G_MovePlayers(void)
                 }
                 else
                 {
+#ifdef NETDUKE32
+                    // Forensics: the dead-view follows the corpse SPRITE --
+                    // name the copy when it stomps OUR seat (late-join hunt).
+                    {
+                        extern int32_t g_netForensics;
+                        if (g_netForensics && playerNum == myconnectindex)
+                            LOG_F(INFO, "[pw] deadcopy p%d sprite=(%d,%d) extra=%d dead=%d spr=%d psi=%d maxhp=%d",
+                                  playerNum, (int)pSprite->x, (int)pSprite->y,
+                                  (int)pSprite->extra, (int)pPlayer->dead_flag,
+                                  spriteNum, (int)pPlayer->i, (int)pPlayer->max_player_health);
+                    }
+#endif
                     pPlayer->pos.x = pSprite->x;
                     pPlayer->pos.y = pSprite->y;
                     pPlayer->pos.z = pSprite->z-(20<<8);
@@ -9655,10 +9667,18 @@ void G_MoveWorld(void)
         G_MoveTransports();  //ST 9
     }
 
+#ifdef NETDUKE32
+    if (numplayers > 1) Net_SelfPosWatch("pretransplayers");
+#endif
+
     {
         MICROPROFILE_SCOPEI("MoveWorld", "MovePlayers", MP_YELLOW);
         G_MovePlayers();  //ST 10
     }
+
+#ifdef NETDUKE32
+    if (numplayers > 1) Net_SelfPosWatch("postplayers");
+#endif
 
     // Must be called here to fix a problem where SE7 Transports and Touchplates do not activate concurrently
     G_RecordOldSpritePosForStatnum(STAT_PLAYER);
