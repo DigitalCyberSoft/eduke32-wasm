@@ -5206,6 +5206,12 @@ static void P_DoJetpack(int const playerNum, int const playerBits, int const pla
         pPlayer->pos.z = actor[pPlayer->i].ceilingz + (18 << 8);
 }
 
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+extern "C" int Net_PendingSpawnSeat(int playerNum);
+extern "C" void Net_PendingSpawnDone(int playerNum);
+extern int Net_LmsAllowRespawn(int playerNum);
+#endif
+
 static void P_Dead(int const playerNum, int const sectorLotag, int const floorZ, int const ceilZ)
 {
     auto const pPlayer = g_player[playerNum].ps;
@@ -5216,6 +5222,45 @@ static void P_Dead(int const playerNum, int const sectorLotag, int const floorZ,
 
     if ((numplayers < 2 || g_netServer) && pPlayer->dead_flag == 0)
         P_FragPlayer(playerNum);
+
+#if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
+    // SPAWN-ON-DEMAND late-join seats (stream mode): the seat's synthetic
+    // corpse never ran the CON dying sequence, so CON's respawn keypress can
+    // never fire for it. Accept open/fire here with the SAME gametype gates
+    // CON_RESETPLAYER's MP branch applies (LMS lives, no-respawn co-op).
+    // The input column replicates, so every peer spawns the seat on the
+    // same consumed tic.
+    {
+        if (numplayers > 1 && !g_netServer && Net_PendingSpawnSeat(playerNum)
+            && playerNum == myconnectindex)
+        {
+            // Pending-seat input probe (~2s): names the consumed bits so a
+            // spawn press that never lands is visible in the log.
+            static int32_t nextPb;
+            if ((int32_t)totalclock - nextPb >= 0 || (int32_t)totalclock + 480 < nextPb)
+            {
+                nextPb = (int32_t)totalclock + 240;
+                LOG_F(INFO, "[seat] pending: consumed bits=0x%x staged bits=0x%x",
+                      (unsigned)g_player[playerNum].input.bits, (unsigned)netInput.bits);
+            }
+        }
+        if (numplayers > 1 && !g_netServer && Net_PendingSpawnSeat(playerNum)
+            && (TEST_SYNC_KEY(g_player[playerNum].input.bits, SK_OPEN)
+                || TEST_SYNC_KEY(g_player[playerNum].input.bits, SK_FIRE)))
+        {
+            bool const allowSpawn =
+                !(g_gametypeFlags[ud.coop] & GAMETYPE_NORESPAWN)
+                && (!(g_gametypeFlags[ud.coop] & GAMETYPE_LMS) || Net_LmsAllowRespawn(playerNum));
+            if (allowSpawn)
+            {
+                Net_PendingSpawnDone(playerNum);
+                P_ResetMultiPlayer(playerNum);
+                LOG_F(INFO, "[seat] player %d spawned on demand", playerNum);
+                return;
+            }
+        }
+    }
+#endif
 
     if (sectorLotag == ST_2_UNDERWATER)
     {

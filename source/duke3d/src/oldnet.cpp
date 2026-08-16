@@ -301,19 +301,25 @@ void Net_GetPackets(void)
     // stuck at 1, and the host can never reach the >1 state its lobby/launch gate needs.
     net_poll();
 
-    if (g_netJoinCatchup)
     {
-        // Joiner-side catchup heartbeat (~2s), placed on the ALWAYS-pumped
-        // path: the live-reported 3rd-seat wedge froze the move loop, so a
-        // beat inside gm-gated code went silent exactly when it mattered.
-        static int32_t nextBeat;
-        if ((int32_t)totalclock - nextBeat >= 0)
+        extern uint32_t g_seatDiagUntil;
+        uint32_t const wallNow = timerGetTicks();
+        if (g_netJoinCatchup || wallNow < g_seatDiagUntil)
         {
-            auto const ps = g_player[myconnectindex].ps;
-            nextBeat = (int32_t)totalclock + 240;
-            LOG_F(INFO, "[join] catchup: plc=%d send=%d r2s=%d gm=%d dead=%d np=%d",
-                  movefifoplc, movefifosendplc, (int)ready2send,
-                  ps ? (int)ps->gm : -1, ps ? (int)ps->dead_flag : -1, numplayers);
+            // Joiner heartbeat (~2s), ALWAYS-pumped path, WALL-clock limited
+            // (totalclock freezes exactly when the wedges under test hit).
+            // Covers catchup AND the first 40s after the seat.
+            static uint32_t nextBeat;
+            if (wallNow >= nextBeat)
+            {
+                auto const ps = g_player[myconnectindex].ps;
+                nextBeat = wallNow + 2000;
+                LOG_F(INFO, "[join] beat: plc=%d send=%d myend=%d sh=%d r2s=%d gm=%d dead=%d tc=%d otc=%d stall=0x%x np=%d",
+                      movefifoplc, movefifosendplc, g_player[myconnectindex].movefifoend,
+                      g_netSampleHead, (int)ready2send, ps ? (int)ps->gm : -1,
+                      ps ? (int)ps->dead_flag : -1, (int32_t)totalclock, (int32_t)ototalclock,
+                      (unsigned)g_netStallMask, numplayers);
+            }
         }
     }
 
@@ -553,6 +559,8 @@ int32_t g_netSampleHead;             // slave: absolute tic of the next local sa
 int32_t g_netFillTics;               // master: synthesized tics (deadline/join fill)
 int32_t g_netJoinCatchup;            // joiner/healing guest: applied the snapshot, streaming to live
 int32_t g_netDesyncReporters;        // host: bitmask of guests whose DESYNC_REPORT named them diverged
+uint32_t s_pendingSpawnMask;         // late-join seats waiting for their first spawn (press open/fire)
+uint32_t g_seatDiagUntil;            // wall-ms deadline for the post-seat cursor beat (diagnostic)
 int32_t g_netEolFromHost;            // guest: this MODE_EOL was authorized by PACKET_TYPE_EOL
 static int32_t s_eolPending;         // guest: between EOL-received and level entry -- drop
                                      // unreliable stream packs (a stale E1L1 snap/paint applied
@@ -2875,6 +2883,7 @@ static void Net_ResetProtocolState(void)
     g_netDesyncReporters = 0;
     g_netEolFromHost = 0;
     s_eolPending     = 0;
+    s_pendingSpawnMask = 0;
     s_eolWaitMask    = 0;
     s_eolGraceClock  = 0;
     s_hostEolWait    = 0;
@@ -4277,6 +4286,25 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     if (g_gametypeFlags[ud.m_coop] & GAMETYPE_COOP)
                         ud.m_ffire = 0;          // mirror the host: no friendly fire in coop
                 }
+                if (g_netStreamMode
+                    && (g_netJoinCatchup
+                        || (g_player[myconnectindex].connected
+                            && g_player[myconnectindex].ps != NULL
+                            && (g_player[myconnectindex].ps->gm & MODE_GAME))))
+                {
+                    // STALE REDELIVERY GUARD: the host re-sends NEW_GAME until
+                    // a guest acks with PLAYER_READY -- which a catchup joiner
+                    // NEVER sends (it skips the barrier). The redelivery used
+                    // to land right after the seat and RESTART the level over
+                    // the freshly synced world (plc back to 0, column never
+                    // aggregated again: "stuck in one place, can't move but I
+                    // can fire; they don't have my state" -- live-reported
+                    // 3rd seat, 2026-08-16). Mid-catchup or seated in-game,
+                    // a NEW_GAME can only be stale: drop it.
+                    LOG_F(INFO, "[nnative] stale NEW_GAME ignored (catchup=%d, already in the match)",
+                          (int)g_netJoinCatchup);
+                    break;
+                }
                 if (flags & NEWGAME_VIA_SNAPSHOT)
                 {
                     // LAUNCH VIA SNAPSHOT: do NOT enter locally. The host
@@ -4606,6 +4634,11 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                         return;   // stale generation
                 }
                 int32_t const ack = (int32_t)B_UNBUF32(&packbuf[2]);
+                // A joiner in the catchup pipeline consumed its entry state
+                // from the snapshot -- stop the NEW_GAME redelivery loop that
+                // would otherwise restart its level post-seat (it never sends
+                // the PLAYER_READY that normally acks it).
+                s_newGameAckMask |= (1u << other);
                 if (s_joinFlowIsHeal && other == s_joinFlowSlot)
                     s_healAckFence = 1;   // post-apply by construction
                 if (ack > s_slaveAck[other])
@@ -5372,6 +5405,23 @@ static int Net_RotateFreeSpriteToHead(int16_t idx)
 // EVERY peer runs this at the same consumed tic (Net_ApplyPendingJoins), so it
 // must be bit-deterministic: the template is CONNECTHEAD's ps -- identical
 // lockstep state on every peer -- never myconnectindex's (which differs).
+// Seats waiting for their first spawn (press open/fire). The synthetic
+// dead-pending body never ran the CON dying sequence, so the CON's own
+// respawn keypress check can never fire for it -- P_Dead consults this mask
+// and runs the same gametype-gated reset engine-side. Input columns
+// replicate to every peer, so the spawn lands on the same tic everywhere.
+extern uint32_t s_pendingSpawnMask;  // declared with the early statics (level reset zeroes it)
+extern "C" int Net_PendingSpawnSeat(int playerNum)
+{
+    return (playerNum >= 0 && playerNum < MAXPLAYERS
+            && (s_pendingSpawnMask & (1u << playerNum))) ? 1 : 0;
+}
+extern "C" void Net_PendingSpawnDone(int playerNum)
+{
+    if (playerNum >= 0 && playerNum < MAXPLAYERS)
+        s_pendingSpawnMask &= ~(1u << playerNum);
+}
+
 void Net_InsertLatePlayer(int k)
 {
     if ((unsigned)k >= MAXPLAYERS || g_playerSpawnCnt <= 0)
@@ -5421,21 +5471,33 @@ void Net_InsertLatePlayer(int k)
     auto &s = sprite[i];
     s.yvel     = k;    // classic contract: a player sprite's yvel is its player index
     s.clipdist = 64;
-    s.cstat    = 257;
     s.owner    = i;
     s.pal      = p.palookup;
     s.shade    = -12;
     s.xoffset  = 0;
     s.xrepeat  = 42;
     s.yrepeat  = 36;
-    s.extra    = p.max_player_health;
+    // LATE JOINERS SPAWN ON DEMAND (user 2026-08-16: "they should need to
+    // press open to spawn -- and only if the game type allows it"): the seat
+    // lands DEAD-PENDING -- no visible body, zero health, dead_flag armed --
+    // and the engine's own death machinery takes it from there: P_Dead runs
+    // the wait state, the APLAYER CON accepts the open/fire press, and
+    // CON_RESETPLAYER's MP branch applies the gametype gates (LMS lives,
+    // no-respawn co-op) before P_ResetMultiPlayer spawns the body (which
+    // restores cstat 257 + full health + dead_flag 0). Every peer consumes
+    // the same input column, so the spawn decision replicates; the exact
+    // position converges via POS_REPORT like any ordinary respawn.
+    s.cstat    = 32768;
+    s.extra    = 0;
+    p.dead_flag  = 1;
     p.last_extra = p.max_player_health;
     p.inv_amount[GET_SHIELD] = g_startArmorAmount;
 
     P_ResetWeapons(k);   // includes the MP shotgun arena loadout
     P_ResetInventory(k);
 
-    initprintf("net: inserted late player %d at spawn %d\n", k, k % g_playerSpawnCnt);
+    s_pendingSpawnMask |= (1u << k);
+    LOG_F(INFO, "[seat] player %d inserted PENDING (press open to spawn)", k);
 }
 
 // RECEIVER: seat the mask, load LATEJOIN_SAVE, restore the LOCAL identity (the
@@ -5643,11 +5705,35 @@ void Net_ApplyPendingJoins(void)
             { extern int32_t g_clipLogBudget; g_clipLogBudget = 40; }
 #endif
             // I am the joiner: leave spectator mode and start staging real
-            // inputs from this very tic.
+            // inputs AT THE LIVE EDGE, not the seat tic. The host zero-fills
+            // this seat's column from the announcement on (joinerNoReal
+            // synthesis: the match never stalls on a joiner) and its send
+            // cursor runs AHEAD of the sims -- records sampled from the seat
+            // tic arrive forever behind the fill and every one is dup-dropped:
+            // the seat was PERMANENTLY zero-input on the host ("I'm stuck in
+            // one place, I can't move but I can fire; they don't have my
+            // state" -- live-reported 3rd seat, 2026-08-16). movefifosendplc
+            // tracks the host's send cursor within wire latency; sampling just
+            // ahead of it lands our first real records beyond the fill, which
+            // clears joinerNoReal and hands the column back to us.
             g_netJoinCatchup = 0;
             screenpeek       = myconnectindex;
-            g_netSampleHead  = movefifoplc;
-            s_ackOfMyInput   = movefifoplc;
+            g_netSampleHead  = max(movefifoplc, movefifosendplc + 4);
+            s_ackOfMyInput   = g_netSampleHead;
+            g_seatDiagUntil  = timerGetTicks() + 40000;
+            // Spawn-on-demand seat: tell the player what the black screen
+            // wants from them (the seat is dead-pending by design).
+            // QUOTE_RESERVED3 is NOT allocated unless some CON defined it --
+            // writing it blind was a null Bstrcpy that killed the engine the
+            // instant the seat landed (every post-seat stall since the
+            // redesign was this crash).
+            if (apStrings[QUOTE_RESERVED3] == NULL)
+                C_AllocQuote(QUOTE_RESERVED3);
+            if (apStrings[QUOTE_RESERVED3] != NULL)
+            {
+                Bstrcpy(apStrings[QUOTE_RESERVED3], "PRESS OPEN TO SPAWN");
+                P_DoQuote(QUOTE_RESERVED3, g_player[myconnectindex].ps);
+            }
             // The pre-seat sampler never ran, so the lag/jitter bookkeeping
             // accumulated garbage (localNow was -1): reset it or the first
             // timer-nudge block would jerk totalclock by a bogus offset.
@@ -5810,8 +5896,17 @@ void Net_HostJoinFlow(void)
         {
             // Too slow for the 256-tic ring (cold art/texture caches). Each
             // retry re-bases the stream on a FRESH snapshot; the joiner gets
-            // warmer every pass. Persistent failure -> kick.
-            if (++s_joinFlowTries >= NET_JOIN_TRIES)
+            // warmer every pass. Persistent failure -> kick -- but ONLY count
+            // a try once the joiner has acked at all: a browser seat can
+            // spend 20s+ just booting the engine (bigger GRPs boot slower),
+            // and exhausting the try budget during boot kicked live joiners
+            // ("immediately desyncs and disconnects"). While it has never
+            // acked, re-base patiently; the transport peer-down path still
+            // reaps genuinely dead joiners.
+            bool const everAcked = (s_slaveAck[k] > s_joinFlowBase);
+            if (!everAcked)
+                s_joinFlowTries = 0;
+            if (everAcked && ++s_joinFlowTries >= NET_JOIN_TRIES)
             {
                 initprintf("net: %s %d cannot catch up -> kick\n",
                            s_joinFlowIsHeal ? "heal target" : "joiner", k);
