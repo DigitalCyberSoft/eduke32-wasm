@@ -1249,7 +1249,14 @@ static int32_t VM_ResetPlayer(int const playerNum, int32_t vmFlags, int32_t cons
                 !(g_gametypeFlags[ud.coop] & GAMETYPE_NORESPAWN)
                 && (!(g_gametypeFlags[ud.coop] & GAMETYPE_LMS) || Net_LmsAllowRespawn(playerNum));
             if (allowRespawn)
+            {
                 P_ResetMultiPlayer(playerNum);
+                // Stream bystanders get zero-filled inputs for other guests,
+                // so their sim never reaches this respawn opcode for those
+                // seats -- the host telegraphs it (no-op off-host/classic).
+                extern void Net_BroadcastSeatSpawn(int playerNum);
+                Net_BroadcastSeatSpawn(playerNum);
+            }
         }
 #endif
     }

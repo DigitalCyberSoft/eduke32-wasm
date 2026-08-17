@@ -625,6 +625,30 @@ void P_MoveToRandomSpawnPoint(int playerNum)
     auto &p = *g_player[playerNum].ps;
     int i = playerNum;
 
+    {
+        extern int32_t g_netStreamMode, g_netForensics;
+        // STREAM MODE: only the seat's OWNING peer rolls the pick. Self pos is
+        // client-authoritative (POS_REPORT/gpos snaps every other peer within
+        // a beat), so a non-owner's roll is not just wasted: it burns local
+        // krand and scores candidates against THIS peer's drifted copies of
+        // the other players -- three peers picked rows 7/0/5 for the same
+        // join spawn, live -- and can materialize the body onto a player in
+        // this peer's world (DM friendly fire = local telefrag). Non-owners
+        // hold the body where it is until the owner's stream places it.
+        if (g_netStreamMode && numplayers > 1 && playerNum != myconnectindex)
+        {
+            if (g_netForensics)
+            {
+#ifdef __EMSCRIPTEN__
+                EM_ASM({ console.log('[spawn] hold p=' + $0 + ' plc=' + $1); }, playerNum, (int)movefifoplc);
+#else
+                LOG_F(INFO, "[spawn] hold p=%d plc=%d", playerNum, (int)movefifoplc);
+#endif
+            }
+            return;
+        }
+    }
+
     if ((g_netServer || ud.multimode > 1) && !(g_gametypeFlags[ud.coop] & GAMETYPE_FIXEDRESPAWN))
     {
         // THREE krand candidates, keep the one farthest from living enemies
@@ -700,14 +724,19 @@ void P_MoveToRandomSpawnPoint(int playerNum)
     if ((g_gametypeFlags[ud.coop] & GAMETYPE_COOP) && g_playerSpawnCnt > 0)
         i = 0;
 
-#ifdef __EMSCRIPTEN__
     {
         extern int32_t g_netForensics;
         if (g_netForensics)
-            EM_ASM({ console.log('[spawn] random p=' + $0 + ' row=' + $1 + ' sect=' + $2 + ' cnt=' + $3); },
-                   playerNum, i, (int)g_playerSpawnPoints[i].sect, g_playerSpawnCnt);
-    }
+        {
+#ifdef __EMSCRIPTEN__
+            EM_ASM({ console.log('[spawn] random p=' + $0 + ' row=' + $1 + ' sect=' + $2 + ' cnt=' + $3 + ' plc=' + $4); },
+                   playerNum, i, (int)g_playerSpawnPoints[i].sect, g_playerSpawnCnt, (int)movefifoplc);
+#else
+            LOG_F(INFO, "[spawn] random p=%d row=%d sect=%d cnt=%d plc=%d",
+                  playerNum, i, (int)g_playerSpawnPoints[i].sect, g_playerSpawnCnt, (int)movefifoplc);
 #endif
+        }
+    }
     p.opos = p.pos = g_playerSpawnPoints[i].xyz;
 
     p.bobpos     = p.pos.xy;

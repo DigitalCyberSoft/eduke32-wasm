@@ -5282,6 +5282,14 @@ static void P_Dead(int const playerNum, int const sectorLotag, int const floorZ,
                     Net_PendingSpawnDone(playerNum);
                     P_ResetMultiPlayer(playerNum);
                     LOG_F(INFO, "[seat] player %d spawned on demand", playerNum);
+                    {
+                        // Bystander guests never see this seat's OPEN press
+                        // (zero-filled input columns for other guests): the
+                        // host must TELL them the seat is up or it stays a
+                        // corpse on their screen until the next softsnap.
+                        extern void Net_BroadcastSeatSpawn(int playerNum);
+                        Net_BroadcastSeatSpawn(playerNum);
+                    }
                     if (playerNum == myconnectindex)
                     {
                         // Leave the waiting room: the pending phase spectated

@@ -279,6 +279,7 @@ enum DukePacket_t
     PACKET_TYPE_READY_ROSTER,  // host -> guests, ~1Hz while at the entry barrier: bitmask of seats already in (display only)
     PACKET_TYPE_LEVEL_GO,      // host -> guests, stream mode: EXPLICIT entry release ([1] = host crossing number); the only signal that opens a guest's barrier
     PACKET_TYPE_JOIN_ACK,      // catchup peer -> host, RELIABLE: [1]=epoch, [2..5]=contiguous M2S applied; paces the join/heal flow (s_slaveAck)
+    PACKET_TYPE_SEAT_SPAWNED,  // host -> guests, stream: [1]=seat that just spawned (on-demand or respawn). Bystanders get ZERO-FILLED inputs for other guests, so they can never infer another guest's spawn from the input stream -- it must be told.
     PACKET_END, // Should remain last in list.
 };
 
@@ -298,6 +299,7 @@ void Net_DrainEnemyHits(void);    // host, on-tick: apply guests' reported enemy
 void Net_GlideEnemies(void);      // guest, per-tic: glide live enemies onto streamed positions (no snap jitter)
 void Net_ApplyGuestWeapon(int seat); // host, per-tic: force a guest seat's curr_weapon/got/ammo from its report
 void Net_ApplyGuestPos(int seat);    // host, per-tic: adopt a guest seat's reported position/facing (client-authoritative movement)
+void Net_BroadcastSeatSpawn(int playerNum); // host, stream: reliable "seat spawned" telegram to every guest (bystanders cannot infer it -- see PACKET_TYPE_SEAT_SPAWNED)
 void Net_ShareCoopAccess(void);      // host, per-tic (coop): union every seat's key cards and share to all (guest no-op)
 void Net_SendQuit(void);
 void Net_SendWeaponChoice(void);

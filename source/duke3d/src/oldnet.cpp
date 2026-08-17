@@ -3929,6 +3929,9 @@ void Net_ParsePackets(void)
 // Formerly the body of the mmulti_getpacket() loop; the do/while(0) preserves
 // the original `continue`-to-skip-this-packet semantics now that each frame
 // arrives individually.
+extern "C" int Net_PendingSpawnSeat(int playerNum);   // defined below (pending-seat mask)
+extern "C" void Net_PendingSpawnDone(int playerNum);
+
 void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int packbufleng)
 {
     int i, j;
@@ -4615,6 +4618,42 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     g_netBarrierReadyMask = (uint32_t)B_UNBUF32(&packbuf[1]);
                 return;
             }
+            case PACKET_TYPE_SEAT_SPAWNED:
+            {
+                // Host's "seat pk[1] just spawned" telegram (on-demand join
+                // spawn or CON respawn). Bystander guests receive ZERO-FILLED
+                // inputs for other guests, so their sim never reaches the
+                // spawn opcode for those seats -- without the telegram the
+                // seat stayed a corpse here until the next aligned softsnap
+                // (observed 65s live: "joining can desync another guest").
+                // Position is NOT carried: the non-owner spawn hold keeps the
+                // body where it is and the owner's POS_REPORT/gpos stream
+                // places it within a beat.
+                if (packbufleng >= 2 && other == connecthead && g_netStreamMode
+                    && myconnectindex != connecthead)
+                {
+                    int const seat = packbuf[1];
+                    if ((unsigned)seat < MAXPLAYERS && seat != myconnectindex
+                        && g_player[seat].ps != NULL
+                        && (unsigned)g_player[seat].ps->i < MAXSPRITES)
+                    {
+                        int const pend = Net_PendingSpawnSeat(seat);
+                        bool const dead = (sprite[g_player[seat].ps->i].extra <= 0
+                                           || g_player[seat].ps->dead_flag);
+                        if (pend || dead)
+                        {
+                            if (pend)
+                                Net_PendingSpawnDone(seat);
+                            P_ResetMultiPlayer(seat);
+                            LOG_F(INFO, "[seat] remote spawn applied p=%d (pend=%d dead=%d)",
+                                  seat, pend, (int)dead);
+                        }
+                        // Already alive: our sim processed this spawn itself
+                        // (host seat / own seat) -- the telegram is a dupe.
+                    }
+                }
+                return;
+            }
             case PACKET_TYPE_LEVEL_GO:
             {
                 // STREAM MODE: the host's EXPLICIT entry release ("there
@@ -5160,7 +5199,13 @@ int32_t g_netPredictMode = 3;
 // Forensic console dumps (MISMATCH/INPDUMP/SPAWNDUMP/RNGDUMP/STATDUMP) --
 // default OFF: comparisons and auto-resync run regardless; the dump bursts
 // correlated with renderer deaths on the bench. Soak enables for hunts.
-int32_t g_netForensics = 0;
+// Native harnesses arm it with NN_FORENSICS=1 (browser uses the Web_ exports).
+static int32_t Net_ForensicsFromEnv(void)
+{
+    const char *e = getenv("NN_FORENSICS");
+    return (e && *e == '1') ? 1 : 0;
+}
+int32_t g_netForensics = Net_ForensicsFromEnv();
 // Test-harness input injectors: set only by the Emscripten Web_Test* exports
 // below, so they stay 0 in native builds -- but the consumer that reads them in
 // the input-staging path is compiled for NETNATIVE too, so the storage must
@@ -5457,8 +5502,10 @@ static int Net_RotateFreeSpriteToHead(int16_t idx)
 // Seats waiting for their first spawn (press open/fire). The synthetic
 // dead-pending body never ran the CON dying sequence, so the CON's own
 // respawn keypress check can never fire for it -- P_Dead consults this mask
-// and runs the same gametype-gated reset engine-side. Input columns
-// replicate to every peer, so the spawn lands on the same tic everywhere.
+// and runs the same gametype-gated reset engine-side. The keypress is only
+// visible where the seat's REAL input bits flow (the host, and the seat's
+// own client): stream-mode bystanders get zero-filled columns for other
+// guests, so they learn of the spawn via PACKET_TYPE_SEAT_SPAWNED instead.
 extern uint32_t s_pendingSpawnMask;  // declared with the early statics (level reset zeroes it)
 extern "C" int Net_PendingSpawnSeat(int playerNum)
 {
@@ -5469,6 +5516,28 @@ extern "C" void Net_PendingSpawnDone(int playerNum)
 {
     if (playerNum >= 0 && playerNum < MAXPLAYERS)
         s_pendingSpawnMask &= ~(1u << playerNum);
+}
+
+// Host, stream mode: tell every guest a seat just spawned (join spawn-on-
+// demand or CON respawn). A bystander's sim never reaches the spawn opcode
+// for OTHER guests (zero-filled input columns), so until this telegram
+// existed the seat stayed a corpse there until the next aligned softsnap --
+// up to a minute of "the joiner is dead/frozen on my screen" (live-reported
+// as "joining can desync another guest"). Carries no position: the receiver
+// resets the seat in place (non-owner spawn hold) and the owner's stream
+// places it within a beat.
+void Net_BroadcastSeatSpawn(int playerNum)
+{
+    if (!g_netStreamMode || numplayers <= 1 || myconnectindex != connecthead
+        || oldnet_predicting || (unsigned)playerNum >= MAXPLAYERS)
+        return;
+
+    uint8_t pk[2] = { PACKET_TYPE_SEAT_SPAWNED, (uint8_t)playerNum };
+    int i;
+    TRAVERSE_CONNECT(i)
+        if (i != myconnectindex && !(g_netBotMask & (1 << i)))
+            oldnet_sendpacket(i, pk, 2);
+    LOG_F(INFO, "[seat] spawn telegram p=%d", playerNum);
 }
 
 void Net_InsertLatePlayer(int k)
@@ -6544,7 +6613,7 @@ void Net_ApplyGuestPos(int seat)
     // read "seat 2 never applies" from a healthy wire.
     static int32_t s_gpApplied[MAXPLAYERS];
     if ((++s_gpApplied[seat] & 511) == 1)
-        LOG_F(INFO, "[gpos] seat=%d applies=%d at (%d,%d)", seat, s_gpApplied[seat], ps->pos.x, ps->pos.y);
+        LOG_F(INFO, "[gpos] seat=%d applies=%d at (%d,%d) plc=%d", seat, s_gpApplied[seat], ps->pos.x, ps->pos.y, (int)movefifoplc);
 }
 
 // GUEST: report newly earned key cards upstream (reliable channel; idempotent).
