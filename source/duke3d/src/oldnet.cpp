@@ -894,6 +894,21 @@ static int16_t s_botDeadSect[MAXPLAYERS][BOT_DEAD_N]; // recently-unreachable ta
 static int16_t s_botDeadCool[MAXPLAYERS][BOT_DEAD_N]; // tics of avoidance left (0 = slot free)
 static int32_t s_botGoalNear[MAXPLAYERS];    // closest we have come to the current goal
 static int16_t s_botGoalStall[MAXPLAYERS];   // tics since that closest approach improved
+// ── Inventory / jetpack state (netduke32-mined, 2026-08-18) ─────────────────
+// SK_JETPACK is a TOGGLE edge-triggered through interface_toggle
+// (P_HandleSharedKeys, sector.cpp:2699-2701): a held bit fires exactly once
+// and then latches until released, so activation is a one-tic TAP guarded by
+// a cooldown. s_botJetHold is the jet-nav engagement window; while it runs,
+// the block below owns the vertical keys (JUMP=ascend / CROUCH=descend, the
+// sim's own jetpack controls) toward the current goal's z.
+static int16_t s_botJetHold[MAXPLAYERS];     // >0: jetpack vertical nav engaged
+static int8_t  s_botJetCool[MAXPLAYERS];     // tics until another SK_JETPACK tap
+// Forensics tallies for the [botinv] line: activations per seat, so gates can
+// assert the inventory features actually fire.
+static uint16_t s_botMedUses[MAXPLAYERS];    // SK_MEDKIT presses
+static uint16_t s_botSterUses[MAXPLAYERS];   // SK_STEROIDS presses
+static uint16_t s_botJetActs[MAXPLAYERS];    // jetpack ON taps
+static int32_t  s_botInvLogPlc[MAXPLAYERS];  // [botinv] rate limiter (movefifoplc)
 
 // Probe the straight WALK line to (tx,ty): can the feet take the direct path?
 // Follow-until-clear steering hangs off this -- goal-directed turning is only
@@ -1562,6 +1577,28 @@ static int Bot_PlanItem(int k, DukePlayer_t *ps)
     return 1;
 }
 
+// DM preferred ENGAGE DISTANCE by OUR current weapon (netduke32 fdmatrix
+// dukebot.cpp:73 collapsed to its their-weapon=PISTOL column, floored at 128
+// exactly like their max(fdmatrix[..],128) at :798). The steering keeps its
+// existing target heading and strafe; only the forward drive changes shape:
+// approach when farther than ~1.5x band, strafe-hold within the band, give
+// ground inside ~3/4 band. Contact weapons (128) effectively always press in.
+static int16_t const s_botEngageDist[MAX_WEAPONS] = {
+    128,   // KNEE        (contact)
+    1024,  // PISTOL
+    512,   // SHOTGUN
+    512,   // CHAINGUN
+    2560,  // RPG         (self-splash)
+    512,   // HANDBOMB
+    128,   // SHRINKER
+    1536,  // DEVISTATOR
+    128,   // TRIPBOMB
+    128,   // FREEZE
+    2560,  // HANDREMOTE  (pipebomb detonator in hand)
+    128,   // GROW
+    512,   // FLAMETHROWER (not in their matrix; short-range spray)
+};
+
 static input_t Bot_GetInput(int k)
 {
     input_t in = {};
@@ -1669,6 +1706,8 @@ static input_t Bot_GetInput(int k)
         s_botTrapTics[k]   = 0;
         s_botRouteLen[k]   = 0;             // routes don't survive teleports
         s_botRouteCool[k]  = 0;
+        s_botJetHold[k]    = 0;             // fresh body: no jet-nav carryover
+        s_botJetCool[k]    = 0;             // (activation tallies persist -- telemetry)
         for (int di = 0; di < BOT_DEAD_N; di++) // a teleport changes reachability:
             s_botDeadCool[k][di] = 0;           // forget which exits were impossible
     }
@@ -1680,6 +1719,18 @@ static input_t Bot_GetInput(int k)
     // player-targeting below is gated on !botCoop; the coop branch hunts the
     // nearest enemy sprite instead.
     bool const botCoop = (g_gametypeFlags[ud.coop] & GAMETYPE_COOP) != 0;
+    // LOW-RESOURCE ITEM PRIORITY (netduke32 dukebot.cpp:771 shape, our
+    // fields): badly hurt, or nearly dry on the current weapon -> a pickup
+    // errand outranks CLOSING on the combat target. It is a priority flip,
+    // not a flee: facing and firing at a visible target stay untouched; only
+    // the movement bias hands the body to the errand machinery below.
+    bool prioritizeItems = false;
+    {
+        int const w = ps->curr_weapon;
+        bool const lowAmmo = (unsigned)w < MAX_WEAPONS && ps->max_ammo_amount[w] > 0
+                             && ps->ammo_amount[w] <= (ps->max_ammo_amount[w] >> 3);
+        prioritizeItems = (sprite[ps->i].extra <= (ps->max_player_health >> 1)) || lowAmmo;
+    }
     // Skill knobs, one column per Duke difficulty the host picked:
     //   0 Piece Of Cake / 1 Let's Rock / 2 Come Get Some / 3 Damn I'm Good.
     // turn cap (ang units/tic), fire gate (max aim-off to shoot), aim wobble
@@ -1797,7 +1848,10 @@ static input_t Bot_GetInput(int k)
                     s_botNavX[k]    = sprite[mon].x;
                     s_botNavY[k]    = sprite[mon].y;
                 }
-                s_botGoal[k] = 0;            // a monster to fight: drop the errand
+                // A monster to fight: drop the errand -- unless resources are
+                // low and the errand IS the resupply (the priority flip).
+                if (!(prioritizeItems && s_botGoal[k] == 2))
+                    s_botGoal[k] = 0;
             }
             else
             {
@@ -1949,8 +2003,11 @@ static input_t Bot_GetInput(int k)
                 s_botNavY[k]    = tps->pos.y;
             }
         }
-        if (best >= 0 && (bestSeen || s_botNavOn[k]))
+        if (best >= 0 && (bestSeen || s_botNavOn[k])
+            && !(prioritizeItems && s_botGoal[k] == 2))
             s_botGoal[k] = 0;           // a fight we can PROSECUTE: drop the errand
+                                        // (kept when low resources make the
+                                        // ITEM errand outrank closing distance)
         else if (s_botGoal[k] == 0)
         {
             // Nobody in sight: run the ROOM ROUTINE. A close unseen enemy
@@ -1990,6 +2047,13 @@ static input_t Bot_GetInput(int k)
         if (s_botTurnPref[k] == 0 || (Bot_Rnd() & 63) == 0)
             s_botTurnPref[k] = (Bot_Rnd() & 1) ? 1 : -1;
         }   // end DM (player-target) acquisition branch
+        // Low-resource resupply: while a fight is on, errand planning above is
+        // suppressed -- but with prioritizeItems set the bot WANTS a nearby
+        // health/ammo detour to bias movement toward (Bot_PlanItem's own
+        // walk-line + 3000-unit leash keeps it a detour, not a quest).
+        if (prioritizeItems && s_botGoal[k] == 0
+            && (s_botTarget[k] >= 0 || (botCoop && s_botMonTgt[k] >= 0)))
+            Bot_PlanItem(k, ps);
     }
 
     // Stuck detection: intending to move but the feet aren't (walls, doors,
@@ -2318,6 +2382,8 @@ static input_t Bot_GetInput(int k)
 
     // Steering priority: wall-bounce > visible chase > blind homing/wander.
     int wantAng;
+    bool chaseTgt = false;      // movement heading is AT the combat target
+                                // (arms the DM engage-distance band below)
     if (s_botTrapTics[k] > 104 && !(s_botGoal[k] != 0 && s_botGoalSeen[k] > 0))
     {
         // Hard-trapped: hold the escape axis (the way we came in is the way
@@ -2339,11 +2405,16 @@ static input_t Bot_GetInput(int k)
         s_botLaneHold[k]--;
         wantAng = s_botLaneAng[k];      // committed to the open lane
     }
-    else if (hasTgt && (canHit || seesTarget || s_botNavOn[k]))
+    else if (hasTgt && (canHit || seesTarget || s_botNavOn[k])
+             && !(prioritizeItems && s_botGoal[k] == 2))
     {
         // Toward the target when the shot can land; along the ROUTE (first
         // portal midpoint) when it cannot -- homing at an unhittable target
         // grinds fences forever, the measured no-encounter equilibrium.
+        // (With prioritizeItems + a live ITEM errand this branch stands down:
+        // the errand branch below drives the BODY to the pickup while the
+        // aim/fire path -- keyed on seesTarget/canHit, not on wantAng --
+        // keeps facing and shooting the target. Their :841/:1128 behavior.)
         if (!canHit && s_botNavOn[k])
         {
             // Follow-until-clear (chase flavor): straight at the waypoint
@@ -2376,7 +2447,8 @@ static input_t Bot_GetInput(int k)
         }
         else
         {
-            wantAng = getangle(tgX - ps->pos.x, tgY - ps->pos.y);
+            wantAng  = getangle(tgX - ps->pos.x, tgY - ps->pos.y);
+            chaseTgt = true;
             if (!seesTarget)
                 wantAng = (wantAng + (int)(Bot_Rnd() % 129) - 64) & 2047;
         }
@@ -2494,7 +2566,27 @@ static input_t Bot_GetInput(int k)
     bool run = false;
     // Magnitudes trimmed ~15% (user: "move slightly too fast"). 80 was full
     // human run; 68 is a hair under.
-    if (canHit && dist2d <= 2048)        { fwdSpd = 20; strSpd = s_botStrafeDir[k] * 40; }         // knife: orbit
+    // DM ENGAGE-DISTANCE BAND (capability 4): when the movement heading is AT
+    // a hittable target, the forward drive follows the per-weapon preferred
+    // distance instead of the old fixed 2048/8192 ladder -- approach beyond
+    // ~1.5x band, strafe-hold inside the band, back off inside ~3/4 band
+    // (netduke32's fightPos pull toward fdmatrix range, dukebot.cpp:796-848).
+    // Strafe keeps the existing s_botStrafeDir orbit. Coop and every recovery
+    // state (bounce/lane/trap -- chaseTgt false) keep the old ladder.
+    if (!botCoop && canHit && chaseTgt && (unsigned)ps->curr_weapon < MAX_WEAPONS)
+    {
+        int32_t const band = s_botEngageDist[ps->curr_weapon];
+        int32_t const lo   = band - (band >> 2);
+        int32_t const hi   = band + (band >> 1);
+        if (dist2d > hi)
+        {
+            if (dist2d <= 8192) { fwdSpd = 48; strSpd = s_botStrafeDir[k] * 28; run = true; } // press in
+            else                { fwdSpd = 68; run = true; }                                   // close from afar
+        }
+        else if (dist2d < lo)            { fwdSpd = -34; strSpd = s_botStrafeDir[k] * 40; }    // give ground
+        else                             { fwdSpd = 0;   strSpd = s_botStrafeDir[k] * 40; }    // hold the band
+    }
+    else if (canHit && dist2d <= 2048)   { fwdSpd = 20; strSpd = s_botStrafeDir[k] * 40; }         // knife: orbit
     else if (canHit && dist2d <= 8192)   { fwdSpd = 48; strSpd = s_botStrafeDir[k] * 28; run = true; } // press
     else if (s_botBounceHold[k] > 0 && klabs(diff) > 150) { fwdSpd = 34; }                          // wall half-stride
     else                                 { fwdSpd = 68; run = true; }                               // roam
@@ -2502,8 +2594,9 @@ static input_t Bot_GetInput(int k)
     // redirect the FACING. The existing canHit circle-strafe already orbits
     // -- now correctly around the AIM -- and roam/nav keep their straight
     // heading; the aim just tracks the target independently.)
-    if (run)    in.bits    |= BIT(SK_RUN);
-    if (fwdSpd) in.extbits |= BIT(EK_MOVE_FORWARD);
+    if (run)        in.bits    |= BIT(SK_RUN);
+    if (fwdSpd > 0) in.extbits |= BIT(EK_MOVE_FORWARD);
+    if (fwdSpd < 0) in.extbits |= BIT(EK_MOVE_BACKWARD);   // engage-band back-off
     if (strSpd) in.extbits |= BIT(strSpd > 0 ? EK_STRAFE_LEFT : EK_STRAFE_RIGHT);
     if (fwdSpd || strSpd)
     {
@@ -2600,6 +2693,136 @@ static input_t Bot_GetInput(int k)
                 in.bits |= BIT(SK_CROUCH);
                 in.bits &= ~BIT(SK_JUMP);       // ducts: jumping just grinds the ceiling
             }
+        }
+    }
+
+    // JETPACK VERTICAL NAV (capability 2; netduke32 dukebot.cpp:1024-1177
+    // mined). Strictly OUT of water: underwater the surface rule above owns
+    // SK_JUMP -- "air outranks errands" stays supreme, and the jetpack state
+    // machine never runs there. While flying, the sim's own controls apply:
+    // SK_JUMP ascends, SK_CROUCH descends (their ASCEND/DESCEND :1161-1177).
+    {
+        bool const inWater = (sector[ps->cursectnum].lotag == ST_2_UNDERWATER);
+        if (s_botJetCool[k] > 0)
+            s_botJetCool[k]--;
+        // Goal z of the CURRENT movement objective: the combat target, the
+        // item errand's sprite, or the errand portal's floor (with a body
+        // height off it). z grows DOWN, so a goal ABOVE us gives dz > 0.
+        int32_t goalZ = 0;
+        bool haveGoalZ = false;
+        if (hasTgt)
+            { goalZ = tgZ; haveGoalZ = true; }
+        else if (s_botGoal[k] == 2 && (unsigned)s_botGoalItem[k] < MAXSPRITES)
+            { goalZ = sprite[s_botGoalItem[k]].z; haveGoalZ = true; }
+        else if (s_botGoal[k] != 0 && (unsigned)s_botGoalSect[k] < (unsigned)numsectors)
+            { goalZ = getflorzofslope(s_botGoalSect[k], s_botGoalX[k], s_botGoalY[k]) - (20 << 8); haveGoalZ = true; }
+        int32_t const dz = haveGoalZ ? ps->pos.z - goalZ : 0;   // >0: goal ABOVE
+        // No flying in crawl spaces: mirrors their (truefz-truecz) <= 72<<8
+        // descend clause (:1101) and keeps this block from fighting the duct
+        // crouch above and the hard-trap crouch escape.
+        bool const canFlyHere = !inWater && (ps->truefz - ps->truecz) > (72 << 8);
+        // ARM: fuel to spare (their >106 gate, :1028), the goal far ABOVE
+        // (their 48<<8 threshold shape, :1102/:1108), and the ground game
+        // failing -- the errand stall watch, the escalating bounce ladder, or
+        // the hard-trap clock say we are pinned against rising geometry.
+        if (!inWater && ps->inv_amount[GET_JETPACK] > 106
+            && s_botJetHold[k] == 0 && !ps->jetpack_on
+            && haveGoalZ && dz > (48 << 8) && canFlyHere
+            && (s_botGoalStall[k] > 40 || s_botStuckEpisodes[k] >= 2
+                || s_botTrapTics[k] > 60))
+            s_botJetHold[k] = 260;              // ~8.7s engagement window
+        if (s_botJetHold[k] > 0)
+        {
+            s_botJetHold[k]--;
+            bool const fuelOut = (ps->inv_amount[GET_JETPACK] < 106);
+            if (!ps->jetpack_on)
+            {
+                // Not airborne yet: TAP the toggle while the reason holds.
+                if (haveGoalZ && dz > (32 << 8) && !fuelOut && canFlyHere)
+                {
+                    if (s_botJetCool[k] == 0)
+                    {
+                        in.bits |= BIT(SK_JETPACK);
+                        s_botJetCool[k] = 12;
+                        s_botJetActs[k]++;
+                    }
+                }
+                else
+                    s_botJetHold[k] = 0;        // reason gone before liftoff
+            }
+            else if (haveGoalZ && dz > (16 << 8) && !fuelOut && canFlyHere)
+            {
+                in.bits |= BIT(SK_JUMP);        // ASCEND toward the goal z
+                in.bits &= ~BIT(SK_CROUCH);
+            }
+            else
+            {
+                // Near goal z / goal below / fuel low: DESCEND, and once the
+                // floor is close, tap the toggle OFF (their :1161-1169).
+                in.bits &= ~BIT(SK_JUMP);
+                in.bits |= BIT(SK_CROUCH);
+                if (ps->truefz <= ps->pos.z + (72 << 8) && s_botJetCool[k] == 0)
+                {
+                    in.bits |= BIT(SK_JETPACK); // land: toggle off
+                    s_botJetCool[k] = 12;
+                    s_botJetHold[k] = 0;
+                }
+            }
+        }
+        else if (ps->jetpack_on && !inWater)
+        {
+            // Jetpack running with NO jet-nav engaged (window expired, or the
+            // sim left it on across an event): land it -- descend and toggle
+            // off near the floor, so the bot never hovers aimlessly.
+            in.bits &= ~BIT(SK_JUMP);
+            in.bits |= BIT(SK_CROUCH);
+            if (ps->truefz <= ps->pos.z + (72 << 8) && s_botJetCool[k] == 0)
+            {
+                in.bits |= BIT(SK_JETPACK);
+                s_botJetCool[k] = 12;
+            }
+        }
+    }
+
+    // INVENTORY USE (capability 1; netduke32 dukebot.cpp:1195-1199). Verified
+    // against OUR P_HandleSharedKeys: SK_MEDKIT (sector.cpp:3159) heals from
+    // inv_amount[GET_FIRSTAID] directly and SK_STEROIDS (sector.cpp:2762)
+    // starts a dose only at a full 400 bottle -- both plain edge-triggered SK_
+    // bits, so a one-tic press IS what a human's key does. Cadences ride
+    // Bot_Rnd, the per-seat private RNG -- never the sim's krand.
+    {
+        // Medkit: hurt below ~2/3 max health, 1-in-25 per tic (their :1195).
+        if (ps->inv_amount[GET_FIRSTAID] > 0
+            && ps->last_extra < (ps->max_player_health * 2) / 3
+            && (Bot_Rnd() % 25) == 0)
+        {
+            in.bits |= BIT(SK_MEDKIT);
+            s_botMedUses[k]++;
+        }
+        // Steroids: DM only, a visible locked target at close quarters (or
+        // caught with the knee out), full bottle, 1-in-100 per tic (:1198).
+        if (!botCoop && hasTgt && seesTarget
+            && ps->inv_amount[GET_STEROIDS] >= 400
+            && (dist2d <= 2560 || ps->curr_weapon == KNEE_WEAPON)
+            && (Bot_Rnd() % 100) == 0)
+        {
+            in.bits |= BIT(SK_STEROIDS);
+            s_botSterUses[k]++;
+        }
+        // Forensics: per-seat activation tallies (medkit/steroids/jetpack), at
+        // most one line per seat per ~2s -- lets gates assert the features
+        // fire. LOG_F lands in the native harness logs (EM_ASM is a no-op
+        // there, compat.h:18) and in the wasm console via stderr.
+        extern int32_t g_netForensics;
+        if (g_netForensics
+            && (in.bits & (BIT(SK_MEDKIT) | BIT(SK_STEROIDS) | BIT(SK_JETPACK)))
+            && (movefifoplc - s_botInvLogPlc[k] >= 60
+                || movefifoplc < s_botInvLogPlc[k]))   // plc restarted (level change)
+        {
+            s_botInvLogPlc[k] = movefifoplc;
+            LOG_F(INFO, "[botinv] plc=%d seat=%d med=%d ster=%d jet=%d",
+                  (int)movefifoplc, k, (int)s_botMedUses[k],
+                  (int)s_botSterUses[k], (int)s_botJetActs[k]);
         }
     }
 
@@ -2742,8 +2965,14 @@ void Net_SeatBots(int minPlayers, int skill)
     // "targeting sprite 0" for a tic before the first respawn reset.
     for (int k = 0; k < MAXPLAYERS; k++)
     {
-        s_botTarget[k] = -1;
-        s_botMonTgt[k] = -1;
+        s_botTarget[k]    = -1;
+        s_botMonTgt[k]    = -1;
+        s_botJetHold[k]   = 0;      // inventory/jetpack graft state: fresh match
+        s_botJetCool[k]   = 0;
+        s_botMedUses[k]   = 0;
+        s_botSterUses[k]  = 0;
+        s_botJetActs[k]   = 0;
+        s_botInvLogPlc[k] = 0;
     }
     if (myconnectindex != connecthead)
         return;
