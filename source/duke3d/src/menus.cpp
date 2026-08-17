@@ -1965,7 +1965,7 @@ static MenuOption_t MEO_NET_CFG_LOCALONLY = MAKE_MENUOPTION( &MF_Bluefont, &MEOS
 static MenuEntry_t ME_NET_CFG_LOCALONLY = MAKE_MENUENTRY( "Local Only", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_LOCALONLY, Option );
 static MenuOption_t MEO_NET_CFG_AUTOAIM = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_OffOn, &s_netAutoAim );
 static MenuEntry_t ME_NET_CFG_AUTOAIM = MAKE_MENUENTRY( "Auto Aim", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_AUTOAIM, Option );
-static MenuRangeInt32_t MEO_NET_CFG_BOTS = MAKE_MENURANGE( &s_netMinPlayers, &MF_Bluefont, 1, 8, 0, 8, DisplayTypeInteger|EnforceIntervals );
+static MenuRangeInt32_t MEO_NET_CFG_BOTS = MAKE_MENURANGE( &s_netMinPlayers, &MF_Bluefont, 1, 16, 0, 16, DisplayTypeInteger|EnforceIntervals );
 static MenuEntry_t ME_NET_CFG_BOTS = MAKE_MENUENTRY( "Min Players", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_BOTS, RangeInt32 );
 // CPU skill labels mirror the game's OWN skill names (user: "the CPU skills
 // should match the regular game levels: piece of cake, lets rock, come get
@@ -2046,7 +2046,7 @@ void Menu_NetConfigLoad(void)
     SCRIPT_GetNumber(h, "Multiplayer", "AutoAim",    &s_netAutoAim);
     // Guard a hand-edited / stale cfg (ranges mirror the menu widgets).
     s_netMaxPlayers = clamp(s_netMaxPlayers, 2, 16);
-    s_netMinPlayers = clamp(s_netMinPlayers, 1, 8);
+    s_netMinPlayers = clamp(s_netMinPlayers, 1, 16);
     s_netBotSkill   = clamp(s_netBotSkill, 0, 3);
     s_netAutoAim    = clamp(s_netAutoAim, 0, 1);
 }
