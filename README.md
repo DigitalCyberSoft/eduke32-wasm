@@ -2,7 +2,7 @@
 
 Duke Nukem 3D on WebAssembly, with serverless peer-to-peer multiplayer.
 
-[![Duke Nukem 3D main menu running in a browser](platform/emscripten/og-image.png)](https://digitalcybersoft.github.io/eduke32-wasm/)
+[![Duke Nukem 3D title screen](platform/emscripten/og-image.png)](https://digitalcybersoft.github.io/eduke32-wasm/)
 
 ### [▶ PLAY NOW — digitalcybersoft.github.io/eduke32-wasm](https://digitalcybersoft.github.io/eduke32-wasm/)
 
