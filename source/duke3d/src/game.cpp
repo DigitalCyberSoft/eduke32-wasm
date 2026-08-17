@@ -1393,7 +1393,25 @@ static int32_t G_InitActor(int32_t i, int32_t tilenum, int32_t set_movflag_uncon
 int32_t A_InsertSprite(int16_t whatsect,int32_t s_x,int32_t s_y,int32_t s_z,int16_t s_pn,int8_t s_s,
                        uint8_t s_xr,uint8_t s_yr,int16_t s_a,int16_t s_ve,int16_t s_zv,int16_t s_ow,int16_t s_ss)
 {
-
+#ifdef NETDUKE32
+    // Prediction-replay rail: the replay sandbox swaps sprite[] and the
+    // sect/stat lists, but the spawn init downstream (A_Spawn and friends)
+    // writes the REAL actor[] entry of a slot the live lists may still hold,
+    // and any predicted spawn diverges this peer's world from the lockstep
+    // (the old 15-19s fork class). No known replay path spawns (weapons bail,
+    // the effect spawners are gated at their callers); refuse and name any
+    // new one. Rate-limited: a hot path must not flood the log.
+    if (EDUKE32_PREDICT_FALSE(oldnet_predicting))
+    {
+        static int32_t s_refused;
+        if (s_refused < 8 || (s_refused & 255) == 0)
+            LOG_F(ERROR, "A_InsertSprite: refused predicted spawn of pic %d from pic %d spr %d (refusal #%d)",
+                  s_pn, (s_ow < 0 || (unsigned)s_ow >= MAXSPRITES) ? -1 : TrackerCast(sprite[s_ow].picnum),
+                  s_ow, s_refused + 1);
+        s_refused++;
+        return -1;
+    }
+#endif
 
     int32_t newSprite;
 

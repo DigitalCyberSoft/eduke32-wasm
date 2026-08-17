@@ -426,6 +426,7 @@ void A_RadiusDamage(int spriteNum, int blastRadius, int dmg1, int dmg2, int dmg3
 void A_SpawnMultiple(int spriteNum, int tileNum, int spawnCnt);
 
 int  G_SetInterpolation(int32_t *posptr);
+void G_AddKillCredit(int spriteNum, DukePlayer_t *pFallback, uint16_t kills);
 void G_DeleteAllLights(void);
 void G_AddGameLight(int spriteNum, int sectNum, vec3_t const &offset, int lightRange, int lightRadius, int lightHoriz, uint32_t lightColor, int lightPrio);
 void G_InterpolateLights(int smoothratio);

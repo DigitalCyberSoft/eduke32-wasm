@@ -3772,7 +3772,9 @@ breakfor:
 
             vInstruction(CON_ADDKILLS):
                 insptr++;
-                P_AddKills(vm.pPlayer, *insptr++);
+                // vm.pPlayer is A_FindPlayer's NEAREST pick when an actor
+                // runs its death state -- resolve the actual killer instead.
+                G_AddKillCredit(vm.spriteNum, vm.pPlayer, *insptr++);
                 vm.pActor->stayput = -1;
                 dispatch();
 
@@ -7101,7 +7103,7 @@ void A_Execute(int const spriteNum, int const playerNum, int const playerDist)
     if ((unsigned)vm.pSprite->sectnum >= MAXSECTORS)
     {
         if (A_CheckEnemySprite(vm.pSprite))
-            P_AddKills(vm.pPlayer, 1);
+            G_AddKillCredit(vm.spriteNum, vm.pPlayer, 1);
 
         A_DeleteSprite(vm.spriteNum);
         return;

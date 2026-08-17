@@ -821,6 +821,25 @@ void A_DeleteSprite(int spriteNum)
     }
 
 #ifdef NETDUKE32
+    // Prediction-replay rail: the replay sandbox swaps sprite[]/the sect/stat
+    // lists, but EVENT_KILLIT, ambient-sound teardown and the deletion queue
+    // touch REAL state, and any predicted delete diverges this peer's world
+    // from the lockstep (the old 15-19s fork class). No known replay path
+    // deletes (the payloads are gated at their callers); refuse and name any
+    // new one. Rate-limited: a hot path must not flood the log.
+    if (EDUKE32_PREDICT_FALSE(oldnet_predicting))
+    {
+        static int32_t s_refused;
+        if (s_refused < 8 || (s_refused & 255) == 0)
+            LOG_F(ERROR, "A_DeleteSprite: refused predicted delete of sprite %d pic %d (refusal #%d)",
+                  spriteNum, ((unsigned)spriteNum < MAXSPRITES) ? TrackerCast(sprite[spriteNum].picnum) : -1,
+                  s_refused + 1);
+        s_refused++;
+        return;
+    }
+#endif
+
+#ifdef NETDUKE32
     // DEBUG (residual-fork hunt): per-tic delete accounting (sync.cpp cat 13),
     // with the victims' picnums so a one-peer-only delete names itself.
     if (numplayers > 1 && !oldnet_predicting)
@@ -871,6 +890,39 @@ void A_DeleteSprite(int spriteNum)
 #else
     Net_DeleteSprite(spriteNum);
 #endif
+}
+
+// Kill credit for a dying sprite belongs to the KILLER: resolve the dying
+// sprite's htowner (stamped by every damage path, and by the host for
+// guest-reported hits) to a player seat. The callers historically credited
+// whatever player they had at hand -- A_FindPlayer's NEAREST pick, or even
+// the local seat -- which pays coop kills to bystanders and disagrees across
+// peers. When the owner chain does not end at a player (crushers, recon cars
+// downed by hazards, ...), fall back to the caller's legacy player so those
+// deaths keep their stock attribution. actors_killed stays per-peer sim
+// state; authoritative display comes from the host's copy.
+void G_AddKillCredit(int const spriteNum, DukePlayer_t * const pFallback, uint16_t const kills)
+{
+#ifdef NETDUKE32
+    // A resolved seat can be ANOTHER player's real ps -- never from a replay
+    // (same rule as the P_QuickKill rail).
+    if (oldnet_predicting)
+        return;
+#endif
+
+    if ((unsigned)spriteNum < MAXSPRITES)
+    {
+        int const ownerSprite = actor[spriteNum].htowner;
+
+        if ((unsigned)ownerSprite < MAXSPRITES && sprite[ownerSprite].picnum == APLAYER &&
+            (unsigned)P_Get(ownerSprite) < MAXPLAYERS)
+        {
+            P_AddKills(g_player[P_Get(ownerSprite)].ps, kills);
+            return;
+        }
+    }
+
+    P_AddKills(pFallback, kills);
 }
 
 void A_AddToDeleteQueue(int spriteNum)
@@ -4179,6 +4231,14 @@ static void P_FinishWaterChange(int const playerNum, DukePlayer_t * const pPlaye
 
     P_UpdateScreenPal(pPlayer);
 
+#ifdef NETDUKE32
+    // Reachable from the prediction replay via G_MovePlayerSprite's TROR
+    // water crossing: the position/sector writes above stay inside the replay
+    // sandbox, but effect spawns would hit the A_InsertSprite rail.
+    if (oldnet_predicting)
+        return;
+#endif
+
     if ((krand()&255) < 32)
         A_Spawn(playerNum, WATERSPLASH2);
 
@@ -4998,7 +5058,10 @@ ACTOR_STATIC void G_MoveActors(void)
                     int const newSprite = A_Spawn(spriteNum, EXPLOSION2);
                     A_PlaySound(LASERTRIP_EXPLODE, newSprite);
                     A_Spawn(spriteNum, PIGCOP);
-                    P_AddKills(g_player[myconnectindex].ps, 1);
+                    // Resolve to whoever downed the recon car; the legacy
+                    // fallback (the LOCAL seat) is a different player on every
+                    // peer, so only the resolved path agrees in multiplayer.
+                    G_AddKillCredit(spriteNum, g_player[myconnectindex].ps, 1);
                     DELETE_SPRITE_AND_CONTINUE(spriteNum);
                 }
 
@@ -5216,7 +5279,8 @@ ACTOR_STATIC void G_MoveActors(void)
                     if (damageTile == FREEZEBLAST)
                         goto next_sprite;
 
-                    P_AddKills(pPlayer, 1);
+                    // pPlayer is A_FindPlayer's NEAREST pick, not the shooter.
+                    G_AddKillCredit(spriteNum, pPlayer, 1);
 
                     for (bssize_t j = 16; j >= 0; --j)
                     {
@@ -5278,7 +5342,10 @@ ACTOR_STATIC void G_MoveActors(void)
                             sprite[j].pal = 0;
                         }
 
-                        P_AddKills(pPlayer, 1);
+                        // pPlayer here is the slimed player, who is also the
+                        // only one who can shoot it off -- but credit through
+                        // the damage chain like every other death.
+                        G_AddKillCredit(spriteNum, pPlayer, 1);
                         pData[0] = GREENSLIME_DEAD;
 
                         if (pPlayer->somethingonplayer == spriteNum)
@@ -5362,7 +5429,8 @@ ACTOR_STATIC void G_MoveActors(void)
                     goto next_sprite;
                 }
 
-                P_AddKills(pPlayer, 1);
+                // pPlayer is A_FindPlayer's NEAREST pick, not the shooter.
+                G_AddKillCredit(spriteNum, pPlayer, 1);
 
                 if ((krand()&255) < 32)
                 {
@@ -5567,6 +5635,14 @@ ACTOR_STATIC void G_MoveActors(void)
             fallthrough__;
         case HEAVYHBOMB__:
         {
+            enum
+            {
+                // Spare t_data slot: the pipebomb uses 0 (pickup delay),
+                // 2 (fuse/respawn time), 3 (was shot), 5 (water splash),
+                // 6/7 (timer control; see the fuse init in player.cpp).
+                PIPEBOMB_ORIGINALOWNER = 1,
+            };
+
             int           playerNum;
             DukePlayer_t *pPlayer;
             int           detonatePlayer;
@@ -5578,6 +5654,29 @@ ACTOR_STATIC void G_MoveActors(void)
                     A_PlaySound(TELEPORTER, spriteNum);
                     A_Spawn(spriteNum, TRANSPORTERSTAR);
                     pSprite->cstat = 257;
+
+                    if (pSprite->picnum == HEAVYHBOMB)
+                    {
+                        // A bomb that respawned after being SHOT must come
+                        // back pristine: the detonation leaves the was-shot
+                        // latch (pData[3]), the armed fuse state (pData[6]),
+                        // spent health and any pending htextra behind, and
+                        // each of those re-detonates the fresh bomb within
+                        // two tics of reappearing. The picked-up respawn was
+                        // already clean; this makes the shot respawn match.
+                        pData[2] = 0;
+                        pData[3] = 0;
+                        pData[5] = 0;
+                        pData[6] = 0;
+                        pData[7] = 0;
+                        pSprite->xvel  = 0;
+                        pSprite->yvel  = 4;
+                        pSprite->zvel  = 0;
+                        pSprite->extra = G_DefaultActorHealthForTile(pSprite->picnum);
+                        actor[spriteNum].htextra  = -1;
+                        actor[spriteNum].htowner  = spriteNum;
+                        actor[spriteNum].htpicnum = pSprite->picnum;
+                    }
                 }
                 goto next_sprite;
             }
@@ -5593,10 +5692,20 @@ ACTOR_STATIC void G_MoveActors(void)
 
             if (pData[3] == 0)
             {
+                // A_IncurDamage overwrites a shot sprite's owner with the
+                // damager (that is what pays the blast's kill credit to the
+                // shooter), but the respawn decision after the explosion
+                // needs the ORIGINAL owner: owner == spriteNum marks a
+                // map-placed bomb. Save it across the call, restore after
+                // the blast has spent the shooter credit.
+                pData[PIPEBOMB_ORIGINALOWNER] = -1;
+                int const originalOwner = pSprite->owner;
+
                 if (A_IncurDamage(spriteNum) >= 0)
                 {
                     pData[3]       = 1;
                     pData[2]       = 0;
+                    pData[PIPEBOMB_ORIGINALOWNER] = originalOwner;
                     detonatePlayer = 0;
                     pSprite->xvel  = 0;
                     goto DETONATEB;
@@ -5714,6 +5823,13 @@ DETONATEB:
 
                     for (bssize_t x = 0; x < 8; ++x)
                         RANDOMSCRAP(pSprite, spriteNum);
+
+                    // The blast above credited the shooter through the
+                    // clobbered owner; from here on only the respawn test
+                    // reads it, and that needs the map-placement marker.
+                    // HEAVYHBOMB only: mortars/mines keep stock delete-on-shot.
+                    if (pSprite->picnum == HEAVYHBOMB && pData[PIPEBOMB_ORIGINALOWNER] > -1)
+                        pSprite->owner = pData[PIPEBOMB_ORIGINALOWNER];
                 }
 
                 if (pSprite->yrepeat)
@@ -5747,14 +5863,18 @@ DETONATEB:
                     {
                         if ((g_gametypeFlags[ud.coop] & GAMETYPE_WEAPSTAY) && pSprite->owner == spriteNum)
                         {
-                            for (bssize_t j = 0; j < pPlayer->weapreccnt; j++)
-                            {
-                                if (pPlayer->weaprecs[j] == pSprite->picnum)
-                                    goto next_sprite;
-                            }
+                            // Weapon-stay credit is tracked per PICKUP SPRITE
+                            // (same model as CON_IFGOTWEAPONCE, gameexec.cpp):
+                            // a weaprecs scan here would key on the PICNUM, so
+                            // one map-placed pipebomb locked out every other
+                            // one for the rest of the life.
+                            extern uint16_t g_coopWeapGrab[MAXSPRITES];
+                            uint16_t const pmask = (uint16_t)(1u << playerNum);
 
-                            if (pPlayer->weapreccnt < MAX_WEAPONS)
-                                pPlayer->weaprecs[pPlayer->weapreccnt++] = pSprite->picnum;
+                            if (g_coopWeapGrab[spriteNum] & pmask)
+                                goto next_sprite;
+
+                            g_coopWeapGrab[spriteNum] |= pmask;
                         }
 
                         P_AddAmmo(pPlayer, HANDBOMB_WEAPON, 1);

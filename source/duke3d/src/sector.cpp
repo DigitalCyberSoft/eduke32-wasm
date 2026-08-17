@@ -24,6 +24,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 #include "duke3d.h"
 #include "input.h"
+#ifdef NETDUKE32
+# include "net_predict.h"  // oldnet_predicting: no world writes from replays
+#endif
 
 // PRIMITIVE
 
@@ -1266,6 +1269,15 @@ enum { SWITCH_WALL, SWITCH_SPRITE };
 
 int P_ActivateSwitch(int playerNum, int wallOrSprite, int switchType)
 {
+#ifdef NETDUKE32
+    // Reachable from the prediction replay (P_DoCounters runs the access-card
+    // hand off during P_ProcessInput): switches burn the once-per-tic
+    // lasttransport latch, flip real walls/sectors and can spawn through
+    // G_OperateRespawns -- authoritative time only.
+    if (oldnet_predicting)
+        return 0;
+#endif
+
     if (wallOrSprite < 0)
         return 0;
 
@@ -3114,7 +3126,13 @@ CHECKINV1:
             }
         }
 
-        if (TEST_SYNC_KEY(playerBits, SK_HOLODUKE) && (pPlayer->newowner == -1 || pPlayer->holoduke_on != -1))
+        if (TEST_SYNC_KEY(playerBits, SK_HOLODUKE) && (pPlayer->newowner == -1 || pPlayer->holoduke_on != -1)
+#ifdef NETDUKE32
+            // Holoduke toggling spawns/retires a world sprite: never from a
+            // prediction replay (A_InsertSprite rail).
+            && !oldnet_predicting
+#endif
+            )
         {
             if (pPlayer->holoduke_on == -1)
             {
