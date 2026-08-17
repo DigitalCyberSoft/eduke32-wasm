@@ -1273,9 +1273,11 @@ int P_ActivateSwitch(int playerNum, int wallOrSprite, int switchType)
     // Reachable from the prediction replay (P_DoCounters runs the access-card
     // hand off during P_ProcessInput): switches burn the once-per-tic
     // lasttransport latch, flip real walls/sectors and can spawn through
-    // G_OperateRespawns -- authoritative time only.
-    if (oldnet_predicting)
-        return 0;
+    // G_OperateRespawns -- authoritative time only. The macro also clears the
+    // prediction context: the switch sounds below play on the USING player's
+    // own sprite, and without the clear the P2 choke would mute them as
+    // already-predicted echoes (this subtree never runs in a replay).
+    UNPREDICTABLE_FUNCTION(0);
 #endif
 
     if (wallOrSprite < 0)
@@ -2642,6 +2644,11 @@ static int P_CheckDetonatorSpecialCase(DukePlayer_t *const pPlayer, int weaponNu
 
 void P_HandleSharedKeys(int playerNum)
 {
+#ifdef NETDUKE32
+    // [P1] Replay root (see P_ProcessInput): inventory/toggle sounds fired in
+    // here are claimed by Net_LocalSoundGate for the local seat.
+    SET_PREDICTION_CONTEXT(playerNum);
+#endif
     auto const pPlayer = g_player[playerNum].ps;
 
     if (pPlayer->cheat_phase == 1) return;

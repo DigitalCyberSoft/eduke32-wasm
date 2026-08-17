@@ -61,6 +61,18 @@ void Net_UseOriginalPointers(void);
 void Net_BeginPredictedView(void);  // render-only ps swap (camera/weapon feel)
 void Net_EndPredictedView(void);
 
+// ── P2: instant, exactly-once local action sounds ───────────────────────────
+// Single choke for S_PlaySound/S_PlaySound3D. A stream-mode guest's OWN action
+// sounds (fired inside its P_ProcessInput/P_HandleSharedKeys context) emit at
+// the FIRST simulation of their tic -- normally the prediction pass, i.e.
+// instantly -- and stay silent on every re-entry of that tic (correction
+// replays) and on the authoritative echo. Everything else keeps the blanket
+// rule: prediction passes silent, authoritative tic plays. Returns nonzero
+// when the caller should emit.
+int  Net_LocalSoundGate(int soundNum, int spriteNum);
+void Net_LocalSoundMarkTicDone(int32_t tic);   // a sim pass finished tic; mutes re-entries
+void Net_LocalSoundResetWatermark(void);       // Net_ClearFIFO: plc restarted
+
 // Returns true if we're in a valid predictable state and context for the local player.
 // Used to prevent sounds and display events from triggering outside of prediction if they are predictable.
 // Also prevents double-playing of one-shot events like light flashes and sound playback.

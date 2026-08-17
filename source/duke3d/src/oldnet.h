@@ -190,7 +190,8 @@ extern int32_t g_netStallMask;    // players the consume gate is waiting on
 void Net_ConsumeQuitInputs(void); // deterministic voluntary-leave excision (consumption time)
 void Net_ApplyPendingDrops(void); // deterministic involuntary excision at the master-stamped tic
 void Net_ExcisePlayer(int i);     // remove a player from the running match (classic quit body)
-extern int32_t g_netPredictMode;  // DEBUG bisect: bit0 = correction pass, bit1 = view swap
+extern int32_t g_netPredictMode;  // prediction mask (NN_PREDICT): bit0 = correction pass,
+                                  // bit1 = view swap, bit2 = reserved (P3), bit3 = P2 sounds
 void Net_FlushPendingDrops(void); // barrier entry: fold pending drops into the roster, no world edits
 
 // ── Canonical stream + no-stall join (host = input sequencer) ────────────────

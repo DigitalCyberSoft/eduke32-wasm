@@ -829,11 +829,12 @@ int S_PlaySound3D(int num, int spriteNum, const vec3_t& pos)
 {
 #ifdef NETDUKE32
     // Prediction replays the pending local inputs EVERY frame (and again after
-    // each authoritative tic once Net_CorrectPrediction runs). Any sound fired
-    // from a predicted pass would repeat 30+ times and then fire once more for
-    // real; player.cpp carries no per-site guards in this port, so suppress
-    // centrally. The authoritative tic plays it once, a beat later.
-    if (oldnet_predicting)
+    // each authoritative tic once Net_CorrectPrediction runs), so emission is
+    // decided at this single choke: a guest's OWN action sounds play exactly
+    // once at the first simulation of their tic (normally the prediction pass,
+    // i.e. instantly); every other sound keeps the blanket rule -- silent from
+    // replays, played by the authoritative tic. See net_predict.cpp.
+    if (!Net_LocalSoundGate(num, spriteNum))
         return -1;
 #endif
     int const sndNum = VM_OnEventWithReturn(EVENT_SOUND, spriteNum, screenpeek, num);
@@ -960,7 +961,7 @@ error:
 int S_PlaySound(int num)
 {
 #ifdef NETDUKE32
-    if (oldnet_predicting)   // see S_PlaySound3D: no sounds from prediction passes
+    if (!Net_LocalSoundGate(num, -1))   // see S_PlaySound3D: single emission choke
         return -1;
 #endif
     int sndnum = VM_OnEventWithReturn(EVENT_SOUND, g_player[screenpeek].ps->i, screenpeek, num);

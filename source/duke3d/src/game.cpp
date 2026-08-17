@@ -7817,12 +7817,19 @@ int G_DoMoveThings(void)
 #endif
 
 #ifdef NETDUKE32
+    // [P2] Own-action sound watermark: the tic just consumed (inputs were
+    // read and movefifoplc advanced at the top of this function) is now fully
+    // simulated. Whether its sounds played here (first sim) or already played
+    // from a prediction pass, every later re-entry stays silent.
+    if (numplayers > 1)
+        Net_LocalSoundMarkTicDone(movefifoplc - 1);
+
     // Reconcile prediction against the tic that just became authoritative:
     // snap the predicted copies back to the real state and replay the still-
     // pending local inputs. Without this the predicted view free-runs and
     // never absorbs remote effects on the local player (knockback, damage,
     // moving sectors). Sounds fired during the replay are centrally
-    // suppressed (sounds.cpp oldnet_predicting guards).
+    // decided at the Net_LocalSoundGate choke (sounds.cpp).
     if ((g_netPredictMode & 1)
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
         && !g_netJoinCatchup

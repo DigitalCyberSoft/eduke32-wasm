@@ -5422,9 +5422,20 @@ static uint32_t g_netSnapshotMask = 0;  // bits 0..15 seat mask, 16..23 move epo
 uint8_t g_netMoveEpoch = 0;
 int32_t g_netEpochDrops = 0; // discarded stale-generation move packets (debug surface)
 
-// DEBUG bisection switch (desync validation): bit0 = Net_CorrectPrediction
-// runs, bit1 = predicted-view render swap active. Defaults to both ON.
-int32_t g_netPredictMode = 3;
+// Prediction feature mask / kill-switch (also the desync-validation bisect):
+//   bit0 (1) = Net_CorrectPrediction runs (the correction replay)
+//   bit1 (2) = predicted-view render swap active
+//   bit2 (4) = RESERVED for P3 (instant weapon visuals) -- NOT implemented
+//   bit3 (8) = P2 instant local action sounds (Net_LocalSoundGate watermark)
+// Default = all shipped features ON. NN_PREDICT=<mask> overrides at boot;
+// NN_PREDICT=0 turns every prediction feature off (guests fall back to
+// authoritative-time sounds and the raw lockstep view).
+static int32_t Net_PredictModeFromEnv(void)
+{
+    const char *e = getenv("NN_PREDICT");
+    return (e && *e) ? Batoi(e) : (1|2|8);
+}
+int32_t g_netPredictMode = Net_PredictModeFromEnv();
 // Forensic console dumps (MISMATCH/INPDUMP/SPAWNDUMP/RNGDUMP/STATDUMP) --
 // default OFF: comparisons and auto-resync run regardless; the dump bursts
 // correlated with renderer deaths on the bench. Soak enables for hunts.
@@ -9134,6 +9145,7 @@ void Net_ClearFIFO(void)
     bufferjitter = 1;
     mymaxlag = otherminlag = 0;
     movefifoplc = movefifosendplc = predictfifoplc = 0;
+    Net_LocalSoundResetWatermark();   // [P2] plc restarted: forget emitted tics
 
     // Capture the live sprite array pointer BEFORE Net_InitializePrediction ->
     // Net_ResetPredictionData memcpys from it. Nothing else in the transport
