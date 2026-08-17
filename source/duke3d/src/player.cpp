@@ -127,6 +127,15 @@ static void P_IncurDamage(DukePlayer_t * const pPlayer)
 
 void P_QuickKill(DukePlayer_t * const pPlayer)
 {
+#ifdef NETDUKE32
+    // Prediction-replay rail: pPlayer can be ANOTHER seat's real ps (the
+    // stomp payload passes the squished player), and the guts spawn is world
+    // state -- a replayed kill forks this peer only. Deaths resolve at
+    // authoritative time; the correction snaps the local copy.
+    if (oldnet_predicting)
+        return;
+#endif
+
     P_PalFrom(pPlayer, 48, 48,48,48);
     I_AddForceFeedback(pPlayer->max_player_health << FF_PLAYER_DMG_SCALE, pPlayer->max_player_health << FF_PLAYER_DMG_SCALE, pPlayer->max_player_health << FF_PLAYER_TIME_SCALE);
 
@@ -5152,7 +5161,12 @@ static void P_DoWater(int const playerNum, int const playerBits, int const floor
     }
 
 #ifndef EDUKE32_STANDALONE
-    if (!FURY && pPlayer->scuba_on && (krand()&255) < 8)
+    if (
+#ifdef NETDUKE32
+        // Effect spawn: never from a prediction replay (A_InsertSprite rail).
+        !oldnet_predicting &&
+#endif
+        !FURY && pPlayer->scuba_on && (krand()&255) < 8)
     {
         int const spriteNum = A_Spawn(pPlayer->i, WATERBUBBLE);
         int const q16ang      = fix16_to_int(pPlayer->q16ang);
@@ -5742,7 +5756,13 @@ void P_ProcessInput(int playerNum)
 
                 if (trueFloorDist <= pPlayer->spritezoffset)
                 {
-                    if (pPlayer->on_ground == 1)
+                    if (pPlayer->on_ground == 1
+#ifdef NETDUKE32
+                        // PLAYERONWATER spawn: never from a prediction replay
+                        // (A_InsertSprite rail).
+                        && !oldnet_predicting
+#endif
+                        )
                     {
 #ifdef YAX_ENABLE
                         if (yax_getbunch(pPlayer->cursectnum, YAX_FLOOR) == -1)
@@ -5760,7 +5780,13 @@ void P_ProcessInput(int playerNum)
                 }
             }
         }
-        else if (pPlayer->footprintcount > 0 && pPlayer->on_ground)
+        else if (pPlayer->footprintcount > 0 && pPlayer->on_ground
+#ifdef NETDUKE32
+                 // Footprint spawns: never from a prediction replay
+                 // (A_InsertSprite rail).
+                 && !oldnet_predicting
+#endif
+                 )
         {
             if (pPlayer->cursectnum >= 0 && (sector[pPlayer->cursectnum].floorstat & 2) != 2)
             {
@@ -6403,7 +6429,17 @@ RECHECK:
             pPlayer->holster_weapon = 0;
             pPlayer->weapon_pos     = klabs(pPlayer->weapon_pos);
 
-            if (pPlayer->actorsqu >= 0 && sprite[pPlayer->actorsqu].statnum != MAXSTATUS &&
+            if (
+#ifdef NETDUKE32
+                // Stomp payload writes the WORLD: guts/pool spawns, sprite
+                // deletes, respawn operation -- and for a squished player it
+                // writes ANOTHER seat's real ps through P_QuickKill. The
+                // replay sandbox covers none of that, so the payload runs at
+                // authoritative time only; the detector (G_MovePlayerSprite)
+                // may arm knee_incs/actorsqu on the predicted copy freely.
+                !oldnet_predicting &&
+#endif
+                pPlayer->actorsqu >= 0 && sprite[pPlayer->actorsqu].statnum != MAXSTATUS &&
                 dist(&sprite[pPlayer->i], &sprite[pPlayer->actorsqu]) < 1400)
             {
                 int const dmg = G_DefaultActorHealthForTile(KNEE);
@@ -6440,7 +6476,13 @@ RECHECK:
                     }
                     default:
                         if (A_CheckEnemySprite(&sprite[pPlayer->actorsqu]))
-                            P_AddKills(pPlayer, 1);
+                        {
+                            // The stomper owns this kill on every peer, no
+                            // matter who shrank the victim: restamp before
+                            // resolving the credit.
+                            actor[pPlayer->actorsqu].htowner = pPlayer->i;
+                            G_AddKillCredit(pPlayer->actorsqu, pPlayer, 1);
+                        }
                         A_DeleteSprite(pPlayer->actorsqu);
                         break;
                 }
