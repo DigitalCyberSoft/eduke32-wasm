@@ -127,6 +127,8 @@ cd platform/emscripten && npm install && npm run build:net
 | `NN_GAMETYPE` | `0` deathmatch (default), `1` co-op |
 | `NN_LOCALBOT` | `1` = this seat plays itself (test bot) |
 | `NN_AUTOAIM` | host: `1` = allow autoaim; default forces it OFF for every player |
+| `NN_FORENSICS` | `1` = verbose net forensics logging (`[psnd]`, dumps, probes) |
+| `NN_PREDICT` | prediction feature mask; default all ON, `0` = kill-switch. bit0 correction replay, bit1 predicted view, bit2 reserved (P3 weapon visuals), bit3 instant local action sounds |
 
 ## More documentation
 

@@ -20,6 +20,118 @@ int32_t  backupSeed;
 // [NetDuke32 port] netduke32's separate g_random stream does not exist in this
 // tree; randomseed (backupSeed) is the sole RNG state to save/restore.
 
+// ── P2: per-tic sound watermark ─────────────────────────────────────────────
+// netduke32's model ("play during PREDICTSTATE_PROCESS, mute CORRECT + the
+// authoritative echo") assumes each tic is predicted exactly once before it
+// is consumed. Our guest RE-ENTERS a range of tics on every correction and
+// can meet a tic first on any of three passes (PROCESS, a CORRECT replay, or
+// the free-run authoritative consume), so the exactly-once property must key
+// on the TIC, not the pass: an own-action sound for tic T emits only while
+// T >= s_psndDonePlc, and every completed sim pass raises the mark past its
+// tic. First pass of T plays (instant), every later entry of T is silent.
+static int32_t s_psndDonePlc;       // tics below this already emitted own-action sounds
+static int32_t s_psndDupPlc = -1;   // in-tic (plc,snd) dedup: tic the ring describes
+static int16_t s_psndDupSnd[8];
+static int     s_psndDupCnt;
+
+void Net_LocalSoundResetWatermark(void)
+{
+    s_psndDonePlc = 0;
+    s_psndDupPlc  = -1;
+    s_psndDupCnt  = 0;
+}
+
+void Net_LocalSoundMarkTicDone(int32_t tic)
+{
+    // plc restarted (level change) without passing Net_ClearFIFO: legal
+    // re-entries lag the mark by at most the pending sample window (~100
+    // tics, see oldnet.cpp's `capped` gate), so a gap beyond the whole ring
+    // is a restart (s_botInvLogPlc idiom). Smaller backward jumps -- heal
+    // rewinds re-running already-heard tics -- deliberately keep the mark:
+    // a re-entry stays silent no matter which flow re-enters it.
+    if (tic + MOVEFIFOSIZ < s_psndDonePlc)
+        s_psndDonePlc = tic;
+    if (tic >= s_psndDonePlc)
+        s_psndDonePlc = tic + 1;
+}
+
+int Net_LocalSoundGate(int soundNum, int spriteNum)
+{
+    if (numplayers < 2)
+        return 1;   // solo/demo: prediction never runs, nothing to suppress
+
+    extern int32_t g_netPredictMode, g_netStreamMode, g_netForensics;
+    auto const pOwn = g_player[myconnectindex].ps;
+
+    // Claimed = a stream-mode GUEST's own action sound: fired from inside its
+    // own seat's P_ProcessInput/P_HandleSharedKeys context (P1 arming) on its
+    // own sprite (or as a 2D sound). The host and legacy lockstep keep the
+    // blanket rule bit-for-bit: their own tics are played by the
+    // authoritative pass exactly as before.
+    bool const claimed = (g_netPredictMode & 8) && g_netStreamMode
+        && myconnectindex != connecthead
+        && oldnet_predictcontext == myconnectindex
+        && pOwn != NULL && (spriteNum == -1 || spriteNum == pOwn->i);
+
+    if (!claimed)
+        return !oldnet_predicting;   // blanket: replays silent, authoritative plays
+
+    int32_t const tic = oldnet_predicting ? predictfifoplc : movefifoplc - 1;
+
+    int         emit = 0;
+    const char *why;
+    if (tic < s_psndDonePlc)
+        why = oldnet_predicting ? "replay" : "echo";
+    else
+    {
+        if (tic != s_psndDupPlc)
+        {
+            s_psndDupPlc = tic;
+            s_psndDupCnt = 0;
+        }
+        int dup = 0;
+        for (int i = 0; i < s_psndDupCnt; i++)
+            if (s_psndDupSnd[i] == (int16_t)soundNum)
+                dup = 1;
+        if (dup)
+            why = "dup";
+        else
+        {
+            if (s_psndDupCnt < ARRAY_SSIZE(s_psndDupSnd))
+                s_psndDupSnd[s_psndDupCnt++] = (int16_t)soundNum;
+            emit = 1;
+            why  = "first";
+        }
+    }
+
+    if (g_netForensics)
+    {
+        // emit=1 lines are bounded by real sounds and never rate-limited (the
+        // smoke gate counts them); emit=0 echo/replay lines can fire per tic
+        // (e.g. the falling-scream retry) and get a small per-window budget.
+        static int32_t s_logWindow;
+        static int     s_logBudget;
+        if (emit)
+            LOG_F(INFO, "[psnd] plc=%d snd=%d emit=1 why=%s", tic, soundNum, why);
+        else
+        {
+            int32_t const win = (int32_t)totalclock >> 7;
+            if (win != s_logWindow)
+            {
+                s_logWindow = win;
+                s_logBudget = 6;
+            }
+            if (s_logBudget > 0)
+            {
+                s_logBudget--;
+                LOG_F(INFO, "[psnd] plc=%d snd=%d emit=0 why=%s", tic, soundNum, why);
+            }
+        }
+    }
+
+    return emit;
+}
+
 static void Net_ProcessPrediction(void)
 {
 #ifdef __EMSCRIPTEN__
@@ -76,6 +188,9 @@ static void Net_ProcessPrediction(void)
     predictBackup[INPUTFIFO_PREDICTTICK].q16horiz = predictedPlayer.q16horiz;
 #endif
 
+    // [P2] This tic's own-action sounds (if any) are spent: later re-entries
+    // (correction replays, the authoritative echo) stay silent.
+    Net_LocalSoundMarkTicDone(predictfifoplc);
     predictfifoplc++;
 }
 

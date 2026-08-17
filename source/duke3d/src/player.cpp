@@ -131,9 +131,9 @@ void P_QuickKill(DukePlayer_t * const pPlayer)
     // Prediction-replay rail: pPlayer can be ANOTHER seat's real ps (the
     // stomp payload passes the squished player), and the guts spawn is world
     // state -- a replayed kill forks this peer only. Deaths resolve at
-    // authoritative time; the correction snaps the local copy.
-    if (oldnet_predicting)
-        return;
+    // authoritative time; the correction snaps the local copy. The macro also
+    // clears the prediction context for the subtree (P2 sound choke).
+    UNPREDICTABLE_FUNCTION;
 #endif
 
     P_PalFrom(pPlayer, 48, 48,48,48);
@@ -4451,8 +4451,12 @@ static void P_ProcessWeapon(int playerNum)
     // RTT-deep replays landed). Weapons run at authoritative time only; the
     // predicted VIEW shows the authoritative weapon state RTT late -- the
     // classic client-prediction scope (movement + angles, not fire).
-    if (oldnet_predicting)
-        return;
+    // UNPREDICTABLE_FUNCTION = that same bail PLUS a context clear: since the
+    // weapon pipeline never runs in a prediction pass, its sounds must NOT be
+    // claimed by the P2 watermark (they'd be muted as "already-predicted
+    // echoes" and vanish) -- they keep the plain authoritative-time path
+    // until P3 un-bails this function.
+    UNPREDICTABLE_FUNCTION;
 #endif
     auto const     pPlayer      = g_player[playerNum].ps;
     uint8_t *const weaponFrame  = &pPlayer->kickback_pic;
@@ -5405,6 +5409,15 @@ static void P_ClampZ(DukePlayer_t* const pPlayer, int const sectorLotag, int32_t
 
 void P_ProcessInput(int playerNum)
 {
+#ifdef NETDUKE32
+    // [P1] Replay root: everything below runs in this seat's predictable
+    // context (netduke32's model). Net_InPredictableState answers truthfully
+    // here, and the sound choke (Net_LocalSoundGate) uses the context to tell
+    // a guest's own action sounds from the rest of the world. Cleared on any
+    // return; authoritative-only subtrees (UNPREDICTABLE_FUNCTION) re-clear
+    // it so their sounds keep the plain authoritative path.
+    SET_PREDICTION_CONTEXT(playerNum);
+#endif
     auto &thisPlayer = g_player[playerNum];
 
     if (thisPlayer.playerquitflag == 0)
