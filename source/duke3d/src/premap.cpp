@@ -2338,6 +2338,14 @@ int G_EnterLevel(int gameMode)
     // pre-launch ps position, canonizing lobby-era wander coordinates as
     // spawn rows ([spawn] trace: cnt=7 rows on a 2-spawn map; bots launched
     // marooned at positions that exist nowhere in the map file).
+    // 16-SEAT NOTE -- deliberately NOT adopting netduke32's MAXSPAWNPOINTS=64
+    // decouple: our table stays MAXPLAYERS(16)-sized because every fill site
+    // caps at MAXPLAYERS (this loop, G_CollectSpawnPoints, Net_SetSpawnTable)
+    // and every consumer wraps modulo g_playerSpawnCnt (the OOB guard in
+    // P_MoveToRandomSpawnPoint, G_AssignSpreadRows' seat%cnt) -- extra map
+    // starts are ignored and seats beyond the map's start count reuse rows
+    // deterministically; no OOB read, no garbage spawn. netduke32's 64-point
+    // pool would only add spawn VARIETY on maps authored with >16 starts.
     g_playerSpawnCnt = 0;
     g_playerSpawnPoints[0].xyz  = p0.pos;
     g_playerSpawnPoints[0].ang  = playerAngle;

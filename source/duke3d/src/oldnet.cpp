@@ -672,8 +672,12 @@ static int      s_healAckFence;      // host: 1 = post-apply acks are flowing
 static int32_t  s_softStrikes[MAXPLAYERS];
 static int32_t  s_softStrikeClock[MAXPLAYERS];
 // Tic-stamped soft snap awaiting its consume tic (guest side).
-static char     s_pendingSnap[768];  // [type][count][tic i32][seed i32][grand i32]
-                                     // + 8*75B players + [awc]+64*i16 animwall tags
+static char     s_pendingSnap[2048]; // [type][count][tic i32][seed i32][grand i32]
+                                     // + 16*75B players + [awc]+64*i16 animwall tags
+                                     // 16-seat worst case: 14+1200+1+128 = 1343B. The
+                                     // old 768B cap silently dropped every pack past
+                                     // ~8 seats (remote players froze); the receive
+                                     // guard now screams when a pack outgrows this.
 static int      s_pendingSnapLen;
 static int32_t  s_pendingSnapTic;
 // Stream-mode machinery (defined after Net_ApplyPendingStateSnap).
@@ -2958,7 +2962,7 @@ void Net_SeatBots(int minPlayers, int skill)
 {
     g_netBotMask    = 0;
     g_netBotSkill   = clamp(skill, 0, 3);
-    g_netMinPlayers = clamp(minPlayers, 1, 8);
+    g_netMinPlayers = clamp(minPlayers, 1, 16);   // floor stays 1; cap = MAXPLAYERS seats
     // Clear every seat's combat lock up front -- including myconnectindex, which
     // the seating loop below skips. The local-bot test path (g_netLocalBot) runs
     // the brain for the host's own seat, and the static-0 default would read as
@@ -4601,6 +4605,8 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     g_netDesyncReporters |= (1 << other);
 #ifdef __EMSCRIPTEN__
                     EM_ASM({ console.log('[eng] desync report from peer ' + $0 + ' -> targeted heal'); }, other);
+#else
+                    LOG_F(WARNING, "[desync] report from peer %d -> targeted heal", other);
 #endif
                 }
                 break;
@@ -4727,13 +4733,23 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                 // Stream mode: the pack is a PAINT of current truth, not a
                 // timeline repair -- "stale on arrival" does not exist; the
                 // newest pack always supersedes whatever is pending.
-                if ((!g_netStreamMode && snapTic < movefifoplc) || len > (int)sizeof(s_pendingSnap))
+                if (len > (int)sizeof(s_pendingSnap))
+                {
+                    // NEVER silent again: the old 768B stash dropped every pack
+                    // past ~8 seats right here -- the extra players appeared to
+                    // join but simply never moved, with zero log evidence.
+                    extern int32_t g_netForensics;   // defined below (file pattern)
+                    if (g_netForensics)
+                        LOG_F(ERROR, "[snap] pack DROPPED len=%d cap=%d", len, (int)sizeof(s_pendingSnap));
+                    break;   // oversized: cannot stash
+                }
+                if (!g_netStreamMode && snapTic < movefifoplc)
                 {
 #ifdef __EMSCRIPTEN__
                     EM_ASM({ console.log('[eng] softsnap DROPPED (tic=' + $0 + ' plc=' + $1 + ' len=' + $2 + ')'); },
                            snapTic, movefifoplc, len);
 #endif
-                    break;   // stale on arrival (we consumed past it) or malformed
+                    break;   // stale on arrival (we consumed past it)
                 }
                 // UNORDERED-CHANNEL GUARD: STATE_SNAP now rides the unreliable
                 // UNORDERED channel (the OpenArena snapshot model), so an OLDER
@@ -6439,9 +6455,12 @@ void Net_SendStateSnap(int k)
     }
     oldnet_sendpacket(k, (unsigned char *)packbuf, j);
     // Stream mode sends this ~3x/sec per guest: prints are forensics-only there.
+    // LOG_F, not initprintf: initputs is a no-op without the startup window, so
+    // the pack SIZE (the 16-seat capacity datum) was invisible to native
+    // harness logs -- exactly how the 768B receive cap stayed silent.
     if (!g_netStreamMode || g_netForensics)
     {
-        initprintf("net: soft state snap -> slot %d (%d players, %d bytes, tic %d)\n", k, n, j, movefifoplc);
+        LOG_F(INFO, "net: soft state snap -> slot %d (%d players, %d bytes, tic %d)", k, n, j, movefifoplc);
 #ifdef __EMSCRIPTEN__
         EM_ASM({ console.log('[eng] softsnap sent p=' + $0 + ' bytes=' + $1 + ' tic=' + $2); }, k, j, movefifoplc);
 #endif
@@ -7169,6 +7188,17 @@ void Net_ApplyPendingStateSnap(void)
                     EM_ASM({ console.log('[rserr] plc=' + $0 + ' seat=' + $1 + ' err=' + $2); },
                            movefifoplc, slot,
                            klabs(ps->pos.x - pp.x) + klabs(ps->pos.y - pp.y));
+#ifndef __EMSCRIPTEN__
+                // 16-seat probe (native forensics): every remote seat's snap
+                // target, sampled. Two samples with different (x,y) for a seat
+                // prove that seat MOVES on this guest's screen -- the exact
+                // user-visible outcome the old 768B stash cap silently broke
+                // (seats past ~8 joined but never moved).
+                static uint32_t s_rsProbeN[MAXPLAYERS];
+                if (g_netForensics && (++s_rsProbeN[slot] & 7) == 1)
+                    LOG_F(INFO, "[rsnap] seat=%d applies=%u at (%d,%d) plc=%d",
+                          slot, s_rsProbeN[slot], pp.x, pp.y, (int)movefifoplc);
+#endif
             }
             if ((unsigned)ps->i < MAXSPRITES)
                 sprite[ps->i].extra = sprExtra;
@@ -8416,7 +8446,7 @@ int Net_CorrectDivergence(int k)
     // of rubber-banding into a single clean catch-up seconds after joining.
     if (s_joinTic[k] >= 0 && movefifoplc - s_joinTic[k] < 1800)   // ~60s post-seat
     {
-        initprintf("net: fresh joiner %d diverged -> straight to heal\n", k);
+        LOG_F(WARNING, "net: fresh joiner %d diverged -> straight to heal", k);   // LOG_F: must be visible in native logs (desync gate)
         s_softStrikes[k] = 0;
         return Net_StartHealFlow(k);
     }
@@ -8427,7 +8457,7 @@ int Net_CorrectDivergence(int k)
         return 0;
     }
     // Soft corrections are not holding: the worlds have genuinely forked.
-    initprintf("net: soft corrections exhausted for slot %d -> snapshot heal\n", k);
+    LOG_F(WARNING, "net: soft corrections exhausted for slot %d -> snapshot heal", k);   // LOG_F: must be visible in native logs (desync gate)
     s_softStrikes[k] = 0;
     return Net_StartHealFlow(k);
 }

@@ -121,7 +121,7 @@ cd platform/emscripten && npm install && npm run build:net
 | `NN_KEY` | shared match key |
 | `NN_HOSTID` | host identity for a guest to join |
 | `NN_PLAYERS` | seats to wait for before launching (default 2) |
-| `NN_MAXPLAYERS` | seat cap, decoupled from the launch threshold |
+| `NN_MAXPLAYERS` | seat cap, decoupled from the launch threshold; honored up to 16 (the native transport defaults to 8). Caveat: host uplink scales O(N) -- 16 seats is ~4x the 8-player uplink; browser hosts on residential links should stay near 8 |
 | `NN_PUBLIC` | `1` = announce in the public match list |
 | `NN_NAME` | match / player name |
 | `NN_GAMETYPE` | `0` deathmatch (default), `1` co-op |
