@@ -233,6 +233,19 @@ static int A_FindTargetSprite(const spritetype *pSprite, int projAng, int projec
 
     if (playerNum != -1)
     {
+#ifdef NETDUKE32
+        // MATCH RULE: DMFLAG_NOAUTOAIM (host-set, replicated to every peer
+        // with the match settings) forces autoaim off for ALL seats
+        // regardless of each client's own option -- aim assist is a match
+        // property, not a client preference. Default ON for every match.
+        if (numplayers > 1 && (ud.m_dmflags & DMFLAG_NOAUTOAIM))
+        {
+            static int32_t s_naaLogged;
+            if (s_naaLogged++ == 0)
+                LOG_F(INFO, "[aim] match rule: autoaim suppressed for all seats (DMFLAG_NOAUTOAIM)");
+            return -1;
+        }
+#endif
         if (!g_player[playerNum].ps->auto_aim)
             return -1;
 

@@ -1574,6 +1574,9 @@ static char s_netGrpLabels[128];    // advertised GRP set, pulled for the HOST C
 static char s_netMatchName[NET_NAME_MAX] = "Duke Match";
 static char s_netJoinCode[1024];    // fits a full browser-shape invite (base64url JSON, ~500 chars), not just the 44-char room key
 static int32_t s_netMaxPlayers = 8;
+// Match rule, not a client option: OFF (default) suppresses autoaim for
+// EVERY seat via DMFLAG_NOAUTOAIM in the replicated match settings.
+static int32_t s_netAutoAim = 0;
 static int32_t s_netShareGrp = 1;       // On => let others download our shareware GRP (default)
 static int32_t s_netLocalOnly = 0;      // On => host boots guests whose real ping exceeds the local threshold
 static int32_t s_netPingIdx  = 0;       // index into the ping presets
@@ -1636,6 +1639,13 @@ extern "C" {
 
 static void netmenu_host(void)
 {
+    // Commit the autoaim match rule before hosting: the flag rides
+    // ud.m_dmflags in the settings replication, so every guest enforces it.
+    if (s_netAutoAim)
+        ud.m_dmflags &= ~DMFLAG_NOAUTOAIM;
+    else
+        ud.m_dmflags |= DMFLAG_NOAUTOAIM;
+    LOG_F(INFO, "[aim] match autoaim: %s", s_netAutoAim ? "allowed" : "forced off");
 #ifdef __EMSCRIPTEN__
     char name[80], player[80], script[256];
     netmenu_js_quote(name, sizeof name, s_netMatchName);
@@ -1953,6 +1963,8 @@ static MenuOption_t MEO_NET_CFG_SHARE = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_Off
 static MenuEntry_t ME_NET_CFG_SHARE = MAKE_MENUENTRY( "GRP Sharing", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_SHARE, Option );
 static MenuOption_t MEO_NET_CFG_LOCALONLY = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_OffOn, &s_netLocalOnly );
 static MenuEntry_t ME_NET_CFG_LOCALONLY = MAKE_MENUENTRY( "Local Only", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_LOCALONLY, Option );
+static MenuOption_t MEO_NET_CFG_AUTOAIM = MAKE_MENUOPTION( &MF_Bluefont, &MEOS_OffOn, &s_netAutoAim );
+static MenuEntry_t ME_NET_CFG_AUTOAIM = MAKE_MENUENTRY( "Auto Aim", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_AUTOAIM, Option );
 static MenuRangeInt32_t MEO_NET_CFG_BOTS = MAKE_MENURANGE( &s_netMinPlayers, &MF_Bluefont, 1, 8, 0, 8, DisplayTypeInteger|EnforceIntervals );
 static MenuEntry_t ME_NET_CFG_BOTS = MAKE_MENUENTRY( "Min Players", &MF_Redfont, &MEF_VideoSetup, &MEO_NET_CFG_BOTS, RangeInt32 );
 // CPU skill labels mirror the game's OWN skill names (user: "the CPU skills
@@ -1990,7 +2002,7 @@ static MenuEntry_t ME_NET_CFG_GAMETYPE = MAKE_MENUENTRY( "Game Type", &MF_Redfon
 static MenuLink_t MEO_NET_CFG_START = { MENU_NET_LOBBY, MA_Advance, };
 static MenuEntry_t ME_NET_CFG_START = MAKE_MENUENTRY( "Start", &MF_Redfont, &MEF_VideoSetup_Apply, &MEO_NET_CFG_START, Link );
 static MenuEntry_t *MEL_NET_HOSTCFG[] = {
-    &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_GAMETYPE, &ME_NET_CFG_EPISODE, &ME_NET_CFG_LEVEL, &ME_NET_CFG_SHARE, &ME_NET_CFG_LOCALONLY, &ME_NET_CFG_BOTS, &ME_NET_CFG_BOTSKILL, &ME_NET_CFG_START,
+    &ME_NET_CFG_NAME, &ME_NET_CFG_MAXPLAYERS, &ME_NET_CFG_GAMETYPE, &ME_NET_CFG_EPISODE, &ME_NET_CFG_LEVEL, &ME_NET_CFG_SHARE, &ME_NET_CFG_LOCALONLY, &ME_NET_CFG_AUTOAIM, &ME_NET_CFG_BOTS, &ME_NET_CFG_BOTSKILL, &ME_NET_CFG_START,
 };
 
 // Persist the host-setup choices so they survive a restart. Native writes them
@@ -2005,6 +2017,7 @@ void Menu_NetConfigSave(void)
     SCRIPT_PutString(h, "Multiplayer", "MatchName",  s_netMatchName);
     SCRIPT_PutNumber(h, "Multiplayer", "MaxPlayers", s_netMaxPlayers,   FALSE, FALSE);
     SCRIPT_PutNumber(h, "Multiplayer", "MinPlayers", s_netMinPlayers,   FALSE, FALSE);
+    SCRIPT_PutNumber(h, "Multiplayer", "AutoAim",    s_netAutoAim,      FALSE, FALSE);
     SCRIPT_PutNumber(h, "Multiplayer", "BotSkill",   s_netBotSkill,     FALSE, FALSE);
     SCRIPT_PutNumber(h, "Multiplayer", "GameType",   ud.m_coop,         FALSE, FALSE);
     SCRIPT_PutNumber(h, "Multiplayer", "Episode",    NetEpisode,        FALSE, FALSE);
@@ -2030,10 +2043,12 @@ void Menu_NetConfigLoad(void)
     SCRIPT_GetNumber(h, "Multiplayer", "Level",      &ud.m_level_number);
     SCRIPT_GetNumber(h, "Multiplayer", "GrpSharing", &s_netShareGrp);
     SCRIPT_GetNumber(h, "Multiplayer", "LocalOnly",  &s_netLocalOnly);
+    SCRIPT_GetNumber(h, "Multiplayer", "AutoAim",    &s_netAutoAim);
     // Guard a hand-edited / stale cfg (ranges mirror the menu widgets).
     s_netMaxPlayers = clamp(s_netMaxPlayers, 2, 16);
     s_netMinPlayers = clamp(s_netMinPlayers, 1, 8);
     s_netBotSkill   = clamp(s_netBotSkill, 0, 3);
+    s_netAutoAim    = clamp(s_netAutoAim, 0, 1);
 }
 
 // CHANGE MAP (host, in-game): same Episode/Level pickers; Warp relaunches every

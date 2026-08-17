@@ -290,6 +290,13 @@ typedef struct {
 #endif
 } user_defs;
 
+#ifdef NETDUKE32
+// Deathmatch-flag bits carried in ud.m_dmflags (replicated host -> guests
+// with the match settings on NEW_GAME/INIT_SETTINGS). Bits 0..14 mirror
+// upstream netduke32's set; 15+ belong to this fork.
+# define DMFLAG_NOAUTOAIM (1 << 15)   // host rule: autoaim OFF for every seat
+#endif
+
 extern user_defs ud;
 
 #ifndef ONLY_USERDEFS

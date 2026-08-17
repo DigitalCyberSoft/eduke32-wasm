@@ -126,6 +126,7 @@ cd platform/emscripten && npm install && npm run build:net
 | `NN_NAME` | match / player name |
 | `NN_GAMETYPE` | `0` deathmatch (default), `1` co-op |
 | `NN_LOCALBOT` | `1` = this seat plays itself (test bot) |
+| `NN_AUTOAIM` | host: `1` = allow autoaim; default forces it OFF for every player |
 
 ## More documentation
 

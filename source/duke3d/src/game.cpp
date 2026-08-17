@@ -6875,6 +6875,18 @@ int app_main(int argc, char const* const* argv)
         G_ScanGroups();
     }
 #endif
+#ifdef NETDUKE32
+    // Autoaim match-rule DEFAULT: forced off for every seat. The host menu
+    // ("Auto Aim") re-commits this either way before hosting; this seed
+    // covers headless env-driven hosts that never touch the menu.
+    // NN_AUTOAIM=1 allows autoaim for such a host.
+    ud.m_dmflags |= DMFLAG_NOAUTOAIM;
+    {
+        const char *aa = getenv("NN_AUTOAIM");
+        if (aa && *aa == '1')
+            ud.m_dmflags &= ~DMFLAG_NOAUTOAIM;
+    }
+#endif
 
 #ifdef STARTUP_SETUP_WINDOW
     if (g_commandSetup || (!Bgetenv("SteamTenfoot") && (readSetup < 0 || (!g_noSetup && (ud.configversion != BYTEVERSION_EDUKE32 || ud.setup.forcesetup)))))
