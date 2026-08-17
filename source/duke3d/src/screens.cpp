@@ -190,31 +190,50 @@ static void G_ShowScores(void)
 {
     int32_t t, i;
 
-    if (g_mostConcurrentPlayers > 1 && (g_gametypeFlags[ud.coop]&GAMETYPE_SCORESHEET))
+    // Any MP session has a board: coop counts monster kills, everything else
+    // counts frags. Only existing per-seat data -- no wire additions.
+    if (numplayers > 1)
     {
+        int32_t const coop = (g_gametypeFlags[ud.coop] & GAMETYPE_COOP);
+
         gametext_center(SCORESHEETOFFSET+58+2, "Multiplayer Totals");
         gametext_center(SCORESHEETOFFSET+58+10, g_mapInfo[G_LastMapInfoIndex()].name);
 
         t = 0;
         minitext(70, SCORESHEETOFFSET+80, "Name", 8, 2+8+16+ROTATESPRITE_MAX);
-        minitext(170, SCORESHEETOFFSET+80, "Frags", 8, 2+8+16+ROTATESPRITE_MAX);
+        minitext(170, SCORESHEETOFFSET+80, coop ? "Kills" : "Frags", 8, 2+8+16+ROTATESPRITE_MAX);
         minitext(200, SCORESHEETOFFSET+80, "Deaths", 8, 2+8+16+ROTATESPRITE_MAX);
         minitext(235, SCORESHEETOFFSET+80, "Ping", 8, 2+8+16+ROTATESPRITE_MAX);
 
         for (i=g_mostConcurrentPlayers-1; i>=0; i--)
         {
-            if (!g_player[i].playerquitflag)
+            if (!g_player[i].playerquitflag || g_player[i].ps == NULL)
                 continue;
 
             minitext(70, SCORESHEETOFFSET+90+t, g_player[i].user_name, g_player[i].ps->palookup, 2+8+16+ROTATESPRITE_MAX);
 
-            Bsprintf(tempbuf, "%-4d", g_player[i].ps->frag);
+            Bsprintf(tempbuf, "%-4d", coop ? g_player[i].ps->actors_killed
+                                           : g_player[i].ps->frag - g_player[i].ps->fraggedself);
             minitext(170, SCORESHEETOFFSET+90+t, tempbuf, 2, 2+8+16+ROTATESPRITE_MAX);
 
-            Bsprintf(tempbuf, "%-4d", g_player[i].frags[i] + g_player[i].ps->fraggedself);
+            // Deaths = what the other seats recorded against this one, plus
+            // suicide/environment deaths: P_FragPlayer bumps the killer's
+            // frags[victim] for player kills and fraggedself for the rest.
+            int32_t deaths = g_player[i].ps->fraggedself;
+            for (bssize_t j = 0; j < MAXPLAYERS; j++)
+                if (j != i)
+                    deaths += g_player[j].frags[i];
+            Bsprintf(tempbuf, "%-4d", deaths);
             minitext(200, SCORESHEETOFFSET+90+t, tempbuf, 2, 2+8+16+ROTATESPRITE_MAX);
 
-            Bsprintf(tempbuf, "%-4d", g_player[i].ping);
+            if (i == connecthead)
+                Bstrcpy(tempbuf, "HOST");
+#ifdef NETDUKE32
+            else if (g_netBotMask & (1 << i))
+                Bstrcpy(tempbuf, "BOT");  // host-synthesized seat: no wire, no ping
+#endif
+            else
+                Bsprintf(tempbuf, "%d", g_player[i].ping);
             minitext(235, SCORESHEETOFFSET+90+t, tempbuf, 2, 2+8+16+ROTATESPRITE_MAX);
 
             t += 7;
@@ -1394,6 +1413,20 @@ void G_DisplayRest(int32_t smoothratio)
         gametext_center(70, "Press F1 to Accept, F2 to Decline");
     }
 
+    // MP spectate label: name whose eyes we are looking through -- the
+    // late-join watcher state forces screenpeek to the host, and coop spy view
+    // cycles it. A persistent draw, not a quote: QUOTE_RESERVED3 is shared
+    // with the aim-at-player id display, so either writer clobbers the other.
+    if (numplayers > 1 && screenpeek != myconnectindex && g_player[screenpeek].ps != NULL)
+    {
+        G_ScreenText(MF_Minifont.tilenum, 160<<16, 16<<16, MF_Minifont.zoom, 0, 0, "FOLLOWING",
+                     -127, 6, g_textstat, 0, MF_Minifont.emptychar.x, MF_Minifont.emptychar.y,
+                     MF_Minifont.between.x, MF_Minifont.between.y,
+                     MF_Minifont.textflags|TEXT_XCENTER, 0, 0, xdim-1, ydim-1);
+        gametext_(160<<16, 23<<16, g_player[screenpeek].user_name, -127,
+                  g_player[screenpeek].ps->palookup, 0, 0, TEXT_XCENTER|TEXT_UPPERCASE);
+    }
+
     if (BUTTON(gamefunc_Show_Scoreboard))
         G_ShowScores();
 
@@ -2437,7 +2470,11 @@ void G_BonusScreen(int32_t bonusonly)
         fadepal(0, 0, 0, 0, 252, 28);
     }
 
-    if (bonusonly || (g_netServer || ud.multimode > 1)) return;
+    // Coop falls through to the SP stats slate below, each peer reading its
+    // own sim's per-player counters; every other MP mode had its scoresheet
+    // above and is done here. SP (no server, multimode 1) is unchanged.
+    if (bonusonly || ((g_netServer || ud.multimode > 1) && !(g_gametypeFlags[ud.coop] & GAMETYPE_COOP)))
+        return;
 
     bonusscreen_tiles[0] = BONUSSCREEN + ((ud.volume_number==1) ? 5 : 0);
     for (k = 1; k < 5; ++k)
@@ -2688,7 +2725,11 @@ void G_BonusScreen(int32_t bonusonly)
                 if (totalclock > 10240 && totalclock < 10240+10240)
                     totalclock = 1024;
 
-                if (I_CheckAllInput() && totalclock >(60*2)) // JBF 20030809
+                // MP: advance after 10 seconds with or without input -- every
+                // peer must reach the level-load barrier, and a seat parked on
+                // this screen stalls the whole match.
+                if ((I_CheckAllInput() && totalclock >(60*2)) // JBF 20030809
+                    || (numplayers > 1 && totalclock > (TICRATE*10)))
                 {
                     I_ClearAllInput();
                     if (totalclock < (60*13))
