@@ -9434,6 +9434,24 @@ void M_DisplayMenus(void)
         {
             net_native_mark_launched();
             ud.m_volume_number      = (NetEpisode >= 0 && NetEpisode < MAXVOLUMES) ? NetEpisode : 0;
+#ifdef NETDUKE32
+            // Headless CPU-bot seating (NN_SEATBOTS=N, host only): fill up to N
+            // seats with host-authoritative bots, exactly as the net menu's Min
+            // Players does (netmenu_relaunch -> Net_SeatBots, BEFORE multimode is
+            // derived so bots ride the roster + NEW_GAME seat mask). The native
+            // autolaunch otherwise never seats g_netBotMask bots, so a menu-hosted
+            // bot match (and its DM respawn path) had no headless repro. NN_BOTSKILL
+            // sets the skill column; default 2.
+            if (myconnectindex == connecthead)
+            {
+                const char *sb = getenv("NN_SEATBOTS");
+                if (sb && *sb)
+                {
+                    const char *sk = getenv("NN_BOTSKILL");
+                    Net_SeatBots(clamp(atoi(sb), 1, 16), (sk && *sk) ? clamp(atoi(sk), 0, 3) : 2);
+                }
+            }
+#endif
             ud.multimode            = numplayers;
             g_mostConcurrentPlayers = ud.multimode;
             // Headless gametype pick (NN_GAMETYPE; default 0 = DM) so the native

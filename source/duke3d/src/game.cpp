@@ -7844,7 +7844,13 @@ int G_DoMoveThings(void)
 #endif
 
     if (g_netServer)
+    {
+#ifdef NETDUKE32
+        extern void Net_TestFragTick(void);   // NN_TESTFRAG: forced respawn for the DM respawn gate (inert unless set)
+        Net_TestFragTick();
+#endif
         Net_SendServerUpdates();
+    }
 
     if ((everyothertime&1) == 0)
     {

@@ -947,6 +947,34 @@ static int32_t Bot_SkillFromEnv(void)    { const char *e = getenv("NN_BOTSKILL")
 static int32_t Bot_AlertCapFromEnv(void) { const char *e = getenv("NN_BOTALERTCAP"); return (e && *e) ? Batoi(e) : 0; }
 static int32_t g_botSkillEnv = Bot_SkillFromEnv();
 static int32_t g_botAlertCap = Bot_AlertCapFromEnv();
+
+// NN_TESTFRAG=<seat>: host-only forced periodic frag of one seat so the DM
+// respawn path (death CON -> VM_ResetPlayer -> P_ResetMultiPlayer ->
+// P_MoveToRandomSpawnPoint) can be gated DETERMINISTICALLY without waiting on
+// bots to actually kill each other. Arms lethal htextra (the blessed
+// host-damage mechanism -- never writes extra directly), attributed to the
+// host; the normal death->resetplayer flow then runs the respawn/roll. Inert
+// unless the env is set (like NN_TESTKILL/NN_TESTEOL). Native harness only.
+void Net_TestFragTick(void)
+{
+    static int s_seat = -2;
+    if (s_seat == -2) { const char *e = getenv("NN_TESTFRAG"); s_seat = (e && *e) ? atoi(e) : -1; }
+    if (s_seat < 0 || (unsigned)s_seat >= MAXPLAYERS)
+        return;
+    static int32_t s_last = -1000;
+    if (movefifoplc - s_last < 180)   // ~7s cadence: die, respawn, settle, repeat
+        return;
+    auto const ps = g_player[s_seat].ps;
+    if (ps == NULL || !g_player[s_seat].connected || ps->dead_flag
+        || (unsigned)ps->i >= MAXSPRITES || sprite[ps->i].extra <= 0)
+        return;
+    s_last = movefifoplc;
+    int const tgt = ps->i;
+    actor[tgt].htextra  = (int16_t)(ps->max_player_health + 100);
+    actor[tgt].htpicnum = SHOTSPARK1;
+    actor[tgt].htowner  = (g_player[connecthead].ps != NULL) ? (int16_t)g_player[connecthead].ps->i : (int16_t)tgt;
+    LOG_F(INFO, "[testfrag] armed lethal seat=%d spr=%d plc=%d", s_seat, tgt, (int)movefifoplc);
+}
 static int32_t s_botLtgX[MAXPLAYERS], s_botLtgY[MAXPLAYERS];
 static int16_t s_botLtgSect[MAXPLAYERS];     // target sector of the committed LTG
 static int8_t  s_botLtgKind[MAXPLAYERS];     // 0 none, 1 roam anchor, 2 item

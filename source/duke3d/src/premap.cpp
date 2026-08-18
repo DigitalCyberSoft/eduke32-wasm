@@ -626,7 +626,7 @@ void P_MoveToRandomSpawnPoint(int playerNum)
     int i = playerNum;
 
     {
-        extern int32_t g_netStreamMode, g_netForensics;
+        extern int32_t g_netStreamMode, g_netForensics, g_netBotMask;
         // STREAM MODE: only the seat's OWNING peer rolls the pick. Self pos is
         // client-authoritative (POS_REPORT/gpos snaps every other peer within
         // a beat), so a non-owner's roll is not just wasted: it burns local
@@ -635,7 +635,17 @@ void P_MoveToRandomSpawnPoint(int playerNum)
         // join spawn, live -- and can materialize the body onto a player in
         // this peer's world (DM friendly fire = local telefrag). Non-owners
         // hold the body where it is until the owner's stream places it.
-        if (g_netStreamMode && numplayers > 1 && playerNum != myconnectindex)
+        //
+        // EXCEPT a BOT seat is HOST-AUTHORITATIVE (g_netBotMask) -- it has no
+        // remote owner to stream a fresh position, so the HOST is its owner and
+        // must roll its respawn like its own seat. Without this the host held
+        // every bot at its death spot forever, waiting for an owner report that
+        // never comes (live DM report: "bots respawn from where they died").
+        // A guest still HOLDS bots (the host streams them) and holds real
+        // remote guest seats -- only the host is exempted, only for bots.
+        bool const hostOwnsBot = g_netServer && (unsigned)playerNum < MAXPLAYERS
+                                 && (g_netBotMask & (1 << playerNum));
+        if (g_netStreamMode && numplayers > 1 && playerNum != myconnectindex && !hostOwnsBot)
         {
             if (g_netForensics)
             {
