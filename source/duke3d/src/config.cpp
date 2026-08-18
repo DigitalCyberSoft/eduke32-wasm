@@ -334,6 +334,14 @@ void CONFIG_SetDefaults(void)
     ud.statusbarmode          = 1;
     ud.statusbarscale         = 100;
     ud.team                   = 0;
+#if defined(NETNATIVE) || defined(__EMSCRIPTEN__)
+    // TEST HOOK (wave 3b FF-veto smoke): force this peer's TDM team before any
+    // networking, so a headless 3-seat 2-team leg can be stood up (two team-0
+    // bots hunting one team-1 enemy -> a teammate crosses the fire line -> the
+    // friendly-fire veto trips). Set once at defaults, ahead of config load and
+    // the pteam join-send; harmless (unset -> 0) in every non-test run.
+    { const char *e = getenv("NN_TEAM"); if (e && *e) ud.team = clamp(Batoi(e), 0, 3); }
+#endif
     ud.textscale              = 200;
     ud.viewbob                = 1;
     ud.weaponscale            = 100;
