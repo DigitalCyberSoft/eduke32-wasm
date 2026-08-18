@@ -3889,10 +3889,27 @@ static input_t Bot_GetInput(int k)
     else if (canHit && dist2d <= 8192)   { fwdSpd = 48; strSpd = s_botStrafeDir[k] * 28; run = true; } // press
     else if (s_botBounceHold[k] > 0 && klabs(diff) > 150) { fwdSpd = 34; }                          // wall half-stride
     else                                 { fwdSpd = 68; run = true; }                               // roam
-    // (No added weave: the user asked to keep the SAME movement and only
-    // redirect the FACING. The existing canHit circle-strafe already orbits
-    // -- now correctly around the AIM -- and roam/nav keep their straight
-    // heading; the aim just tracks the target independently.)
+    // DM APPROACH WEAVE (user 2026-08-18: "in DM the bots shouldn't run
+    // directly at me like coop -- more strafing; although they should always
+    // face their target"). This SUPERSEDES the earlier "keep the same movement"
+    // directive for DM combat. Whenever a DM bot is closing on a target it can
+    // shoot (canHit, advancing, not mid wall-escape), split the forward drive
+    // into forward + a STRONG lateral strafe so the approach WEAVES instead of
+    // beelining -- most visible on the old "close from afar"/"press" branches
+    // that carried little or no strafe. Facing is decoupled and already locked
+    // on the target (aimAng=rawAng while engaging), so it strafes WHILE aiming +
+    // shooting. Coop monster-hunt (botCoop) keeps the straight charge. The
+    // strafe side rides s_botStrafeDir (3b flip-on-blocked + timed reversal) so
+    // it zig-zags rather than orbiting one way.
+    if (!botCoop && canHit && fwdSpd > 0 && s_botBounceHold[k] == 0)
+    {
+        if (s_botStrafeDir[k] == 0)
+            s_botStrafeDir[k] = (Bot_Rnd() & 1) ? 1 : -1;
+        int const drive = fwdSpd;
+        fwdSpd = (drive * 5) >> 3;                                              // ~0.62 forward
+        strSpd = s_botStrafeDir[k] * max((int)klabs(strSpd), (drive * 3) >> 2); // ~0.75 lateral (>= any existing)
+        run = true;
+    }
     // UNREACHABLE TARGET (ledge/level the mesh can't route to): never advance
     // toward it -- the canHit "press"/orbit branches above would still walk the
     // bot into the wall under it. Hold ground (fwdSpd 0) and keep the strafe, so
