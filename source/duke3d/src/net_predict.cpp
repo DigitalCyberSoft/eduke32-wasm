@@ -226,7 +226,54 @@ void Net_CorrectPrediction(void)
     if (numplayers < 2)
         return;
 
-    DukePlayer_t *p = g_player[myconnectindex].ps;
+    DukePlayer_t *p = g_player[myconnectindex].ps;   // original pointers active: the SIM copy
+
+    // [P4] IDLE CORRECTION DEADBAND (UT99 netcode audit 2026-08-18). The
+    // reset+replay below rebases the predicted RENDER copy onto the freshly
+    // consumed authoritative tic UNCONDITIONALLY, ~30x/sec. When the guest is
+    // standing still that reimports the sim copy's per-tic micro-variation
+    // (floor z-snap, sector relink, opos/pos flip) into the rendered view every
+    // tic -- the reported "flashing while standstill" shimmer. UT sends/applies
+    // no correction when the position error is tiny. So: for a stream guest
+    // whose own player is effectively stationary AND whose predicted copy
+    // already matches the authoritative one within a deadband, SKIP the rebase
+    // and let the per-frame PROCESS pass (Net_DoPrediction at G_MoveLoop) carry
+    // the idle predicted state forward unchanged -- no per-tic jitter to import.
+    // COSMETIC ONLY: touches nothing but the predicted render copy; any real
+    // motion (sim or predicted) or divergence exceeds the band and rebases
+    // exactly as before, so predicted drift is bounded by the band. The host
+    // (truth, no self-prediction) and legacy lockstep are untouched. NN_PREDICT
+    // bit4 kill-switches it.
+    {
+        extern int32_t g_netPredictMode, g_netStreamMode, g_netForensics;
+        if ((g_netPredictMode & 16) && g_netStreamMode && numplayers > 1 && myconnectindex != connecthead)
+        {
+            // z is ~16x finer than x/y in Build; the bands sit well below a real
+            // walk/step (hundreds of units/tic) and above idle micro-jitter.
+            enum { DB_XY = 48, DB_Z = 400 };
+            int32_t const matchXY = klabs(predictedPlayer.pos.x - p->pos.x) + klabs(predictedPlayer.pos.y - p->pos.y);
+            bool const simStill  = klabs(p->pos.x - p->opos.x) + klabs(p->pos.y - p->opos.y) <= DB_XY
+                                && klabs(p->pos.z - p->opos.z) <= DB_Z;
+            bool const predStill = klabs(predictedPlayer.pos.x - predictedPlayer.opos.x)
+                                 + klabs(predictedPlayer.pos.y - predictedPlayer.opos.y) <= DB_XY
+                                && klabs(predictedPlayer.pos.z - predictedPlayer.opos.z) <= DB_Z;
+            bool const matched   = matchXY <= DB_XY && klabs(predictedPlayer.pos.z - p->pos.z) <= DB_Z;
+            bool const skip      = simStill && predStill && matched;
+            if (g_netForensics)
+            {
+                static int32_t s_dbandPlc;
+                if (movefifoplc - s_dbandPlc >= 60 || movefifoplc < s_dbandPlc)   // ~2s, plc-restart safe
+                {
+                    s_dbandPlc = movefifoplc;
+                    LOG_F(INFO, "[dband] plc=%d skip=%d simStill=%d predStill=%d matched=%d dxy=%d dz=%d",
+                          (int)movefifoplc, skip ? 1 : 0, simStill, predStill, matched,
+                          matchXY, (int)klabs(predictedPlayer.pos.z - p->pos.z));
+                }
+            }
+            if (skip)
+                return;   // deadband: keep last frame's predicted state, no rebase
+        }
+    }
 
 #if 0
     if (ud.config.PredictionDebug)

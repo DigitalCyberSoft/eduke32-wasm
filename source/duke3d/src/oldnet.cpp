@@ -6433,13 +6433,16 @@ int32_t g_netEpochDrops = 0; // discarded stale-generation move packets (debug s
 //   bit1 (2) = predicted-view render swap active
 //   bit2 (4) = RESERVED for P3 (instant weapon visuals) -- NOT implemented
 //   bit3 (8) = P2 instant local action sounds (Net_LocalSoundGate watermark)
+//   bit4 (16) = idle correction deadband (skip the reset+replay when a stream
+//               guest is stationary + predicted matches sim -- kills the
+//               standstill-flashing shimmer; see net_predict.cpp)
 // Default = all shipped features ON. NN_PREDICT=<mask> overrides at boot;
 // NN_PREDICT=0 turns every prediction feature off (guests fall back to
-// authoritative-time sounds and the raw lockstep view).
+// authoritative-time sounds, the raw lockstep view, and per-tic correction).
 static int32_t Net_PredictModeFromEnv(void)
 {
     const char *e = getenv("NN_PREDICT");
-    return (e && *e) ? Batoi(e) : (1|2|8);
+    return (e && *e) ? Batoi(e) : (1|2|8|16);
 }
 int32_t g_netPredictMode = Net_PredictModeFromEnv();
 // Forensic console dumps (MISMATCH/INPDUMP/SPAWNDUMP/RNGDUMP/STATDUMP) --

@@ -129,7 +129,7 @@ cd platform/emscripten && npm install && npm run build:net
 | `NN_BOTLTG` | bot roaming brain (OpenArena-mined two-tier goals: map-wide committed goal + last-seen chase + per-edge avoid-reach). Default ON; `0` = kill-switch back to the old single-room brain (also the baseline leg of the roaming smoke) |
 | `NN_AUTOAIM` | host: `1` = allow autoaim; default forces it OFF for every player |
 | `NN_FORENSICS` | `1` = verbose net forensics logging (`[psnd]`, dumps, probes) |
-| `NN_PREDICT` | prediction feature mask; default all ON, `0` = kill-switch. bit0 correction replay, bit1 predicted view, bit2 reserved (P3 weapon visuals), bit3 instant local action sounds |
+| `NN_PREDICT` | prediction feature mask; default all ON, `0` = kill-switch. bit0 correction replay, bit1 predicted view, bit2 reserved (P3 weapon visuals), bit3 instant local action sounds, bit4 idle correction deadband (standstill-flash fix) |
 
 ## More documentation
 
