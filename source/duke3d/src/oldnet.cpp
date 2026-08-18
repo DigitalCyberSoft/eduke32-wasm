@@ -788,6 +788,7 @@ static int16_t s_botNoHitTics[MAXPLAYERS];   // visible-but-unhittable streak (f
 static int32_t s_botLastTDist[MAXPLAYERS];   // pursuit progress: last distance to target
 static int32_t s_botNavX[MAXPLAYERS], s_botNavY[MAXPLAYERS];  // first portal midpoint
 static int8_t  s_botNavOn[MAXPLAYERS];
+static int16_t s_botUnreach[MAXPLAYERS];      // tics the locked target has had NO mesh route (unreachable elevation)
 static int16_t s_botLastSect[MAXPLAYERS];    // re-plan the route on sector crossings
 static int8_t  s_botTurnPref[MAXPLAYERS];    // wall-following handedness (+1/-1)
 static int16_t s_botTrapTics[MAXPLAYERS];    // zero-net-displacement streak (hard trap)
@@ -2414,6 +2415,7 @@ static input_t Bot_GetInput(int k)
             // a statue host for the whole first life of every native probe).
             s_botTarget[k]     = -1;
             s_botMonTgt[k]     = -1;
+            s_botUnreach[k]    = 0;
             s_botPending[k]    = -1;
             s_botItemShun[k]   = -1;
             s_botLastWacked[k] = -1;
@@ -2436,6 +2438,7 @@ static input_t Bot_GetInput(int k)
         s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
         s_botGoal[k]      = 0;      // spawned somewhere new: fresh errand
         s_botMonTgt[k]    = -1;     // no coop monster lock across a respawn
+        s_botUnreach[k]   = 0;      // fresh body: no unreachable-target timer
         s_botTarget[k]    = -1;     // and no player lock either: the old code let
         s_botPending[k]   = -1;     //   sightTics=200 age it out against the 130-tic
                                     //   retention; the wider last-seen window (260)
@@ -2833,6 +2836,12 @@ static input_t Bot_GetInput(int k)
             if (i == revenge)
                 seen = cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
                               cp->pos.x, cp->pos.y, cp->pos.z, cp->cursectnum);
+            // Known-unreachable elevation: a target whose sector we already gave
+            // up on ([unreach] below) is not re-locked -- the bot stops fixating
+            // on an enemy up a ledge and looks for a reachable one. Revenge is
+            // exempt (a bullet in the back overrides the range/reach filters).
+            if (i != revenge && Bot_DeadExitActive(k, cp->cursectnum))
+                continue;
             if (d < bestd) { bestd = d; best = i; bestSeen = seen; }
         }
         // Pursuit memory: with the last-seen chase live the bot walks to a
@@ -2903,6 +2912,35 @@ static input_t Bot_GetInput(int k)
                 s_botNavY[k]    = ry;
             }
         }
+        // ELEVATION-UNREACHABLE TARGET (user 2026-08-18: "bots attack enemies on
+        // elevations they can't reach / keep trying an impossible room change").
+        // The resolver found NO mesh route to this enemy (s_botNavOn stayed 0,
+        // having tried both its live and last-seen spot) -- it is up a ledge or
+        // on a level the bot can't climb to. The steering/fwdSpd gates below
+        // HOLD instead of grinding toward it. If it stays unreachable for ~3s,
+        // LEARN it: blacklist its sector (Bot_MarkDeadExit) so acquisition stops
+        // re-locking it, and drop the lock so the bot finds a reachable enemy or
+        // roams. Reachable target (or none) resets the timer.
+        if (best >= 0 && !s_botNavOn[k])
+        {
+            if (s_botUnreach[k] < 3000)
+                s_botUnreach[k]++;
+            if (s_botUnreach[k] >= 40)           // ~1.5s of no route: give this one up + roam
+            {
+                int const tsect = (g_player[best].ps != NULL) ? g_player[best].ps->cursectnum : -1;
+                if ((unsigned)tsect < (unsigned)numsectors)
+                    Bot_MarkDeadExit(k, tsect);
+                extern int32_t g_netForensics;
+                if (g_netForensics)
+                    LOG_F(INFO, "[unreach] seat=%d dropped tgt=%d sect=%d plc=%d",
+                          k, best, tsect, (int)movefifoplc);
+                s_botTarget[k]  = -1;
+                best            = -1;
+                s_botUnreach[k] = 0;
+            }
+        }
+        else
+            s_botUnreach[k] = 0;
         if (best >= 0 && (bestSeen || s_botNavOn[k])
             && !(prioritizeItems && s_botGoal[k] == 2))
             s_botGoal[k] = 0;           // a fight we can PROSECUTE: drop the errand
@@ -3648,8 +3686,13 @@ static input_t Bot_GetInput(int k)
         }
         else
         {
-            wantAng  = getangle(tgX - ps->pos.x, tgY - ps->pos.y);
-            chaseTgt = true;
+            wantAng  = getangle(tgX - ps->pos.x, tgY - ps->pos.y);   // face it (keep shooting)
+            // Only chase-ADVANCE a target the mesh can reach. A brief no-route
+            // blip (route recompute, target skimming an edge tile) still lets
+            // the bot close for ~8 tics; a SUSTAINED no-route (ledge above) it
+            // holds + shoots, never grinding toward -- until the [unreach] drop.
+            if (s_botNavOn[k] || s_botUnreach[k] <= 8)
+                chaseTgt = true;
             if (!seesTarget)
                 wantAng = (wantAng + (int)(Bot_Rnd() % 129) - 64) & 2047;
         }
@@ -3850,6 +3893,12 @@ static input_t Bot_GetInput(int k)
     // redirect the FACING. The existing canHit circle-strafe already orbits
     // -- now correctly around the AIM -- and roam/nav keep their straight
     // heading; the aim just tracks the target independently.)
+    // UNREACHABLE TARGET (ledge/level the mesh can't route to): never advance
+    // toward it -- the canHit "press"/orbit branches above would still walk the
+    // bot into the wall under it. Hold ground (fwdSpd 0) and keep the strafe, so
+    // it juke-and-shoots in place instead of grinding until the [unreach] drop.
+    if (hasTgt && !s_botNavOn[k] && s_botUnreach[k] > 8 && fwdSpd > 0)
+        fwdSpd = 0;
     // Remember whether we commanded a strafe this tic: next tic's flip-on-
     // blocked (above) checks it against the realized displacement.
     s_botWantStrafe[k] = (strSpd != 0);
@@ -4289,6 +4338,7 @@ void Net_SeatBots(int minPlayers, int skill)
     {
         s_botTarget[k]    = -1;
         s_botMonTgt[k]    = -1;
+        s_botUnreach[k]   = 0;
         s_botJetHold[k]   = 0;      // inventory/jetpack graft state: fresh match
         s_botJetCool[k]   = 0;
         s_botMedUses[k]   = 0;
