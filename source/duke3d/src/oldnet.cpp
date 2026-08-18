@@ -1596,16 +1596,30 @@ static int Bot_Waypoint(int k, DukePlayer_t *ps, int32_t dx2, int32_t dy2,
         int const i2 = s_botRouteIdx[k] + a;
         if (i2 >= s_botRouteLen[k])
             break;
-        if (Bot_LineWalkable(ps, Nvg_CX(s_botRtX[k][i2]), Nvg_CY(s_botRtY[k][i2]))
-            && !Bot_SegNearWedgeSpot(k, ps->pos.x, ps->pos.y,
-                                     Nvg_CX(s_botRtX[k][i2]), Nvg_CY(s_botRtY[k][i2]))
-            && !Bot_SegCrossesCrawl(ps->pos.x, ps->pos.y,
-                                    Nvg_CX(s_botRtX[k][i2]), Nvg_CY(s_botRtY[k][i2])))
+        int32_t const i2x   = Nvg_CX(s_botRtX[k][i2]);
+        int32_t const i2y   = Nvg_CY(s_botRtY[k][i2]);
+        bool const    i2Door = s_nvgFlagT[s_botRtY[k][i2] * s_nvgW + s_botRtX[k][i2]] != 0;
+        if (Bot_LineWalkable(ps, i2x, i2y)
+            && !Bot_SegNearWedgeSpot(k, ps->pos.x, ps->pos.y, i2x, i2y)
+            && !Bot_SegCrossesCrawl(ps->pos.x, ps->pos.y, i2x, i2y))
             pick = i2;
+        // Never string-pull PAST a door tile: a straight line to a waypoint
+        // BEYOND the opening clips the door frame beside it, so the bot drives
+        // into the wall next to the door ("trying to pass through a door to the
+        // side of it, not through the entry", live 2026-08-18). A door tile's
+        // centre sits inside the door sector = on the threshold, so aim AT it
+        // and pass through head-on; the far side repaths once the bot is
+        // through. `pick` is already the door tile if the straight shot to it
+        // was clean, else the last clear waypoint before it -- the bot
+        // approaches and the door becomes a clean straight shot as it nears,
+        // so it is never aimed through the frame. Stop extending at the door.
+        if (i2Door)
+            break;
     }
     *wx = Nvg_CX(s_botRtX[k][pick]);
     *wy = Nvg_CY(s_botRtY[k][pick]);
-    for (int a = pick; a < pick + 3 && a < s_botRouteLen[k]; a++)
+    s_botWpDoor[k] = 0;
+    for (int a = s_botRouteIdx[k]; a <= pick + 2 && a < s_botRouteLen[k]; a++)
     {
         if (s_nvgFlagT[s_botRtY[k][a] * s_nvgW + s_botRtX[k][a]])
             { s_botWpDoor[k] = 1; break; }
