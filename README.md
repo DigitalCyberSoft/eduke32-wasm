@@ -124,8 +124,9 @@ cd platform/emscripten && npm install && npm run build:net
 | `NN_MAXPLAYERS` | seat cap, decoupled from the launch threshold; honored up to 16 (the native transport defaults to 8). Caveat: host uplink scales O(N) -- 16 seats is ~4x the 8-player uplink; browser hosts on residential links should stay near 8 |
 | `NN_PUBLIC` | `1` = announce in the public match list |
 | `NN_NAME` | match / player name |
-| `NN_GAMETYPE` | `0` deathmatch (default), `1` co-op |
+| `NN_GAMETYPE` | gametype index: `0` deathmatch (default), `1` co-op, `2` DM no-spawn, `3`/`4` team DM, `5` last man standing, `6` co-op no-respawn |
 | `NN_LOCALBOT` | `1` = this seat plays itself (test bot) |
+| `NN_BOTLTG` | bot roaming brain (OpenArena-mined two-tier goals: map-wide committed goal + last-seen chase + per-edge avoid-reach). Default ON; `0` = kill-switch back to the old single-room brain (also the baseline leg of the roaming smoke) |
 | `NN_AUTOAIM` | host: `1` = allow autoaim; default forces it OFF for every player |
 | `NN_FORENSICS` | `1` = verbose net forensics logging (`[psnd]`, dumps, probes) |
 | `NN_PREDICT` | prediction feature mask; default all ON, `0` = kill-switch. bit0 correction replay, bit1 predicted view, bit2 reserved (P3 weapon visuals), bit3 instant local action sounds |
