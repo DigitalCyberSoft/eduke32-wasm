@@ -3749,19 +3749,13 @@ static input_t Bot_GetInput(int k)
     int twob = trackWobble[skill] + (botCoop ? 10 : 0);
     if (s_botAimDegrade[k] > 0)
         twob += twob >> 1;   // (#2) post-jink penalty ~1.5x wobble (their aim_accuracy *= 0.7)
-    // (#4) DISTANCE-SCALED HITSCAN ACCURACY: WIDEN the tracking wobble at
-    // point-blank for hitscan weapons, so close brawls aren't laser duels
-    // (their f = 0.6 + min(dist,150)/150*0.4 accuracy curve, INVERTED here into
-    // error WIDTH: worst at contact, full accuracy past ~point-blank range,
-    // ai_dmq3.c:3574). Projectile weapons are exempt -- they aim via leading.
-    if (seesTarget && (unsigned)ps->curr_weapon < MAX_WEAPONS
-        && s_botProjSpeed[ps->curr_weapon] == 0)
-    {
-        int32_t const pbRange = 2048;   // Build-unit stand-in for their 150-unit point blank
-        int32_t const dcl  = klabs(tgX - ps->pos.x) + klabs(tgY - ps->pos.y);
-        int32_t const nearN = pbRange - min(dcl, pbRange);          // 0 far .. pbRange at contact
-        twob += (int)((int64_t)twob * 3 * nearN / (pbRange * 5));   // up to +0.6x wobble point-blank
-    }
+    // (#4) DISTANCE-SCALED HITSCAN ACCURACY -- DISABLED 2026-08-18 (user: bots
+    // aim "really bad" at Come Get Some). It widened the tracking wobble up to
+    // +60% at point-blank -- exactly where DM fights happen -- turning close
+    // brawls into whiff-fests. The base trackWobble[] is already tuned for a
+    // survivable fight; adding the point-blank penalty on top regressed the
+    // accuracy the pre-3b brain had. Left here (no-op) as the anchor if a
+    // gentler curve is ever wanted.
     int const aimErr = seesTarget ? (int)(Bot_Rnd() % (2 * twob + 1)) - twob
                                   : (int)(Bot_Rnd() % (2 * wobble[skill] + 1)) - wobble[skill];
     int const cap = (seesTarget && klabs(diff) > turnCap[skill]) ? turnCap[skill] * 2 : turnCap[skill];
@@ -3772,25 +3766,16 @@ static input_t Bot_GetInput(int k)
     // turnCap stays the hard step ceiling; the wobble rides on top as steering
     // noise. Roam/nav turning keeps the crisp direct clamp -- momentum in a
     // navigation turn would oscillate the body's heading and regress roaming.
-    enum { BOT_VIEW_GAIN = 51, BOT_VIEW_DAMP = 192 };   // k=0.15,c=0.25 -> underdamped, |lambda|~0.87
-    if (engaging)
-    {
-        s_botViewVel[k] += (diff * BOT_VIEW_GAIN) >> 8;           // spring: toward the aim error
-        s_botViewVel[k]  = (s_botViewVel[k] * BOT_VIEW_DAMP) >> 8; // damping < 1 -> decays, overshoots
-        s_botViewVel[k]  = clamp(s_botViewVel[k], -300, 300);     // anti-windup (their maxchange guard)
-        int const step = clamp(s_botViewVel[k] + aimErr, -cap, cap);
-        in.q16avel = fix16_from_int(step);
-        extern int32_t g_netForensics;
-        if (g_netForensics && s_botViewVel[k] != 0 && diff != 0
-            && (s_botViewVel[k] < 0) != (diff < 0) && klabs(s_botViewVel[k]) > (cap >> 2)
-            && (movefifoplc & 15) == 0)
-            LOG_F(INFO, "[vsettle] seat=%d overshoot=%d", k, (int)s_botViewVel[k]);
-    }
-    else
-    {
-        s_botViewVel[k] = 0;   // not engaging: carry no momentum into roam turns
-        in.q16avel = fix16_from_int(clamp(diff + aimErr, -cap, cap));
-    }
+    // (#5) SECOND-ORDER OVERSHOOT VIEW MODEL -- DISABLED 2026-08-18 (user: bots
+    // aim "really bad" / "shooting to the right"). It was underdamped
+    // (|lambda|~0.87), so the aim swung PAST the target and a shot fired
+    // mid-swing landed to the side -- a directional miss, worst on strafing
+    // targets. Accuracy beats head-feel for a combat bot: turn CRISPLY toward
+    // the aim like the pre-3b brain that "was working" (the wobble still rides
+    // on top as honest steering noise). s_botViewVel kept zeroed for the reset
+    // contract; re-enable with proper (critical) damping if head-feel is wanted.
+    s_botViewVel[k] = 0;
+    in.q16avel = fix16_from_int(clamp(diff + aimErr, -cap, cap));
 
     int32_t const dist2d = hasTgt ? klabs(tgX - ps->pos.x) + klabs(tgY - ps->pos.y) : INT32_MAX;
 
