@@ -961,10 +961,28 @@ static int32_t s_botSeenX[MAXPLAYERS], s_botSeenY[MAXPLAYERS];
 static int32_t s_botSeenZ[MAXPLAYERS];
 static int16_t s_botSeenSect[MAXPLAYERS];
 static int8_t  s_botSeenValid[MAXPLAYERS];
-// Roam telemetry: distinct sectors entered this level, per seat ([roam]).
+// WEDGE-SPOT ring: POSITIONS where a committed march died of zero movement.
+// The per-edge ring above cannot learn these -- the E1L1 chair fields and
+// alley pockets are INTRA-sector, so every failure attributes to a different
+// (from,to) pair and the 3-try activation never fires (measured: 19 stall
+// kills in one leg, no edge past tries=2, the bot re-marching through the
+// same field to fresh targets all match). Tile-level cure, OA's avoid-spot
+// concept at minimum size: stamp the spot on a certified wedge; the router
+// and the LTG flood refuse to ENTER tiles near an active spot (leaving is
+// always allowed, or a bot standing in one could never path out).
+#define BOT_WSPOT_N 4
+#define BOT_WSPOT_R 768                       // ~1.5 tiles
+static int32_t s_botWspotX[MAXPLAYERS][BOT_WSPOT_N];
+static int32_t s_botWspotY[MAXPLAYERS][BOT_WSPOT_N];
+static int32_t s_botWspotUntil[MAXPLAYERS][BOT_WSPOT_N];
+// Roam telemetry: distinct sectors entered this level, per seat ([roam]),
+// plus honesty meters -- tics spent effectively stationary (the wedge bill)
+// and tics steered by nothing but the wander fallback (the idle bill).
 static uint8_t s_botRoamBm[MAXPLAYERS][MAXSECTORS >> 3];
 static int32_t s_botRoamCnt[MAXPLAYERS];
 static int32_t s_botRoamLogPlc[MAXPLAYERS];
+static int32_t s_botStillTics[MAXPLAYERS];    // alive tics with step < 16 units
+static int32_t s_botIdleTics[MAXPLAYERS];     // tics on the wander fallback
 static int8_t  s_botTeamLogged[MAXPLAYERS];  // one-shot [team] forensic per seat
 // ── Inventory / jetpack state (netduke32-mined, 2026-08-18) ─────────────────
 // SK_JETPACK is a TOGGLE edge-triggered through interface_toggle
@@ -1115,6 +1133,7 @@ static int32_t s_nvgStamp = -1;
 static int16_t s_nvgSect[NVG_MAX];      // containing sector, -1 = unwalkable
 static uint8_t s_nvgPass[NVG_MAX];      // dir bits out of this tile: 1 +x, 2 -x, 4 +y, 8 -y
 static uint8_t s_nvgFlagT[NVG_MAX];     // 1 = door-sector tile
+static uint8_t s_nvgCrawl[NVG_MAX];     // 1 = crawl-height tile (vent/duct)
 
 static inline int32_t Nvg_CX(int tx) { return s_nvgMinX + tx * NVG_TILE + NVG_TILE / 2; }
 static inline int32_t Nvg_CY(int ty) { return s_nvgMinY + ty * NVG_TILE + NVG_TILE / 2; }
@@ -1171,7 +1190,7 @@ static void Bot_NavBuild(void)
     int16_t seed = 0;
     for (int t = 0; t < total; t++)
     {
-        s_nvgSect[t] = -1; s_nvgPass[t] = 0; s_nvgFlagT[t] = 0;
+        s_nvgSect[t] = -1; s_nvgPass[t] = 0; s_nvgFlagT[t] = 0; s_nvgCrawl[t] = 0;
         int32_t const cx = Nvg_CX(t % s_nvgW), cy = Nvg_CY(t / s_nvgW);
         int16_t cs = seed;
         updatesector(cx, cy, &cs);
@@ -1184,6 +1203,16 @@ static void Bot_NavBuild(void)
             int32_t const gap = getflorzofslope(cs, cx, cy) - getceilzofslope(cs, cx, cy);
             if (gap < (26 << 8))
                 continue;                       // sealed / crush space
+            // Crawl-height tile: WALKABLE (ducking works) but flagged --
+            // the seat-scoped router refuses to route a march INTO ducts
+            // (leave-only, mirroring the wedge-spot rule). E1L1's vent
+            // system is a conveyor that presses a crawling bot into its
+            // sealed grate, the codebase's oldest documented hard trap;
+            // cross-map routing was happily tunneling marches through it
+            // as a shortcut. Bound 72 = the jetpack block's crawl-space
+            // definition: everything below it needs the duck reflex to
+            // move at all (measured pins in clr=60 and clr=68 pockets).
+            s_nvgCrawl[t] = (gap < (72 << 8));
         }
         s_nvgSect[t] = cs;
         s_nvgFlagT[t] = (uint8_t)isDoor;
@@ -1285,6 +1314,8 @@ static uint16_t s_nvgBfsGen = 0;
 // sprite-blind, the straight route through the chairs grinds, and without
 // this hook every re-path chose the same doomed line).
 static int Bot_AvoidEdgeActive(int k, int from, int to);
+static int Bot_NearWedgeSpot(int k, int32_t x, int32_t y);
+static int Bot_SegNearWedgeSpot(int k, int32_t x0, int32_t y0, int32_t x1, int32_t y1);
 
 // BFS over the grid. Rolling horizon: cap stored waypoints; repath when the
 // window empties. parentDir packs the reconstruction into one byte per tile.
@@ -1320,6 +1351,12 @@ static int Bot_NvgPath(int k, int fromTile, int destTile, int16_t *outTx, int16_
             if (k >= 0 && s_nvgSect[u] != s_nvgSect[t]
                 && Bot_AvoidEdgeActive(k, s_nvgSect[t], s_nvgSect[u]))
                 continue;               // dead crossing: route around it
+            if (k >= 0 && s_nvgCrawl[u] && !s_nvgCrawl[t])
+                continue;               // duct: leave-only, never route IN
+            if (k >= 0
+                && Bot_NearWedgeSpot(k, Nvg_CX(u % s_nvgW), Nvg_CY(u / s_nvgW))
+                && !Bot_NearWedgeSpot(k, Nvg_CX(tx), Nvg_CY(ty)))
+                continue;               // wedge pocket: leave-only, never enter
             seenGen[u] = gen;
             parentDir[u] = (uint8_t)d;
             queue[qt++] = u;
@@ -1391,6 +1428,12 @@ static int Bot_NvgFloodSectDist(int k, int fromTile)
                 if (k >= 0 && s_nvgSect[u] != sct
                     && Bot_AvoidEdgeActive(k, sct, s_nvgSect[u]))
                     continue;           // price candidates over ROUTABLE ground
+                if (k >= 0 && s_nvgCrawl[u] && !s_nvgCrawl[t])
+                    continue;           // duct: priced as unroutable inward
+                if (k >= 0
+                    && Bot_NearWedgeSpot(k, Nvg_CX(u % s_nvgW), Nvg_CY(u / s_nvgW))
+                    && !Bot_NearWedgeSpot(k, Nvg_CX(tx), Nvg_CY(ty)))
+                    continue;           // wedge pocket: priced as unroutable
                 s_nvgBfsSeen[u] = s_nvgBfsGen;
                 s_nvgBfsQueue[qt++] = u;
             }
@@ -1406,6 +1449,31 @@ static int8_t  s_botRouteLen[MAXPLAYERS], s_botRouteIdx[MAXPLAYERS];
 static int32_t s_botRouteDX[MAXPLAYERS], s_botRouteDY[MAXPLAYERS];
 static int16_t s_botRouteCool[MAXPLAYERS];
 static int8_t  s_botWpDoor[MAXPLAYERS];      // upcoming waypoint is a door tile
+
+// Does the straight walk cross a crawl-height (duct) tile? Bot_LineWalkable
+// is deliberately CEILING-blind, so the straight-shot legs could tunnel a
+// march into the vent system the router now refuses -- same bypass the
+// wedge spots needed closing. Endpoints inside ducts are exempt (leaving,
+// or a genuine duct goal, is allowed; blind ENTRY is not).
+static int Bot_SegCrossesCrawl(int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+{
+    if (s_nvgW <= 0)
+        return 0;
+    int const t1 = Nvg_TileOf(x1, y1);
+    if (t1 >= 0 && s_nvgCrawl[t1])
+        return 0;                       // goal itself is duct: caller's call
+    int const t0 = Nvg_TileOf(x0, y0);
+    int32_t const dx = x1 - x0, dy = y1 - y0;
+    int const steps = clamp((int)((klabs(dx) + klabs(dy)) >> 8), 1, 64);
+    for (int s2 = 1; s2 < steps; s2++)
+    {
+        int const t = Nvg_TileOf(x0 + (int32_t)(((int64_t)dx * s2) / steps),
+                                 y0 + (int32_t)(((int64_t)dy * s2) / steps));
+        if (t >= 0 && t != t0 && s_nvgCrawl[t])
+            return 1;
+    }
+    return 0;
+}
 
 // Resolve a destination to the CURRENT steering waypoint over the floor
 // grid. String-pulled: aim at the FARTHEST stored waypoint the feet can walk
@@ -1426,8 +1494,13 @@ static int Bot_Waypoint(int k, DukePlayer_t *ps, int32_t dx2, int32_t dy2,
     Bot_NavEnsure();
     if (s_nvgW <= 0)
         return 0;
-    if (Bot_LineWalkable(ps, dx2, dy2))
+    if (Bot_LineWalkable(ps, dx2, dy2)
+        && !Bot_SegNearWedgeSpot(k, ps->pos.x, ps->pos.y, dx2, dy2)
+        && !Bot_SegCrossesCrawl(ps->pos.x, ps->pos.y, dx2, dy2))
     { s_botRouteLen[k] = 0; return 1; }         // straight shot IS mesh-guided
+                                                // (unless it grazes a stamped
+                                                // wedge pocket or tunnels a
+                                                // duct: mesh-route then)
     if (s_botRouteCool[k] > 0)
         s_botRouteCool[k]--;
     int const moved = klabs(s_botRouteDX[k] - dx2) + klabs(s_botRouteDY[k] - dy2);
@@ -1464,7 +1537,11 @@ static int Bot_Waypoint(int k, DukePlayer_t *ps, int32_t dx2, int32_t dy2,
         int const i2 = s_botRouteIdx[k] + a;
         if (i2 >= s_botRouteLen[k])
             break;
-        if (Bot_LineWalkable(ps, Nvg_CX(s_botRtX[k][i2]), Nvg_CY(s_botRtY[k][i2])))
+        if (Bot_LineWalkable(ps, Nvg_CX(s_botRtX[k][i2]), Nvg_CY(s_botRtY[k][i2]))
+            && !Bot_SegNearWedgeSpot(k, ps->pos.x, ps->pos.y,
+                                     Nvg_CX(s_botRtX[k][i2]), Nvg_CY(s_botRtY[k][i2]))
+            && !Bot_SegCrossesCrawl(ps->pos.x, ps->pos.y,
+                                    Nvg_CX(s_botRtX[k][i2]), Nvg_CY(s_botRtY[k][i2])))
             pick = i2;
     }
     *wx = Nvg_CX(s_botRtX[k][pick]);
@@ -1625,6 +1702,68 @@ static void Bot_ClearAvoidEdgeTo(int k, int sect)   // entered it: edges in are 
     for (int i = 0; i < BOT_EAVOID_N; i++)
         if (s_botEdgeTo[k][i] == sect)
             { s_botEdgeUntil[k][i] = 0; s_botEdgeTries[k][i] = 0; }
+}
+
+// --- wedge-spot ring (see the s_botWspot* declarations) ----------------------
+static void Bot_MarkWedgeSpot(int k, int32_t x, int32_t y)
+{
+    int32_t const plc = movefifoplc;
+    int slot = 0;
+    for (int i = 0; i < BOT_WSPOT_N; i++)
+    {
+        // refresh a spot we are basically standing on again
+        if (s_botWspotUntil[k][i] >= plc
+            && klabs(s_botWspotX[k][i] - x) + klabs(s_botWspotY[k][i] - y) < BOT_WSPOT_R)
+            { slot = i; break; }
+        if (s_botWspotUntil[k][i] < s_botWspotUntil[k][slot])
+            slot = i;                           // LRU by expiry
+    }
+    s_botWspotX[k][slot]     = x;
+    s_botWspotY[k][slot]     = y;
+    s_botWspotUntil[k][slot] = plc + 1560;      // ~60s of "do not route back in"
+}
+static int Bot_NearWedgeSpot(int k, int32_t x, int32_t y)
+{
+    int32_t const plc = movefifoplc;
+    for (int i = 0; i < BOT_WSPOT_N; i++)
+        if (s_botWspotUntil[k][i] >= plc && s_botWspotUntil[k][i] - plc <= 2000
+            && klabs(s_botWspotX[k][i] - x) + klabs(s_botWspotY[k][i] - y) < BOT_WSPOT_R)
+            return 1;
+    return 0;
+}
+static void Bot_ClearWedgeSpots(int k)
+{
+    for (int i = 0; i < BOT_WSPOT_N; i++)
+        s_botWspotUntil[k][i] = 0;
+}
+// Does the straight walk (x0,y0)->(x1,y1) pass within an active wedge spot?
+// The route follower's straight-shot and string-pull legs are approved by
+// Bot_LineWalkable, which is deliberately SPRITE-BLIND -- so they sailed
+// right back into a freshly-stamped chair pocket after every escape
+// (measured: the bot broke 2000 units free, then bee-lined into the exact
+// same coordinates for the next item). Any mesh detour the router found was
+// bypassed by the straight line; this check closes that bypass.
+static int Bot_SegNearWedgeSpot(int k, int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+{
+    int32_t const plc = movefifoplc;
+    int live = 0;
+    for (int i = 0; i < BOT_WSPOT_N; i++)
+        if (s_botWspotUntil[k][i] >= plc && s_botWspotUntil[k][i] - plc <= 2000)
+            { live = 1; break; }
+    if (!live)
+        return 0;
+    int32_t const dx = x1 - x0, dy = y1 - y0;
+    int const steps = clamp((int)((klabs(dx) + klabs(dy)) >> 8), 1, 64);
+    for (int s2 = 0; s2 <= steps; s2++)
+    {
+        int32_t const sx = x0 + (int32_t)(((int64_t)dx * s2) / steps);
+        int32_t const sy = y0 + (int32_t)(((int64_t)dy * s2) / steps);
+        for (int i = 0; i < BOT_WSPOT_N; i++)
+            if (s_botWspotUntil[k][i] >= plc && s_botWspotUntil[k][i] - plc <= 2000
+                && klabs(s_botWspotX[k][i] - sx) + klabs(s_botWspotY[k][i] - sy) < BOT_WSPOT_R)
+                return 1;
+    }
+    return 0;
 }
 
 // Roam telemetry: first entry into a sector this level bumps the distinct
@@ -1832,6 +1971,21 @@ static int Bot_PlanItem(int k, DukePlayer_t *ps)
     return 1;
 }
 
+// Every way a commit can end goes through here, so one grep ([ltgend]) shows
+// the full LTG lifecycle per seat: why each march ended and after how many
+// body failures -- the forensic that named the wedge-cluster ping-pong.
+static void Bot_LtgEnd(int k, const char *why)
+{
+    if (s_botLtgKind[k] == 0)
+        return;
+    extern int32_t g_netForensics;
+    if (g_netForensics)
+        LOG_F(INFO, "[ltgend] seat=%d why=%s kind=%d sect=%d item=%d fails=%d plc=%d",
+              k, why, (int)s_botLtgKind[k], (int)s_botLtgSect[k],
+              (int)s_botLtgItem[k], (int)s_botLtgFails[k], (int)movefifoplc);
+    s_botLtgKind[k] = 0;
+}
+
 // ── LTG planning: map-wide candidates, one commit ───────────────────────────
 // Desirability stand-in for OA's fuzzy weight files (deliberately skipped --
 // audit: data-file machinery, not concept): a static class weight, health
@@ -2006,20 +2160,20 @@ static int Bot_LtgErrand(int k, DukePlayer_t *ps)
     {
         int const it = s_botLtgItem[k];
         if ((unsigned)it >= MAXSPRITES || !Bot_IsPickup(sprite[it].picnum))
-            s_botLtgKind[k] = 0;                // gone for good (deleted)
+            Bot_LtgEnd(k, "gone");              // deleted for good
         else if (sprite[it].cstat & 32768)
         {
             // OBSERVED taken (by anyone, us included) while committed: refresh
             // the schedule from this sighting and move on.
             Bot_ItemAvoidStamp(k, it, plc + g_itemRespawnTime);
-            s_botLtgKind[k] = 0;
+            Bot_LtgEnd(k, "taken");
         }
     }
     if (s_botLtgKind[k] == 1 && ps->cursectnum == s_botLtgSect[k])
-        s_botLtgKind[k] = 0;                    // anchor reached
+        Bot_LtgEnd(k, "arrive");                // anchor reached
     if (s_botLtgKind[k] != 0
         && (plc >= s_botLtgUntil[k] || s_botLtgUntil[k] - plc > 700))
-        s_botLtgKind[k] = 0;                    // commit expired (or plc restarted)
+        Bot_LtgEnd(k, "deadline");              // commit expired (or plc restarted)
     if (s_botLtgKind[k] == 0 && !Bot_PlanLtg(k, ps))
         return 0;
     s_botGoal[k]       = (s_botLtgKind[k] == 2) ? 2 : 1;
@@ -2202,7 +2356,7 @@ static input_t Bot_GetInput(int k)
         s_botJetCool[k]    = 0;             // (activation tallies persist -- telemetry)
         for (int di = 0; di < BOT_DEAD_N; di++) // a teleport changes reachability:
             s_botDeadCool[k][di] = 0;           // forget which exits were impossible
-        s_botLtgKind[k]   = 0;              // respawned elsewhere: the committed march is void
+        Bot_LtgEnd(k, "death");             // respawned elsewhere: the committed march is void
         s_botLtgFails[k]  = 0;
         s_botLtgLocal[k]  = 0;
         s_botGoalIsLtg[k] = 0;
@@ -2277,7 +2431,7 @@ static input_t Bot_GetInput(int k)
             else if (ps->cursectnum == s_botGoalSect[k])
             {
                 s_botGoal[k]     = 0;   // LTG roam anchor REACHED
-                s_botLtgKind[k]  = 0;   // next commit re-planned fresh...
+                Bot_LtgEnd(k, "arrive");// next commit re-planned fresh...
                 s_botLtgLocal[k] = 2;   // ...after two LOCAL explore beats:
                                         // march there, then sniff around the
                                         // destination cluster like a player
@@ -2304,10 +2458,13 @@ static input_t Bot_GetInput(int k)
         {
             s_botRoamLogPlc[k] = movefifoplc;
             Bot_RoamStamp(k, ps->cursectnum);   // count the spawn room too
-            LOG_F(INFO, "[roam] seat=%d visited=%d plc=%d x=%d y=%d sect=%d goal=%d ltg=%d",
+            LOG_F(INFO, "[roam] seat=%d visited=%d plc=%d x=%d y=%d sect=%d goal=%d ltg=%d still=%d idle=%d clr=%d",
                   k, (int)s_botRoamCnt[k], (int)movefifoplc,
                   (int)ps->pos.x, (int)ps->pos.y, (int)ps->cursectnum,
-                  (int)s_botGoal[k], (int)s_botLtgKind[k]);
+                  (int)s_botGoal[k], (int)s_botLtgKind[k],
+                  (int)s_botStillTics[k], (int)s_botIdleTics[k],
+                  (int)((getflorzofslope(ps->cursectnum, ps->pos.x, ps->pos.y)
+                         - getceilzofslope(ps->cursectnum, ps->pos.x, ps->pos.y)) >> 8));
         }
     }
 
@@ -2680,6 +2837,7 @@ static input_t Bot_GetInput(int k)
     s_botLastPos[k] = ps->pos.xy;
     if (stepped < 16)
     {
+        s_botStillTics[k]++;            // honesty meter: total stationary time
         if (++s_botStuckTics[k] > 10)
         {
             s_botStuckTics[k] = 0;
@@ -2818,6 +2976,21 @@ static input_t Bot_GetInput(int k)
         if ((s_botOpenGrace[k] & 7) == 0)
             in.bits |= BIT(SK_OPEN);            // re-press while the grace runs
     }
+    // ACTIVE wedge escape (LTG layer; the recovery ladder itself is
+    // untouched): standing INSIDE a stamped wedge spot without moving means
+    // the walk/crouch escapes are beaten -- keep tapping JUMP on the standard
+    // cooldown until the body breaks free. Chairs are knee-high; jumping onto
+    // them is the player's move, and the duct block below still strips jumps
+    // under low ceilings. With a goal live the ladder's lane branch owns the
+    // stuck trips and its bounce-jump rung never fires, so without this the
+    // one-shot jump at stall-kill time (~every 200 tics) was the only jump
+    // pressure a wedged march ever produced (measured: 50s frozen).
+    if (g_botLtgOn && stepped < 16 && s_botJumpCool[k] == 0
+        && Bot_NearWedgeSpot(k, ps->pos.x, ps->pos.y))
+    {
+        in.bits |= BIT(SK_JUMP);
+        s_botJumpCool[k] = 78;
+    }
 
     // Errand upkeep: arrival, timeout, and the DOOR/vent etiquette on approach.
     if (s_botGoal[k] != 0)
@@ -2858,7 +3031,7 @@ static input_t Bot_GetInput(int k)
                 s_botRouteCool[k] = 0;
                 if (++s_botLtgFails[k] >= 2)
                 {
-                    s_botLtgKind[k] = 0;        // LTG survives ONE grind (resume
+                    Bot_LtgEnd(k, "stallkill"); // LTG survives ONE grind (resume
                                                 // from wherever recovery moved
                                                 // us); the second kills it
                     if ((unsigned)s_botGoalSect[k] < (unsigned)numsectors)
@@ -2873,15 +3046,24 @@ static input_t Bot_GetInput(int k)
                     if (s_botGoal[k] == 2 && (unsigned)s_botGoalItem[k] < MAXSPRITES)
                         Bot_ItemAvoidStamp(k, s_botGoalItem[k],
                                            movefifoplc + g_itemRespawnTime);
-                    // ^ and loses its staleness pull, or the next plan re-picks
-                    // it. Two zero-movement stalls back to back is a certified
-                    // WEDGE (sprite fields): hold the goal picker off for a
-                    // beat. A live goal routes every stuck trip into the LANE
-                    // branch of the (unchanged) recovery ladder and the
-                    // episode-gated JUMP rung never fires; the old brain got
-                    // its jumps through natural goal-less wander gaps, so give
-                    // the ladder the same room to work.
-                    s_botThinkHold[k] = (int16_t)(96 + (Bot_Rnd() & 63));
+                    // Two zero-movement stalls back to back is a certified
+                    // WEDGE. Response is ACTIVE, never idle -- the first cut
+                    // paused the picker ~120 tics here to free the recovery
+                    // ladder's jump rung, and the coordinator's probe metrics
+                    // caught the bill: guest path length 0.65x baseline, the
+                    // old brain never idles so every pause was lost ground.
+                    // Now: (1) stamp the SPOT so the router and the flood
+                    // stop feeding marches back into this pocket, and (2) do
+                    // what a player does in a chair field -- JUMP (one tap,
+                    // existing cooldown; the duct-crouch block still strips
+                    // jumps where the ceiling is low). Planning continues
+                    // the same tic; the next commit routes around the spot.
+                    Bot_MarkWedgeSpot(k, ps->pos.x, ps->pos.y);
+                    if (s_botJumpCool[k] == 0)
+                    {
+                        in.bits |= BIT(SK_JUMP);
+                        s_botJumpCool[k] = 78;
+                    }
                 }
                 {
                     extern int32_t g_netForensics;
@@ -2935,7 +3117,7 @@ static input_t Bot_GetInput(int k)
             else if ((unsigned)s_botGoalSect[k] < (unsigned)numsectors)
                 s_botVisitT[k][s_botGoalSect[k]] = movefifoplc;
             if (s_botGoalIsLtg[k])
-                s_botLtgKind[k] = 0;            // spent: plan a fresh commit
+                Bot_LtgEnd(k, "timeout");       // spent: plan a fresh commit
             s_botGoal[k] = 0;
         }
         else if (s_botGoal[k] == 2)
@@ -2951,7 +3133,7 @@ static input_t Bot_GetInput(int k)
                     Bot_ItemAvoidStamp(k, it, movefifoplc + g_itemRespawnTime);
                 if (s_botGoalIsLtg[k])
                 {
-                    s_botLtgKind[k]  = 0;       // LTG satisfied: next think re-plans
+                    Bot_LtgEnd(k, "got");       // LTG satisfied: next think re-plans
                     s_botLtgLocal[k] = 2;       // destination sniff (see crossing)
                 }
                 s_botGoal[k] = 0;
@@ -2962,7 +3144,7 @@ static input_t Bot_GetInput(int k)
                 // sim refuses. Shun it and get back to the room routine.
                 s_botItemShun[k] = (int16_t)it;
                 if (s_botGoalIsLtg[k])
-                    s_botLtgKind[k] = 0;
+                    Bot_LtgEnd(k, "shun");
                 s_botGoal[k]     = 0;
             }
         }
@@ -3251,7 +3433,10 @@ static input_t Bot_GetInput(int k)
         }
     }
     else
+    {
         wantAng = s_botWanderAng[k];
+        s_botIdleTics[k]++;             // honesty meter: wander-fallback time
+    }
 
     // AIM / MOVE DECOUPLING (user directive 2026-08-10): keep the MOVEMENT
     // heading (wantAng: nav route / roam / circle), but FACE the target when
@@ -3453,7 +3638,13 @@ static input_t Bot_GetInput(int k)
                 in.bits |= BIT(SK_OPEN);
             int32_t const clr = getflorzofslope(ps->cursectnum, ps->pos.x, ps->pos.y)
                               - getceilzofslope(ps->cursectnum, ps->pos.x, ps->pos.y);
-            if (clr < (52 << 8))
+            // Threshold 52 -> 72 (the jetpack block's own crawl-space bound):
+            // 56-71-pixel pockets are too low to WALK standing yet were above
+            // the old duck reflex -- a bot standing in one had every step
+            // ceiling-blocked, and only the hard-trap's transient crouch
+            // inched it ~64 units per 104 tics (measured: minutes pinned at
+            // one x in clr=60 and clr=68 pockets, the frozen probe pairs).
+            if (clr < (72 << 8))
             {
                 in.bits |= BIT(SK_CROUCH);
                 in.bits &= ~BIT(SK_JUMP);       // ducts: jumping just grinds the ceiling
@@ -3700,6 +3891,28 @@ static input_t Bot_GetInput(int k)
         }
     }
 
+    // VIEWSCREEN CAMERA LOCK CURE (belt + braces; P_ProcessInput discards
+    // ALL movement while newowner >= 0, player.cpp:5660, and only an
+    // SK_ESCAPE edge clears cameras, sector.cpp:3382 -- which a bot never
+    // presses; its own OPEN taps even keep the toggle latched). Never seen
+    // firing on E1L1 probes ([cam] count 0), but a bot that ever activates
+    // a screen would otherwise freeze forever, so the cure stays.
+    if (ps->newowner >= 0)
+    {
+        in.bits &= ~BIT(SK_OPEN);
+        if (movefifoplc & 1)
+            in.bits |= BIT(SK_ESCAPE);
+        extern int32_t g_netForensics;
+        static int32_t s_camLogPlc[MAXPLAYERS];
+        if (g_netForensics && (movefifoplc - s_camLogPlc[k] >= 260
+                               || movefifoplc < s_camLogPlc[k]))
+        {
+            s_camLogPlc[k] = movefifoplc;
+            LOG_F(INFO, "[cam] seat=%d viewscreen lock, clearing (own=%d) plc=%d",
+                  k, (int)ps->newowner, (int)movefifoplc);
+        }
+    }
+
     if (in.bits & BIT(SK_JUMP))
         s_botJumps[k]++;
 
@@ -3747,9 +3960,12 @@ void Net_SeatBots(int minPlayers, int skill)
         s_botSeenValid[k] = 0;
         Bot_ItemAvoidReset(k);
         Bot_ClearAvoidEdges(k);
+        Bot_ClearWedgeSpots(k);
         Bmemset(s_botRoamBm[k], 0, sizeof(s_botRoamBm[k]));
         s_botRoamCnt[k]    = 0;
         s_botRoamLogPlc[k] = 0;
+        s_botStillTics[k]  = 0;
+        s_botIdleTics[k]   = 0;
         s_botTeamLogged[k] = 0;
     }
     if (myconnectindex != connecthead)
