@@ -898,6 +898,26 @@ static int16_t s_botDeadSect[MAXPLAYERS][BOT_DEAD_N]; // recently-unreachable ta
 static int16_t s_botDeadCool[MAXPLAYERS][BOT_DEAD_N]; // tics of avoidance left (0 = slot free)
 static int32_t s_botGoalNear[MAXPLAYERS];    // closest we have come to the current goal
 static int16_t s_botGoalStall[MAXPLAYERS];   // tics since that closest approach improved
+// ── Combat / aim model (OpenArena-mined, wave 3b). Per-seat static state, no
+// heap; RESET at BOTH the Net_SeatBots init loop AND the respawn block, same as
+// every other body-state array. Concept ports of ai_dmq3.c BotAimAtEnemy /
+// BotCheckAttack + ai_main.c BotChangeViewAngles -- these only SET input bits
+// and angles; authoritative weapon fire lives elsewhere.
+static int16_t s_botFireSight[MAXPLAYERS];    // (#1) tics the CURRENT target has been
+                                              // continuously visible -- FIRE waits for
+                                              // this >= reactTics[skill] (their enemysight
+                                              // reaction gate, BotCheckAttack :3637)
+static int32_t s_botTgtSX[MAXPLAYERS], s_botTgtSY[MAXPLAYERS]; // (#2) last velocity-snapshot pos
+static int32_t s_botTgtVX[MAXPLAYERS], s_botTgtVY[MAXPLAYERS]; // (#2/#3) target vel estimate, units/tic
+static int32_t s_botTgtSnap[MAXPLAYERS];      // (#2) movefifoplc of the last snapshot
+static int8_t  s_botTgtVValid[MAXPLAYERS];    // (#2) a baseline snapshot exists
+static int16_t s_botAimDegrade[MAXPLAYERS];   // (#2) tics of degraded accuracy after a jink
+static int32_t s_botViewVel[MAXPLAYERS];      // (#5) second-order view-angle velocity (ang/tic)
+static int16_t s_botThrWait[MAXPLAYERS];      // (#8) FIRETHROTTLE: tics fire is throttled OFF
+static int16_t s_botThrShoot[MAXPLAYERS];     // (#8) tics of the current shoot window left
+static int16_t s_botStrafeTic[MAXPLAYERS];    // (#7) strafe-change interval accumulator
+static int8_t  s_botStrafeFail[MAXPLAYERS];   // (#7) consecutive blocked strafe attempts (0..2)
+static int8_t  s_botWantStrafe[MAXPLAYERS];   // (#7) commanded a strafe last tic
 // ── Two-tier goal stack: map-wide LTG + errand-as-NBG (OpenArena-mined,
 // wave 3a). The explore planner only ever scored the CURRENT sector's portals
 // and the errand died on every sector crossing, so bots orbited their spawn
@@ -916,6 +936,17 @@ static int32_t Bot_LtgFromEnv(void)
     return (e && *e) ? Batoi(e) : 1;
 }
 static int32_t g_botLtgOn = Bot_LtgFromEnv();
+// TEST KNOBS (wave 3b forensics; the native autolaunch host never calls
+// Net_SeatBots, so the CPU skill is otherwise pinned at its g_netBotSkill
+// default of 2 and the difficulty COLUMNS can't be exercised in a headless
+// leg). NN_BOTSKILL forces the skill column 0..3; NN_BOTALERTCAP overrides the
+// per-skill acquisition-radius cap so the [alert] acquired=0 proof is
+// reachable in a short window. Both default OFF (-1 / 0). Read once at load,
+// exactly like g_botLtgOn -- cross-peer identical (same env on every peer).
+static int32_t Bot_SkillFromEnv(void)    { const char *e = getenv("NN_BOTSKILL");    return (e && *e) ? clamp(Batoi(e), 0, 3) : -1; }
+static int32_t Bot_AlertCapFromEnv(void) { const char *e = getenv("NN_BOTALERTCAP"); return (e && *e) ? Batoi(e) : 0; }
+static int32_t g_botSkillEnv = Bot_SkillFromEnv();
+static int32_t g_botAlertCap = Bot_AlertCapFromEnv();
 static int32_t s_botLtgX[MAXPLAYERS], s_botLtgY[MAXPLAYERS];
 static int16_t s_botLtgSect[MAXPLAYERS];     // target sector of the committed LTG
 static int8_t  s_botLtgKind[MAXPLAYERS];     // 0 none, 1 roam anchor, 2 item
@@ -2230,6 +2261,32 @@ static int16_t const s_botEngageDist[MAX_WEAPONS] = {
     512,   // FLAMETHROWER (not in their matrix; short-range spray)
 };
 
+// PROJECTILE SPEED by OUR current weapon, Build units per tic, for aim leading
+// (audit item 6c). 0 = HITSCAN weapon: no leading, the shot lands instantly
+// (pistol/chaingun/shotgun/knee/tripbomb/flamethrower). Non-zero = the fired
+// projectile's travel speed, so the lead is aimPt = tgt + (dist/projSpeed)*tgtVel
+// (their VectorMA(origin,(dist/wi.speed)*speed,dir,bestorigin), ai_dmq3.c:3480).
+// The live values are CON-data-driven (g_tile[aplWeaponShoots[w][k]].proj->vel),
+// which IS reachable at runtime but adds NULL-check + per-player-index failure
+// modes; this is the classic Duke3D constant table instead -- deterministic on
+// every peer regardless of CON load, and only the MAGNITUDE scales the lead
+// (the leading gate asserts the aim angle CHANGED, not an exact intercept).
+static int16_t const s_botProjSpeed[MAX_WEAPONS] = {
+    0,     // KNEE        (contact / hitscan)
+    0,     // PISTOL      (hitscan)
+    0,     // SHOTGUN     (hitscan)
+    0,     // CHAINGUN    (hitscan)
+    644,   // RPG         (classic rocket velocity)
+    0,     // HANDBOMB    (thrown ballistic arc -- no linear lead)
+    768,   // SHRINKER    (SHRINKSPARK)
+    644,   // DEVISTATOR  (fires RPG-class projectiles)
+    0,     // TRIPBOMB    (placed)
+    1024,  // FREEZE      (FREEZEBLAST -- fast, bounces)
+    0,     // HANDREMOTE  (pipebomb detonator)
+    768,   // GROW        (GROWSPARK / expander)
+    0,     // FLAMETHROWER (short spray)
+};
+
 static input_t Bot_GetInput(int k)
 {
     input_t in = {};
@@ -2363,11 +2420,19 @@ static input_t Bot_GetInput(int k)
         s_botSeenValid[k] = 0;              // last-seen snapshot dies with the body
         for (int ei = 0; ei < BOT_EAVOID_N; ei++)   // reachability changed with the teleport
             { s_botEdgeUntil[k][ei] = 0; s_botEdgeTries[k][ei] = 0; }
+        // wave-3b combat/aim model: a new body has no target sight, no velocity
+        // baseline, no carried view momentum or throttle/strafe phase
+        s_botFireSight[k]  = 0;
+        s_botTgtVValid[k]  = 0;  s_botTgtVX[k] = 0;  s_botTgtVY[k] = 0;  s_botTgtSnap[k] = 0;
+        s_botAimDegrade[k] = 0;
+        s_botViewVel[k]    = 0;
+        s_botThrWait[k]    = 0;  s_botThrShoot[k] = 0;
+        s_botStrafeTic[k]  = 0;  s_botStrafeFail[k] = 0;  s_botWantStrafe[k] = 0;
         // (the item respawn ring PERSISTS: it is world knowledge, not body state;
         // the roam bitmap persists too -- the [roam] meter is per-LEVEL)
     }
 
-    int const skill = clamp(g_netBotSkill, 0, 3);
+    int const skill = clamp(g_botSkillEnv >= 0 ? g_botSkillEnv : g_netBotSkill, 0, 3);
     // COOP: the bot is a teammate. It fights MONSTERS and is blind to human
     // players -- no player target, no player revenge (user 2026-08-12: a coop
     // bot "should never try to revenge attack another player"). Everything
@@ -2409,7 +2474,28 @@ static input_t Bot_GetInput(int k)
     // LOS reaction delay: a newly-seen player must hold line of sight this
     // many tics before the bot locks on -- until then it keeps roaming (user:
     // "spend more time roaming and not notice players by LOS so quickly").
+    // reactTics ALSO gates the FIRE decision now (audit item 6a): fire only
+    // after the target has held continuous sight this long (s_botFireSight).
     static int const reactTics[4] = { 60, 42, 26, 16 };  // ~2.0 / 1.4 / 0.87 / 0.53 s
+    // ── Difficulty COLUMNS added by wave 3b (audit "Skill columns to ADD"):
+    //  ALERTNESS -- acquisition RADIUS cap (Build units, the acquisition scan's
+    //   own klabs(dx)+klabs(dy)+(dz>>2) metric). Their 900+alertness*4000 shape
+    //   (ai_dmq3.c:3081) scaled to Build: a visible player FARTHER than this is
+    //   NOT noticed (we used to acquire at any distance with LOS). Higher skill
+    //   sees farther. E1L1's long street exceeds the low tiers, so the cap
+    //   actually bites there. NN_BOTALERTCAP overrides all four for testing.
+    static int const alertRadius[4] = { 8000, 14000, 22000, 34000 };
+    //  AIM_SKILL tier -- 0 disables projectile LEADING and predictive aim (the
+    //   dumb tier just faces the raw target); >=1 enables linear leading (#3)
+    //   (their aim_skill>0.4 linear-prediction gate, ai_dmq3.c:3474). It also
+    //   scales the always-on aim-error FLOOR below.
+    static int const aimLead[4]  = { 0, 1, 1, 1 };
+    //  FIRETHROTTLE -- fire duty cycle out of 256 (their CHARACTERISTIC_
+    //   FIRETHROTTLE random>throttle wait model, ai_dmq3.c:3643). Higher =
+    //   shoots more of the time; low tiers pulse the trigger like a human
+    //   instead of holding a continuous beam.
+    static int const fireThrottle[4] = { 150, 190, 220, 245 };
+    int const alertR = (g_botAlertCap > 0) ? g_botAlertCap : alertRadius[skill];
 
     // Crossing into a new sector invalidates the plotted portal: re-plan now.
     // It also feeds the room memory: stamp where we are, remember where we
@@ -2487,6 +2573,9 @@ static input_t Bot_GetInput(int k)
                 s_botMonTgt[k]     = (int16_t)wa;   // lock the monster that hit us
                 s_botTargetHold[k] = 0;
                 s_botSightTics[k]  = 0;
+                s_botFireSight[k]  = 0;             // (#1) fire gate restarts on the new lock
+                s_botTgtVValid[k]  = 0;             // (#2) new target: no velocity baseline yet
+                s_botAimDegrade[k] = 0;
                 s_botNoHitTics[k]  = 0;
                 s_botLastTDist[k]  = INT32_MAX;
                 s_botSpawnRoam[k]  = 0;
@@ -2510,6 +2599,9 @@ static input_t Bot_GetInput(int k)
                 s_botTarget[k]     = (int8_t)atk;   // hard-lock onto the attacker NOW
                 s_botTargetHold[k] = 0;
                 s_botSightTics[k]  = 0;             // treat as freshly sighted
+                s_botFireSight[k]  = 0;            // (#1) but still earn the fire window by SIGHT
+                s_botTgtVValid[k]  = 0;            // (#2) new target: no velocity baseline yet
+                s_botAimDegrade[k] = 0;
                 s_botNoHitTics[k]  = 0;
                 s_botLastTDist[k]  = INT32_MAX;
                 s_botPending[k]    = -1;            // cancel any half-built acquisition
@@ -2612,6 +2704,8 @@ static input_t Bot_GetInput(int k)
                 else if (s_botGoal[k] == 0 && !Bot_PlanExplore(k, ps))    // other room / none: ROAM to find
                     s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
             }
+            // Strafe seed at THINK cadence (kept for RNG-sequence parity; the
+            // combat model below re-derives strafe per-tic when a target is up).
             if ((Bot_Rnd() & 3) == 0)
                 s_botStrafeDir[k] = (Bot_Rnd() & 1) ? 1 : -1;
             if (s_botTurnPref[k] == 0 || (Bot_Rnd() & 63) == 0)
@@ -2682,6 +2776,18 @@ static input_t Bot_GetInput(int k)
                 if (d < heardd) { heardd = d; heard = i; }
                 continue;
             }
+            // ALERTNESS RADIUS CAP (audit item 8): a VISIBLE player farther than
+            // this skill's acquisition radius is not noticed -- we used to lock
+            // on at any distance the moment LOS existed (their squaredist >
+            // Square(900+alertness*4000) skip, ai_dmq3.c:3081). Revenge is
+            // exempt: a bullet in the back needs no eyeball range check.
+            if (i != revenge && d > alertR)
+            {
+                extern int32_t g_netForensics;
+                if (g_netForensics)
+                    LOG_F(INFO, "[alert] seat=%d tgt=%d dist=%d acquired=0", k, i, (int)d);
+                continue;
+            }
             if (i == revenge)
                 seen = cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
                               cp->pos.x, cp->pos.y, cp->pos.z, cp->cursectnum);
@@ -2713,12 +2819,18 @@ static input_t Bot_GetInput(int k)
             s_botNoHitTics[k]  = 0;
             s_botLastTDist[k]  = INT32_MAX;
             s_botSightTics[k]  = 0;
+            s_botFireSight[k]  = 0;         // (#1) fresh lock: sight window restarts
+            s_botTgtVValid[k]  = 0;         // (#2) drop the old target's velocity baseline
+            s_botAimDegrade[k] = 0;
             // Native-visible lock trace (the [aim] decoupling line is EM_ASM,
             // wasm-only): every NEW player lock, so the TDM smoke can assert
             // ZERO teammate acquisitions and the DM legs still show combat.
             extern int32_t g_netForensics;
             if (g_netForensics && best >= 0)
+            {
                 LOG_F(INFO, "[tgt] seat=%d locked %d plc=%d", k, best, (int)movefifoplc);
+                LOG_F(INFO, "[alert] seat=%d tgt=%d dist=%d acquired=1", k, best, (int)bestd);
+            }
         }
         s_botTarget[k] = (int8_t)best;
         // Plot the route: ROUTABLE means the MESH says so. The old portal
@@ -2816,6 +2928,10 @@ static input_t Bot_GetInput(int k)
         // picker the moment the detour resolves.
         else if (s_botGoalIsLtg[k] && (Bot_Rnd() & 7) == 0)
             Bot_PlanItem(k, ps);
+        // Strafe seed at THINK cadence (kept for RNG-sequence parity with the
+        // pre-3b brain -- the fixed bot seed makes the roam trajectory sensitive
+        // to Bot_Rnd ordering, and dropping this diverged roaming badly; the
+        // combat model below OWNS the per-tic strafe once a target is up).
         if ((Bot_Rnd() & 3) == 0)
             s_botStrafeDir[k] = (Bot_Rnd() & 1) ? 1 : -1;
         if (s_botTurnPref[k] == 0 || (Bot_Rnd() & 63) == 0)
@@ -2835,6 +2951,50 @@ static input_t Bot_GetInput(int k)
     // OPEN (doors are everywhere in Duke) and occasionally JUMP (ledges).
     int32_t const stepped = klabs(ps->pos.x - s_botLastPos[k].x) + klabs(ps->pos.y - s_botLastPos[k].y);
     s_botLastPos[k] = ps->pos.xy;
+    // ── STRAFE MODEL (audit item 8): flip-on-BLOCKED + time-gated interval,
+    // replacing the old 1-in-4-per-think dice roll. (a) if we commanded a
+    // strafe last tic and the body barely displaced, the strafe lane is walled
+    // -- invert and retry (their 2-attempt flip, ai_dmq3.c:2818); after 2
+    // blocked flips stand down a beat so it can't oscillate in place. (b) else
+    // change direction only past a time-gated interval (~0.4s + skill jitter)
+    // AND on a rare roll (their strafechange_time + random>0.935, :2786). Sets
+    // only the strafe SIGN; the wave-1c engage-band forward drive picks the
+    // forward magnitude independently, so the two compose. NOTE: our movement
+    // is one composed world-velocity vector, so "blocked" is detected as a
+    // near-total pin (stepped tiny) rather than an isolated lateral failure.
+    // Gated on an ACTIVE combat target: strafe only matters while fighting
+    // (s_botStrafeDir feeds the canHit/engage-band movement only), and running
+    // this per tic while ROAMING would consume Bot_Rnd every tic and shift the
+    // fixed-seed roam trajectory -- measured: host path 63k vs 177k, guest
+    // wedged. Confined to combat, the roam Bot_Rnd stream (and thus roaming)
+    // is byte-identical to the pre-3b brain.
+    static int const strafeIntervalTics[4] = { 16, 14, 12, 10 };  // 0.4 + (1-skill)*0.2 s
+    if (s_botTarget[k] >= 0 || (botCoop && s_botMonTgt[k] >= 0))
+    {
+        if (s_botStrafeDir[k] == 0)
+            s_botStrafeDir[k] = (Bot_Rnd() & 1) ? 1 : -1;
+        if (s_botWantStrafe[k] && stepped < 24)
+        {
+            if (s_botStrafeFail[k] < 2)
+            {
+                s_botStrafeDir[k]  = (int8_t)-s_botStrafeDir[k];   // blocked: invert, try the other side
+                s_botStrafeFail[k]++;
+                s_botStrafeTic[k]  = 0;
+            }
+            // else: both sides walled -- leave it; the forward/nav drive escapes
+        }
+        else
+        {
+            if (stepped >= 24)
+                s_botStrafeFail[k] = 0;                            // moving again: reset the ladder
+            int const strInt = strafeIntervalTics[skill] + ((skill >= 3) ? (int)(Bot_Rnd() & 5) : 0);
+            if (++s_botStrafeTic[k] > strInt && (Bot_Rnd() & 15) == 0) // ~6% ~ their random>0.935
+            {
+                s_botStrafeDir[k] = (int8_t)-s_botStrafeDir[k];
+                s_botStrafeTic[k] = 0;
+            }
+        }
+    }
     if (stepped < 16)
     {
         s_botStillTics[k]++;            // honesty meter: total stationary time
@@ -3212,6 +3372,48 @@ static input_t Bot_GetInput(int k)
         else if (s_botSightTics[k] < 30000)
             s_botSightTics[k]++;
     }
+    // (#1) FIRE-SIDE REACTION GATE feed: tics the CURRENT target has been
+    // CONTINUOUSLY visible. Fire is gated on this >= reactTics[skill] below, so
+    // a bot no longer discharges the same tic LOS opens (their enemysight_time
+    // reaction window, BotCheckAttack ai_dmq3.c:3637). Resets the instant sight
+    // breaks; the acquisition/retaliation locks above zero it on a target swap.
+    if (hasTgt && seesTarget)
+        { if (s_botFireSight[k] < 30000) s_botFireSight[k]++; }
+    else
+        s_botFireSight[k] = 0;
+    // (#2) ENEMY-VELOCITY MODEL + direction-change penalty. Snapshot the
+    // target's (x,y) about every 15 tics while visible -> a per-tic velocity
+    // estimate (their enemyvelocity remembered every 0.5s, ai_dmq3.c:3406). A
+    // reversal (dot(newvel,oldvel) < 0) or an abrupt jink degrades THIS seat's
+    // aim for ~1s -- feeds the leading (#3) and widens the tracking wobble
+    // (their aim_accuracy *= 0.7 when the enemy changed direction, :3423). tgX/
+    // tgY here are still the LIVE visible coords (the last-seen chase below only
+    // rewrites them once sight is lost, and this samples only while seen).
+    if (s_botAimDegrade[k] > 0)
+        s_botAimDegrade[k]--;
+    if (hasTgt && seesTarget)
+    {
+        int32_t const dt = movefifoplc - s_botTgtSnap[k];
+        if (s_botTgtVValid[k] && dt >= 15 && dt <= 60)
+        {
+            int32_t const nvx   = (tgX - s_botTgtSX[k]) / dt;   // Build units / tic
+            int32_t const nvy   = (tgY - s_botTgtSY[k]) / dt;
+            int32_t const moved = klabs(tgX - s_botTgtSX[k]) + klabs(tgY - s_botTgtSY[k]);
+            int64_t const dot   = (int64_t)nvx * s_botTgtVX[k] + (int64_t)nvy * s_botTgtVY[k];
+            if (moved > 400 && (dot < 0
+                    || klabs(nvx - s_botTgtVX[k]) + klabs(nvy - s_botTgtVY[k]) > 96))
+                s_botAimDegrade[k] = 30;   // ~1.15s of worse aim after the jink
+            s_botTgtVX[k] = nvx; s_botTgtVY[k] = nvy;
+            s_botTgtSX[k] = tgX; s_botTgtSY[k] = tgY; s_botTgtSnap[k] = movefifoplc;
+        }
+        else if (!s_botTgtVValid[k] || dt > 60 || dt < 0)
+        {
+            // (re)seed the baseline: first sight, the snapshot went stale, or a
+            // movefifoplc reset (level change) put dt negative
+            s_botTgtSX[k] = tgX; s_botTgtSY[k] = tgY; s_botTgtSnap[k] = movefifoplc;
+            s_botTgtVX[k] = 0;   s_botTgtVY[k] = 0;   s_botTgtVValid[k] = 1;
+        }
+    }
     // CHASE THE LAST-SEEN POSITION (their lastenemyorigin model,
     // ai_dmnet.c:2147/:2296). Snapshot the target's position only WHILE
     // visible; the moment sight breaks, movement/navigation runs at the
@@ -3273,7 +3475,8 @@ static input_t Bot_GetInput(int k)
     // zero frags across two 3-minute probes, and the collateral shot out
     // lights/screens map-wide. Fire only when the ACTUAL fire solution
     // (current angle + pitch) lands on a player or near the target.
-    bool canHit = false;
+    bool canHit  = false;
+    int  ffMate  = -1;   // (#6) FF-veto: teammate the fire solution would cross (-1 none)
     if (seesTarget)
     {
         int const fireAng   = fix16_to_int(ps->q16ang) & 2047;
@@ -3284,6 +3487,20 @@ static input_t Bot_GetInput(int k)
         hitscan(&ps->pos, ps->cursectnum, vx, vy, (100 - fireHoriz) << 5, &ray, CLIPMASK1);
         int32_t const distT  = klabs(tgX - ps->pos.x) + klabs(tgY - ps->pos.y);
         int32_t const rayLen = klabs(ray.xyz.x - ps->pos.x) + klabs(ray.xyz.y - ps->pos.y);
+        // FRIENDLY-FIRE LINE VETO (audit item 7 / 6): the fire solution's FIRST
+        // sprite hit being a teammate means the shot would strike a friend
+        // crossing the line to the real enemy behind them (their BotSameTeam
+        // trace check in BotCheckAttack, ai_dmq3.c:3690). Same team test as the
+        // TDM acquisition filter. Recorded now, vetoes the FIRE bit below; DM
+        // (no teams) never trips it. canHit stays true so tracking is unchanged.
+        if (botTeamGame && ray.sprite >= 0 && sprite[ray.sprite].picnum == APLAYER
+            && (unsigned)sprite[ray.sprite].yvel < MAXPLAYERS
+            && sprite[ray.sprite].yvel != k)
+        {
+            auto const rmp = g_player[sprite[ray.sprite].yvel].ps;
+            if (rmp != NULL && rmp->team == ps->team)
+                ffMate = sprite[ray.sprite].yvel;
+        }
         // Fire solution lands on a valid victim: a player in DM, ANY enemy
         // monster in coop (the shot damages whatever monster it hits).
         if (ray.sprite >= 0 && (botCoop ? A_CheckEnemySprite(&sprite[ray.sprite])
@@ -3460,9 +3677,31 @@ static input_t Bot_GetInput(int k)
     // the live coordinates for exactly that tail.
     bool const engaging = (hasTgt && (seesTarget || canHit
                                       || s_botSightTics[k] < (g_botLtgOn ? 50 : 90)));
-    int const aimAng = engaging
-                       ? getangle(tgAimX - ps->pos.x, tgAimY - ps->pos.y)
-                       : moveAng;
+    int const rawAng = getangle(tgAimX - ps->pos.x, tgAimY - ps->pos.y);
+    int       aimAng = engaging ? rawAng : moveAng;
+    // (#3) PROJECTILE LEADING: aim where the target WILL be, not where it is --
+    // aimPt = tgt + (dist/projSpeed)*tgtVel (their VectorMA(origin,(dist/
+    // wi.speed)*speed,dir,bestorigin), ai_dmq3.c:3480). Projectile weapons only
+    // (s_botProjSpeed>0; hitscan never leads), and gated by the AIM_SKILL tier
+    // so the dumbest column fires straight. Uses the velocity estimate (#2).
+    if (engaging && seesTarget && aimLead[skill]
+        && (unsigned)ps->curr_weapon < MAX_WEAPONS && s_botProjSpeed[ps->curr_weapon] > 0
+        && (s_botTgtVX[k] || s_botTgtVY[k]))
+    {
+        int32_t const projS  = s_botProjSpeed[ps->curr_weapon];
+        int32_t const ldist  = klabs(tgAimX - ps->pos.x) + klabs(tgAimY - ps->pos.y);
+        int32_t const flight = ldist / projS;               // tics for the shot to arrive
+        int const     leadAng = getangle(tgAimX + flight * s_botTgtVX[k] - ps->pos.x,
+                                          tgAimY + flight * s_botTgtVY[k] - ps->pos.y);
+        if (leadAng != rawAng)
+        {
+            extern int32_t g_netForensics;
+            if (g_netForensics)
+                LOG_F(INFO, "[lead] seat=%d w=%d rawang=%d leadang=%d",
+                      k, (int)ps->curr_weapon, rawAng, leadAng);
+            aimAng = leadAng;
+        }
+    }
     int diff = (((aimAng - fix16_to_int(ps->q16ang)) + 1024) & 2047) - 1024;
     // Tracking: SMALL wobble while the target is visible (the old +-48 at
     // default skill was +-8 degrees of permanent miss -- "the bots can't aim",
@@ -3479,11 +3718,51 @@ static input_t Bot_GetInput(int k)
     // Coop aim is a notch WORSE than deathmatch (user 2026-08-12: "its targeting
     // should be slightly worse than deathmatch") -- the bot is a helper, not a
     // threat, so widen the tracking wobble ~+10 units (~+1.8 deg of jitter).
-    int const twob = trackWobble[skill] + (botCoop ? 10 : 0);
+    int twob = trackWobble[skill] + (botCoop ? 10 : 0);
+    if (s_botAimDegrade[k] > 0)
+        twob += twob >> 1;   // (#2) post-jink penalty ~1.5x wobble (their aim_accuracy *= 0.7)
+    // (#4) DISTANCE-SCALED HITSCAN ACCURACY: WIDEN the tracking wobble at
+    // point-blank for hitscan weapons, so close brawls aren't laser duels
+    // (their f = 0.6 + min(dist,150)/150*0.4 accuracy curve, INVERTED here into
+    // error WIDTH: worst at contact, full accuracy past ~point-blank range,
+    // ai_dmq3.c:3574). Projectile weapons are exempt -- they aim via leading.
+    if (seesTarget && (unsigned)ps->curr_weapon < MAX_WEAPONS
+        && s_botProjSpeed[ps->curr_weapon] == 0)
+    {
+        int32_t const pbRange = 2048;   // Build-unit stand-in for their 150-unit point blank
+        int32_t const dcl  = klabs(tgX - ps->pos.x) + klabs(tgY - ps->pos.y);
+        int32_t const nearN = pbRange - min(dcl, pbRange);          // 0 far .. pbRange at contact
+        twob += (int)((int64_t)twob * 3 * nearN / (pbRange * 5));   // up to +0.6x wobble point-blank
+    }
     int const aimErr = seesTarget ? (int)(Bot_Rnd() % (2 * twob + 1)) - twob
                                   : (int)(Bot_Rnd() % (2 * wobble[skill] + 1)) - wobble[skill];
     int const cap = (seesTarget && klabs(diff) > turnCap[skill]) ? turnCap[skill] * 2 : turnCap[skill];
-    in.q16avel = fix16_from_int(clamp(diff + aimErr, -cap, cap));
+    // (#5) SECOND-ORDER VIEW MODEL while ENGAGING: a spring-damper toward the
+    // aim instead of a hard clamp, so the head visibly OVERSHOOTS a fast angle
+    // change then settles (their velocity term + 0.45*(1-factor) damping "over
+    // reaction view model", ai_main.c:817). Deterministic (Bot_Rnd-free model);
+    // turnCap stays the hard step ceiling; the wobble rides on top as steering
+    // noise. Roam/nav turning keeps the crisp direct clamp -- momentum in a
+    // navigation turn would oscillate the body's heading and regress roaming.
+    enum { BOT_VIEW_GAIN = 51, BOT_VIEW_DAMP = 192 };   // k=0.15,c=0.25 -> underdamped, |lambda|~0.87
+    if (engaging)
+    {
+        s_botViewVel[k] += (diff * BOT_VIEW_GAIN) >> 8;           // spring: toward the aim error
+        s_botViewVel[k]  = (s_botViewVel[k] * BOT_VIEW_DAMP) >> 8; // damping < 1 -> decays, overshoots
+        s_botViewVel[k]  = clamp(s_botViewVel[k], -300, 300);     // anti-windup (their maxchange guard)
+        int const step = clamp(s_botViewVel[k] + aimErr, -cap, cap);
+        in.q16avel = fix16_from_int(step);
+        extern int32_t g_netForensics;
+        if (g_netForensics && s_botViewVel[k] != 0 && diff != 0
+            && (s_botViewVel[k] < 0) != (diff < 0) && klabs(s_botViewVel[k]) > (cap >> 2)
+            && (movefifoplc & 15) == 0)
+            LOG_F(INFO, "[vsettle] seat=%d overshoot=%d", k, (int)s_botViewVel[k]);
+    }
+    else
+    {
+        s_botViewVel[k] = 0;   // not engaging: carry no momentum into roam turns
+        in.q16avel = fix16_from_int(clamp(diff + aimErr, -cap, cap));
+    }
 
     int32_t const dist2d = hasTgt ? klabs(tgX - ps->pos.x) + klabs(tgY - ps->pos.y) : INT32_MAX;
 
@@ -3544,6 +3823,9 @@ static input_t Bot_GetInput(int k)
     // redirect the FACING. The existing canHit circle-strafe already orbits
     // -- now correctly around the AIM -- and roam/nav keep their straight
     // heading; the aim just tracks the target independently.)
+    // Remember whether we commanded a strafe this tic: next tic's flip-on-
+    // blocked (above) checks it against the realized displacement.
+    s_botWantStrafe[k] = (strSpd != 0);
     if (run)        in.bits    |= BIT(SK_RUN);
     if (fwdSpd > 0) in.extbits |= BIT(EK_MOVE_FORWARD);
     if (fwdSpd < 0) in.extbits |= BIT(EK_MOVE_BACKWARD);   // engage-band back-off
@@ -3808,13 +4090,48 @@ static input_t Bot_GetInput(int k)
     if (dist2d > 8192)  gate >>= 1;
     if (dist2d > 20000) gate >>= 1;
     (void)s_botBurst;
-    if (canHit && klabs(diff) < max(gate, 16))
+    bool const aimReady = canHit && klabs(diff) < max(gate, 16);
+    // (#1) FIRE-SIDE REACTION GATE: the lock, the facing and the tracking all
+    // ran already, but the TRIGGER waits until the target has held continuous
+    // sight for reactTics (their enemysight_time reaction window, BotCheckAttack
+    // ai_dmq3.c:3637). A bot no longer discharges the same tic LOS opens.
+    bool const reactReady = s_botFireSight[k] >= reactTics[skill];
+    // (#8) FIRETHROTTLE duty cycle: pulse the trigger via Bot_Rnd rather than
+    // a continuous beam (their CHARACTERISTIC_FIRETHROTTLE wait/shoot windows,
+    // :3643). Higher throttle column -> shoots more of the time. Only consumed
+    // when a shot is actually on the table (canHit), so the duty stays coherent.
+    bool throttleOK = true;
+    if (canHit)
+    {
+        if (s_botThrWait[k] > 0)        { s_botThrWait[k]--;  throttleOK = false; }
+        else if (s_botThrShoot[k] > 0)  { s_botThrShoot[k]--; throttleOK = true;  }
+        else if ((int)(Bot_Rnd() & 255) > fireThrottle[skill])
+            { s_botThrWait[k]  = (int16_t)(4 + ((256 - fireThrottle[skill]) >> 4)); throttleOK = false; }
+        else
+            { s_botThrShoot[k] = (int16_t)(8 + (fireThrottle[skill] >> 5));         throttleOK = true;  }
+    }
+    // (#6) FRIENDLY-FIRE LINE VETO: a teammate on the fire solution suppresses
+    // the shot (ffMate was resolved in the canHit trace; DM has no teams so it
+    // is always -1 and this is a no-op there).
+    bool const fire = aimReady && reactReady && throttleOK && ffMate < 0;
+    if (fire)
         in.bits |= BIT(SK_FIRE);
+    {
+        extern int32_t g_netForensics;
+        // Fire-decision trace: emitted on every tic a shot is on the table
+        // (canHit). fired=1 is structurally impossible below the reaction floor,
+        // which is exactly what the smoke asserts.
+        if (g_netForensics && canHit)
+            LOG_F(INFO, "[aimr] seat=%d sightTics=%d react=%d fired=%d",
+                  k, (int)s_botFireSight[k], (int)reactTics[skill], (int)fire);
+        if (g_netForensics && aimReady && reactReady && throttleOK && ffMate >= 0)
+            LOG_F(INFO, "[ffveto] seat=%d blocked teammate=%d", k, ffMate);
+    }
     // Blocker-clearing burst ("if an item is in the way of exiting a room,
     // destroy it"): fires along the facing while stuck, only when no player
     // is visible and outside the post-spawn pacifist window. Bullets against
     // walls/doors are harmless; barrels and crates stop blocking.
-    else if (s_botBreakFire[k] > 0 && s_botSpawnRoam[k] == 0)
+    if (!fire && s_botBreakFire[k] > 0 && s_botSpawnRoam[k] == 0)
     {
         s_botBreakFire[k]--;
         in.bits |= BIT(SK_FIRE);
@@ -3967,6 +4284,15 @@ void Net_SeatBots(int minPlayers, int skill)
         s_botStillTics[k]  = 0;
         s_botIdleTics[k]   = 0;
         s_botTeamLogged[k] = 0;
+        // wave-3b combat/aim model: fresh match, no target history
+        s_botFireSight[k]  = 0;
+        s_botTgtVValid[k]  = 0;
+        s_botTgtVX[k]      = 0;  s_botTgtVY[k]   = 0;
+        s_botTgtSnap[k]    = 0;
+        s_botAimDegrade[k] = 0;
+        s_botViewVel[k]    = 0;
+        s_botThrWait[k]    = 0;  s_botThrShoot[k] = 0;
+        s_botStrafeTic[k]  = 0;  s_botStrafeFail[k] = 0;  s_botWantStrafe[k] = 0;
     }
     if (myconnectindex != connecthead)
         return;
