@@ -898,6 +898,74 @@ static int16_t s_botDeadSect[MAXPLAYERS][BOT_DEAD_N]; // recently-unreachable ta
 static int16_t s_botDeadCool[MAXPLAYERS][BOT_DEAD_N]; // tics of avoidance left (0 = slot free)
 static int32_t s_botGoalNear[MAXPLAYERS];    // closest we have come to the current goal
 static int16_t s_botGoalStall[MAXPLAYERS];   // tics since that closest approach improved
+// ── Two-tier goal stack: map-wide LTG + errand-as-NBG (OpenArena-mined,
+// wave 3a). The explore planner only ever scored the CURRENT sector's portals
+// and the errand died on every sector crossing, so bots orbited their spawn
+// room by construction. Port of OA's committed long-term goal
+// (BotGetItemLongTermGoal ai_dmnet.c:280 / BotChooseLTGItem be_ai_goal.c:1282):
+// one map-wide target held ~390-520 tics (their 20s at 26 tics/s), scored
+// desirability/travelTime over ALL pickups + far stale sectors; the existing
+// errand machinery rides on top as the nearby-goal (NBG) layer, and when a
+// detour or fight ends the movement RESUMES the committed LTG instead of
+// re-rolling a neighbor portal. Two struct layers = two sets of statics, no
+// heap. NN_BOTLTG=0 is the kill-switch back to the old single-slot brain
+// (also the baseline leg of the roaming smoke); default ON.
+static int32_t Bot_LtgFromEnv(void)
+{
+    const char *e = getenv("NN_BOTLTG");
+    return (e && *e) ? Batoi(e) : 1;
+}
+static int32_t g_botLtgOn = Bot_LtgFromEnv();
+static int32_t s_botLtgX[MAXPLAYERS], s_botLtgY[MAXPLAYERS];
+static int16_t s_botLtgSect[MAXPLAYERS];     // target sector of the committed LTG
+static int8_t  s_botLtgKind[MAXPLAYERS];     // 0 none, 1 roam anchor, 2 item
+static int16_t s_botLtgItem[MAXPLAYERS];     // sprite index when kind==2
+static int32_t s_botLtgUntil[MAXPLAYERS];    // movefifoplc commit deadline
+static int8_t  s_botLtgFails[MAXPLAYERS];    // stall aborts of this LTG's body
+static int8_t  s_botGoalIsLtg[MAXPLAYERS];   // current errand IS the LTG body:
+                                             // survives sector crossings, resumes
+                                             // after fights/detours
+static vec2_t  s_botLtgAnchor[MAXPLAYERS];   // movement-watch anchor for the body:
+                                             // cross-map routes legitimately walk
+                                             // AWAY from the goal (around blocks),
+                                             // so its stall test is "stopped
+                                             // MOVING", not "stopped approaching"
+static int8_t  s_botLtgLocal[MAXPLAYERS];    // explore beats owed at the LTG
+                                             // destination: march, then sniff
+                                             // around the arrival cluster before
+                                             // the next cross-map commit
+// ITEM RESPAWN-TIME MEMORY (their BotAddToAvoidGoals/BotAvoidGoalTime,
+// be_ai_goal.c:1425/:1367): ring of items predicted absent until a tic.
+// Stamped when an item LTG is CHOSEN; refreshed when the sprite is OBSERVED
+// picked up (in respawn mode a taken item keeps its slot with cstat bit 32768
+// -- the pending-respawn observable). Expiry rides g_itemRespawnTime, the CON
+// RESPAWNITEMTIME gamevar the sim itself counts against (actors.cpp:4804).
+#define BOT_IAVOID_N 8
+static int16_t s_botItemAvoid[MAXPLAYERS][BOT_IAVOID_N];    // sprite idx, -1 free
+static int32_t s_botItemAvoidTil[MAXPLAYERS][BOT_IAVOID_N]; // predicted respawn tic
+// PER-EDGE AVOID-REACH (their avoidreach tries+TTL split, be_ai_move.c:90:
+// AVOIDREACH_TIME 6s / AVOIDREACH_TRIES 4). Replaces the sector-wide
+// 2400-tic blacklist as the PRIMARY stall response: a (fromSect,toSect)
+// crossing only counts as dead after repeated failures inside a short
+// window, so one snag no longer bans a whole room for 80 seconds. The old
+// s_botDeadSect ring survives as the ESCALATION tier (5+ tries).
+#define BOT_EAVOID_N 8
+static int16_t s_botEdgeFrom[MAXPLAYERS][BOT_EAVOID_N];
+static int16_t s_botEdgeTo[MAXPLAYERS][BOT_EAVOID_N];
+static int8_t  s_botEdgeTries[MAXPLAYERS][BOT_EAVOID_N];
+static int32_t s_botEdgeUntil[MAXPLAYERS][BOT_EAVOID_N];    // movefifoplc expiry
+// CHASE LAST-SEEN (their lastenemyorigin, ai_dmnet.c:2147/:2296): position
+// snapshot taken only while the target is VISIBLE; once sight breaks the
+// bot navigates to the SNAPSHOT instead of wall-tracking the live position.
+static int32_t s_botSeenX[MAXPLAYERS], s_botSeenY[MAXPLAYERS];
+static int32_t s_botSeenZ[MAXPLAYERS];
+static int16_t s_botSeenSect[MAXPLAYERS];
+static int8_t  s_botSeenValid[MAXPLAYERS];
+// Roam telemetry: distinct sectors entered this level, per seat ([roam]).
+static uint8_t s_botRoamBm[MAXPLAYERS][MAXSECTORS >> 3];
+static int32_t s_botRoamCnt[MAXPLAYERS];
+static int32_t s_botRoamLogPlc[MAXPLAYERS];
+static int8_t  s_botTeamLogged[MAXPLAYERS];  // one-shot [team] forensic per seat
 // ── Inventory / jetpack state (netduke32-mined, 2026-08-18) ─────────────────
 // SK_JETPACK is a TOGGLE edge-triggered through interface_toggle
 // (P_HandleSharedKeys, sector.cpp:2699-2701): a held bit fires exactly once
@@ -1203,17 +1271,33 @@ static int Nvg_Snap(int32_t x, int32_t y)
     return -1;
 }
 
+// BFS scratch shared by the point-to-point router and the LTG flood pass
+// below (host thread only, never concurrent) -- duplicating the ~500KB of
+// static queue/seen arrays per caller would be pure waste.
+static uint16_t s_nvgBfsSeen[NVG_MAX];
+static uint8_t  s_nvgBfsParent[NVG_MAX];
+static int32_t  s_nvgBfsQueue[NVG_MAX];
+static uint16_t s_nvgBfsGen = 0;
+// Avoid-reach hook INTO the router (defined with its ring below): OpenArena
+// consults avoidreach while CHOOSING reachabilities (BotGetReachabilityToGoal,
+// be_ai_move.c:765), not merely at plan level -- so a crossing that keeps
+// failing gets ROUTED AROUND (the E1L1 auditorium chair field: the mesh is
+// sprite-blind, the straight route through the chairs grinds, and without
+// this hook every re-path chose the same doomed line).
+static int Bot_AvoidEdgeActive(int k, int from, int to);
+
 // BFS over the grid. Rolling horizon: cap stored waypoints; repath when the
 // window empties. parentDir packs the reconstruction into one byte per tile.
-static int Bot_NvgPath(int fromTile, int destTile, int16_t *outTx, int16_t *outTy, int maxOut)
+// `k` scopes the per-seat avoid-reach ring; pass -1 for edge-blind routing.
+static int Bot_NvgPath(int k, int fromTile, int destTile, int16_t *outTx, int16_t *outTy, int maxOut)
 {
-    static uint16_t seenGen[NVG_MAX];
-    static uint8_t  parentDir[NVG_MAX];
-    static int32_t  queue[NVG_MAX];
-    static uint16_t gen = 0;
+    uint16_t *const seenGen   = s_nvgBfsSeen;
+    uint8_t  *const parentDir = s_nvgBfsParent;
+    int32_t  *const queue     = s_nvgBfsQueue;
+    uint16_t       &gen       = s_nvgBfsGen;
     if (fromTile < 0 || destTile < 0)
         return 0;
-    if (++gen == 0) { Bmemset(seenGen, 0, sizeof(seenGen)); gen = 1; }
+    if (++gen == 0) { Bmemset(seenGen, 0, sizeof(s_nvgBfsSeen)); gen = 1; }
     int qh = 0, qt = 0;
     queue[qt++] = fromTile;
     seenGen[fromTile] = gen;
@@ -1233,6 +1317,9 @@ static int Bot_NvgPath(int fromTile, int destTile, int16_t *outTx, int16_t *outT
             int const u = (ty + stepdy[d]) * s_nvgW + (tx + stepdx[d]);
             if (seenGen[u] == gen)
                 continue;
+            if (k >= 0 && s_nvgSect[u] != s_nvgSect[t]
+                && Bot_AvoidEdgeActive(k, s_nvgSect[t], s_nvgSect[u]))
+                continue;               // dead crossing: route around it
             seenGen[u] = gen;
             parentDir[u] = (uint8_t)d;
             queue[qt++] = u;
@@ -1253,6 +1340,64 @@ static int Bot_NvgPath(int fromTile, int destTile, int16_t *outTx, int16_t *outT
     for (int i = rn - 1; i >= 0 && cnt < maxOut; i--)
         { outTx[cnt] = revx[i]; outTy[cnt] = revy[i]; cnt++; }
     return cnt;
+}
+
+// ── LTG travel-cost pass: ONE flood prices every candidate on the map ───────
+// OA prices each LTG candidate with AAS_AreaTravelTimeToGoalArea
+// (be_ai_goal.c:1372) against a precompiled all-pairs routing cache; our
+// Bot_NvgPath is strictly point-to-point, so instead of N point queries this
+// runs a single destination-less BFS from the bot's tile and records, for
+// every SECTOR, the depth (in tiles) and identity of the first -- nearest --
+// walkable tile inside it. Same worst-case cost as ONE full point-to-point
+// call, prices ALL candidates, and runs at most once per LTG re-plan per
+// seat (~every 15-20s). The recorded tile doubles as a guaranteed-on-mesh
+// goal point for roam anchors (a concave sector's centroid can land outside
+// the sector; the flood tile cannot).
+static int16_t s_ltgSectDist[MAXSECTORS];   // tiles from the bot; -1 unreachable
+static int32_t s_ltgSectTile[MAXSECTORS];   // nearest walkable tile in the sector
+static int Bot_NvgFloodSectDist(int k, int fromTile)
+{
+    if (fromTile < 0 || s_nvgW <= 0)
+        return 0;
+    for (int s = 0; s < numsectors; s++)
+        { s_ltgSectDist[s] = -1; s_ltgSectTile[s] = -1; }
+    if (++s_nvgBfsGen == 0) { Bmemset(s_nvgBfsSeen, 0, sizeof(s_nvgBfsSeen)); s_nvgBfsGen = 1; }
+    int qh = 0, qt = 0, depth = 0, found = 0;
+    s_nvgBfsQueue[qt++] = fromTile;
+    s_nvgBfsSeen[fromTile] = s_nvgBfsGen;
+    static int const stepdx[4] = { 1, -1, 0, 0 };
+    static int const stepdy[4] = { 0, 0, 1, -1 };
+    while (qh < qt)
+    {
+        int const levelEnd = qt;                // frontier == one BFS depth
+        for (; qh < levelEnd; qh++)
+        {
+            int const t   = s_nvgBfsQueue[qh];
+            int const sct = s_nvgSect[t];
+            if ((unsigned)sct < (unsigned)numsectors && s_ltgSectDist[sct] < 0)
+            {
+                s_ltgSectDist[sct] = (int16_t)min(depth, 32000);
+                s_ltgSectTile[sct] = t;
+                found++;
+            }
+            int const tx = t % s_nvgW, ty = t / s_nvgW;
+            for (int d = 0; d < 4; d++)
+            {
+                if (!(s_nvgPass[t] & (1 << d)))
+                    continue;
+                int const u = (ty + stepdy[d]) * s_nvgW + (tx + stepdx[d]);
+                if (s_nvgBfsSeen[u] == s_nvgBfsGen)
+                    continue;
+                if (k >= 0 && s_nvgSect[u] != sct
+                    && Bot_AvoidEdgeActive(k, sct, s_nvgSect[u]))
+                    continue;           // price candidates over ROUTABLE ground
+                s_nvgBfsSeen[u] = s_nvgBfsGen;
+                s_nvgBfsQueue[qt++] = u;
+            }
+        }
+        depth++;
+    }
+    return found;
 }
 
 // Per-bot route follower state.
@@ -1291,7 +1436,7 @@ static int Bot_Waypoint(int k, DukePlayer_t *ps, int32_t dx2, int32_t dy2,
     {
         int const from = Nvg_Snap(ps->pos.x, ps->pos.y);
         int const dest = Nvg_Snap(dx2, dy2);
-        s_botRouteLen[k]  = (int8_t)Bot_NvgPath(from, dest, s_botRtX[k], s_botRtY[k], 32);
+        s_botRouteLen[k]  = (int8_t)Bot_NvgPath(k, from, dest, s_botRtX[k], s_botRtY[k], 32);
         s_botRouteIdx[k]  = 0;
         s_botRouteDX[k]   = dx2; s_botRouteDY[k] = dy2;
         s_botRouteCool[k] = 26;                 // repath at most once a second
@@ -1395,6 +1540,106 @@ static void Bot_ClearDeadExit(int k, int sect)
             s_botDeadCool[k][i] = 0;
 }
 
+// --- item respawn-schedule ring (see the s_botItemAvoid* declarations) -------
+// Stamp: this sprite is predicted absent until untilPlc. Same-slot refresh,
+// else evict the slot whose prediction expires soonest (their avoidgoal ring).
+static void Bot_ItemAvoidStamp(int k, int spr, int32_t untilPlc)
+{
+    int slot = -1, lru = 0;
+    for (int i = 0; i < BOT_IAVOID_N; i++)
+    {
+        if (s_botItemAvoid[k][i] == spr) { slot = i; break; }
+        if (s_botItemAvoidTil[k][i] < s_botItemAvoidTil[k][lru]) lru = i;
+    }
+    if (slot < 0) slot = lru;
+    s_botItemAvoid[k][slot]    = (int16_t)spr;
+    s_botItemAvoidTil[k][slot] = untilPlc;
+}
+// Predicted-respawn tic for a sprite, 0 = not tracked. A stamp impossibly far
+// in the future means movefifoplc restarted (level change): treat as untracked.
+static int32_t Bot_ItemAvoidUntil(int k, int spr)
+{
+    for (int i = 0; i < BOT_IAVOID_N; i++)
+        if (s_botItemAvoid[k][i] == spr)
+        {
+            int32_t const til = s_botItemAvoidTil[k][i];
+            if (til - movefifoplc > g_itemRespawnTime + 130)
+                return 0;
+            return til;
+        }
+    return 0;
+}
+static void Bot_ItemAvoidReset(int k)
+{
+    for (int i = 0; i < BOT_IAVOID_N; i++)
+        { s_botItemAvoid[k][i] = -1; s_botItemAvoidTil[k][i] = 0; }
+}
+
+// --- per-edge avoid-reach ring (see the s_botEdge* declarations) -------------
+// Mark a failed (fromSect -> toSect) crossing; returns the try count so the
+// caller can escalate to the sector-wide dead ring after repeated failures.
+// Their BotAddToAvoidReach shape (be_ai_move.c:581): tries++ while the window
+// is still live, reset to 1 when it lapsed.
+static int Bot_MarkAvoidEdge(int k, int from, int to)
+{
+    int32_t const plc = movefifoplc;
+    int slot = -1, lru = 0;
+    for (int i = 0; i < BOT_EAVOID_N; i++)
+    {
+        if (s_botEdgeFrom[k][i] == from && s_botEdgeTo[k][i] == to) { slot = i; break; }
+        if (s_botEdgeUntil[k][i] < s_botEdgeUntil[k][lru]) lru = i;
+    }
+    if (slot < 0)
+    {
+        slot = lru;
+        s_botEdgeFrom[k][slot]  = (int16_t)from;
+        s_botEdgeTo[k][slot]    = (int16_t)to;
+        s_botEdgeTries[k][slot] = 0;
+    }
+    else if (s_botEdgeUntil[k][slot] < plc || s_botEdgeUntil[k][slot] - plc > 400)
+        s_botEdgeTries[k][slot] = 0;            // window lapsed (or plc restarted)
+    if (s_botEdgeTries[k][slot] < 100)
+        s_botEdgeTries[k][slot]++;
+    s_botEdgeUntil[k][slot] = plc + 180;        // ~7s window (their 6s at 26 tics/s)
+    return s_botEdgeTries[k][slot];
+}
+// An edge is only DEAD after 3+ failures inside the live window (their
+// AVOIDREACH_TRIES gate, be_ai_move.c:772) -- one snag costs nothing.
+static int Bot_AvoidEdgeActive(int k, int from, int to)
+{
+    int32_t const plc = movefifoplc;
+    for (int i = 0; i < BOT_EAVOID_N; i++)
+        if (s_botEdgeFrom[k][i] == from && s_botEdgeTo[k][i] == to
+            && s_botEdgeTries[k][i] >= 3
+            && s_botEdgeUntil[k][i] >= plc && s_botEdgeUntil[k][i] - plc <= 400)
+            return 1;
+    return 0;
+}
+static void Bot_ClearAvoidEdges(int k)          // total plan failure: deadlock break
+{
+    for (int i = 0; i < BOT_EAVOID_N; i++)
+        { s_botEdgeUntil[k][i] = 0; s_botEdgeTries[k][i] = 0; s_botEdgeFrom[k][i] = s_botEdgeTo[k][i] = -1; }
+}
+static void Bot_ClearAvoidEdgeTo(int k, int sect)   // entered it: edges in are proven
+{
+    for (int i = 0; i < BOT_EAVOID_N; i++)
+        if (s_botEdgeTo[k][i] == sect)
+            { s_botEdgeUntil[k][i] = 0; s_botEdgeTries[k][i] = 0; }
+}
+
+// Roam telemetry: first entry into a sector this level bumps the distinct
+// count (the [roam] meter -- the user-visible "bots roam deeper" number).
+static void Bot_RoamStamp(int k, int sect)
+{
+    if ((unsigned)sect >= (unsigned)numsectors)
+        return;
+    if (!(s_botRoamBm[k][sect >> 3] & (1 << (sect & 7))))
+    {
+        s_botRoamBm[k][sect >> 3] |= (uint8_t)(1 << (sect & 7));
+        s_botRoamCnt[k]++;
+    }
+}
+
 // COOP target-find: the nearest enemy MONSTER in line of sight. In Cooperative
 // the bot fights monsters and NEVER its human teammates (user 2026-08-12: "it
 // should be trying to kill monsters, not players ... never revenge attack
@@ -1495,16 +1740,20 @@ static int Bot_PlanExplore(int k, DukePlayer_t *ps)
         // one can still win, and follow-until-clear steering earns the rest.
         if (!Bot_LineWalkable(ps, mx, my))
             score >>= 6;
-        // A door we recently could not get through drops to the noise floor, so
-        // a DIFFERENT exit wins -- but it is a demotion, not a veto, so the sole
+        // A crossing we recently could not make drops to the noise floor, so a
+        // DIFFERENT exit wins -- but it is a demotion, not a veto, so the sole
         // way out of a room can still be taken rather than trapping the bot.
-        if (Bot_DeadExitActive(k, ns))
+        // PRIMARY tier is the per-EDGE ring (3+ failures in a short window);
+        // the sector-wide dead ring stays as the escalation tier behind it.
+        int const avoided = (g_botLtgOn && Bot_AvoidEdgeActive(k, cs, ns))
+                            || Bot_DeadExitActive(k, ns);
+        if (avoided)
             score >>= 8;
         // Doors are ROAMING WAYPOINTS (user 2026-08-12): a modest bump so the
         // bot actively routes through them (they lead to fresh rooms) now that
         // it opens them on approach -- not so large it fixates or overrides a
         // much staler open exit.
-        if (isDoor && !Bot_DeadExitActive(k, ns))
+        if (isDoor && !avoided)
             score += 400;
         score += (int32_t)(Bot_Rnd() & 255);        // tiebreak: twin bots split up
         if (score > bestScore)
@@ -1521,6 +1770,7 @@ static int Bot_PlanExplore(int k, DukePlayer_t *ps)
     s_botGoalTics[k]   = 0;
     s_botGoalItem[k]   = -1;
     s_botGoalSeen[k]   = 0;
+    s_botGoalIsLtg[k]  = 0;     // neighbor-portal errand: NBG-tier, dies on crossing
     return 1;
 }
 
@@ -1578,7 +1828,230 @@ static int Bot_PlanItem(int k, DukePlayer_t *ps)
     s_botGoalTics[k]   = 0;
     s_botGoalItem[k]   = (int16_t)best;
     s_botGoalSeen[k]   = 0;
+    s_botGoalIsLtg[k]  = 0;     // nearby-item detour: the NBG layer by definition
     return 1;
+}
+
+// ── LTG planning: map-wide candidates, one commit ───────────────────────────
+// Desirability stand-in for OA's fuzzy weight files (deliberately skipped --
+// audit: data-file machinery, not concept): a static class weight, health
+// scaled by need, weapons discounted when already owned via the errand's
+// natural refusal (the sim just won't pick up what's full -- the one-slot
+// shun catches that). prioritizeItems doubles resupply classes.
+static int Bot_ItemDesire(DukePlayer_t *ps, int picnum, int prioritize)
+{
+    int const hurt = (sprite[ps->i].extra <= (ps->max_player_health >> 1));
+    int w;
+    switch (tileGetMapping(picnum))
+    {
+    case ATOMICHEALTH__:                      w = 900; break;
+    case FIRSTAID__:                          w = hurt ? 900 : 300; break;
+    case COLA__: case SIXPAK__:               w = hurt ? 500 : 150; break;
+    case SHIELD__:                            w = (ps->inv_amount[GET_SHIELD] < 50) ? 550 : 200; break;
+    case JETPACK__:                           w = 700; break;
+    case FIRSTGUNSPRITE__: case SHOTGUNSPRITE__: case CHAINGUNSPRITE__:
+    case RPGSPRITE__: case FREEZESPRITE__: case DEVISTATORSPRITE__:
+    case SHRINKERSPRITE__: case TRIPBOMBSPRITE__: case GROWSPRITEICON__:
+                                              w = 650; break;
+    case AMMO__: case BATTERYAMMO__: case DEVISTATORAMMO__: case RPGAMMO__:
+    case GROWAMMO__: case CRYSTALAMMO__: case HBOMBAMMO__: case AMMOLOTS__:
+    case SHOTGUNAMMO__: case FREEZEAMMO__:    w = 400; break;
+    default:                                  w = 300; break;
+    }
+    if (prioritize && w >= 400)
+        w <<= 1;
+    return w;
+}
+
+// Rough full-run ground speed for schedule math, map units per tic (measured
+// from [bot1] traces: ~55-70 units/tic in the open). One 512-unit nav tile is
+// therefore ~9 tics of travel; only the ORDER of magnitude matters against
+// the 768-tic item respawn window.
+#define BOT_TICS_PER_TILE 9
+
+// Choose a new map-wide long-term goal. Items first (their BotChooseLTGItem:
+// score = desirability / travel), schedule-filtered through the respawn ring
+// -- an item that will be BACK by the time we arrive is a valid target
+// (their avoidtime - traveltime > 0 skip, be_ai_goal.c:1367). When no item
+// survives, a FAR stale sector becomes the roam anchor (the explore
+// gradient's map-wide generalization: distance is a BONUS, not a cost, so
+// the anchor pulls the bot out of its spawn orbit). Returns 1 with the
+// s_botLtg* slots committed for ~390-520 tics.
+static int Bot_PlanLtg(int k, DukePlayer_t *ps)
+{
+    extern int32_t g_netForensics;
+    Bot_NavEnsure();
+    if (s_nvgW <= 0)
+        return 0;
+    int const from = Nvg_Snap(ps->pos.x, ps->pos.y);
+    if (from < 0 || Bot_NvgFloodSectDist(k, from) <= 0)
+        return 0;
+    int32_t const plc = movefifoplc;
+    bool prioritize;
+    {
+        int const w = ps->curr_weapon;
+        bool const lowAmmo = (unsigned)w < MAX_WEAPONS && ps->max_ammo_amount[w] > 0
+                             && ps->ammo_amount[w] <= (ps->max_ammo_amount[w] >> 3);
+        prioritize = (sprite[ps->i].extra <= (ps->max_player_health >> 1)) || lowAmmo;
+    }
+    // ---- pass 1: pickups, map-wide --------------------------------------
+    int32_t bestScore = 0;
+    int bestItem = -1, bestDist = 0;
+    int scheduleBlocked = 0;    // candidates existed but ALL were respawn-avoided
+    static int16_t const stats[3] = { STAT_DEFAULT, STAT_ACTOR, STAT_ZOMBIEACTOR };
+    for (int si = 0; si < 3; si++)
+    for (int j = headspritestat[stats[si]]; j >= 0; j = nextspritestat[j])
+    {
+        auto const &sp = sprite[j];
+        if (!Bot_IsPickup(sp.picnum) || (unsigned)sp.sectnum >= (unsigned)numsectors)
+            continue;
+        if (j == s_botItemShun[k])
+            continue;
+        int const dist = s_ltgSectDist[sp.sectnum];
+        // NBG DIVISION OF LABOR: Bot_PlanItem's detour leash is 3000 units
+        // (~6 tiles), rolled every few thinks idle AND during the march --
+        // anything closer than that is already served without a commit.
+        // Letting near items into the LTG menu re-anchored bots to their
+        // spawn cluster (the desirability/dist score makes a dist-4 item
+        // unbeatable); the LTG exists to pull CROSS-MAP.
+        if (dist < 7)
+            continue;               // unreachable, or NBG-leash range
+        // Respawn schedule: a sprite parked with cstat bit 32768 is PENDING
+        // RESPAWN. Skip it only if it will still be gone on arrival; without
+        // a ring stamp (we never saw it taken) assume the full window.
+        int32_t const travel = dist * BOT_TICS_PER_TILE;
+        int32_t until = Bot_ItemAvoidUntil(k, j);
+        if ((sp.cstat & 32768) && until == 0)
+            until = plc + g_itemRespawnTime;
+        if (until > plc + travel)
+            { scheduleBlocked++; continue; }
+        int32_t const score = ((int32_t)Bot_ItemDesire(ps, sp.picnum, prioritize) << 8)
+                              / dist + (int32_t)(Bot_Rnd() & 31);
+        if (score > bestScore)
+            { bestScore = score; bestItem = j; bestDist = dist; }
+    }
+    if (bestItem >= 0)
+    {
+        s_botLtgKind[k] = 2;
+        s_botLtgItem[k] = (int16_t)bestItem;
+        s_botLtgX[k]    = sprite[bestItem].x;
+        s_botLtgY[k]    = sprite[bestItem].y;
+        s_botLtgSect[k] = sprite[bestItem].sectnum;
+        // Stamp on CHOICE (their BotAddToAvoidGoals at :1425): predicted absent
+        // for one respawn window from now, so the next re-plan doesn't bounce
+        // straight back whether we got it or failed to reach it.
+        Bot_ItemAvoidStamp(k, bestItem, plc + g_itemRespawnTime);
+    }
+    else
+    {
+        // Deadlock escape (their ai_dmnet.c:319): everything worth having was
+        // schedule-avoided -> forget the schedule rather than freeze.
+        if (scheduleBlocked)
+            Bot_ItemAvoidReset(k);
+        // ---- pass 2: FAR stale sector as roam anchor --------------------
+        int32_t bestR = INT32_MIN;
+        int bestS = -1;
+        for (int s = 0; s < numsectors; s++)
+        {
+            int const dist = s_ltgSectDist[s];
+            if (dist < 4)
+                continue;           // FAR anchors only: adjacency is the old orbit
+            if (Bot_DeadExitActive(k, s))
+                continue;
+            int32_t stamp = s_botVisitT[k][s];
+            if (stamp > plc)
+                stamp = 0;          // relaunch left future stamps
+            int32_t stale = plc - stamp;
+            if (stale > 26 * 180)
+                stale = 26 * 180;
+            // Distance bonus CAPPED at mid-range: uncapped, the farthest
+            // corner always won and the bot ping-ponged between the map's
+            // two extremes down the same corridors (measured: sect 237<->
+            // 270/271 all match). Past ~12 tiles staleness dominates, so
+            // successive commits sweep DIFFERENT mid-distance clusters.
+            int32_t const score = stale + min(dist, 12) * 96 + (int32_t)(Bot_Rnd() & 511);
+            if (score > bestR)
+                { bestR = score; bestS = s; }
+        }
+        if (bestS < 0)
+            return 0;
+        s_botLtgKind[k] = 1;
+        s_botLtgItem[k] = -1;
+        s_botLtgX[k]    = Nvg_CX(s_ltgSectTile[bestS] % s_nvgW);
+        s_botLtgY[k]    = Nvg_CY(s_ltgSectTile[bestS] / s_nvgW);
+        s_botLtgSect[k] = (int16_t)bestS;
+        bestDist        = s_ltgSectDist[bestS];
+    }
+    s_botLtgUntil[k] = plc + 390 + (int32_t)(Bot_Rnd() % 131);   // ~15-20s commit
+    s_botLtgFails[k] = 0;
+    if (g_netForensics)
+        LOG_F(INFO, "[ltg] seat=%d plan kind=%s sect=%d dist=%d plc=%d",
+              k, s_botLtgKind[k] == 2 ? "item" : "roam",
+              (int)s_botLtgSect[k], bestDist, (int)plc);
+    return 1;
+}
+
+// Ensure a live LTG and (re)issue the errand that IS its body. The errand
+// machinery below stays the single execution engine; this marks the errand
+// goalIsLtg so it SURVIVES sector crossings and gets re-issued -- resumed --
+// after every fight and detour until the commit deadline. Returns 0 when the
+// feature is off or no goal can be planned (caller falls back to the old
+// neighbor-portal explore).
+static int Bot_LtgErrand(int k, DukePlayer_t *ps)
+{
+    if (!g_botLtgOn)
+        return 0;
+    int32_t const plc = movefifoplc;
+    if (s_botLtgKind[k] == 2)
+    {
+        int const it = s_botLtgItem[k];
+        if ((unsigned)it >= MAXSPRITES || !Bot_IsPickup(sprite[it].picnum))
+            s_botLtgKind[k] = 0;                // gone for good (deleted)
+        else if (sprite[it].cstat & 32768)
+        {
+            // OBSERVED taken (by anyone, us included) while committed: refresh
+            // the schedule from this sighting and move on.
+            Bot_ItemAvoidStamp(k, it, plc + g_itemRespawnTime);
+            s_botLtgKind[k] = 0;
+        }
+    }
+    if (s_botLtgKind[k] == 1 && ps->cursectnum == s_botLtgSect[k])
+        s_botLtgKind[k] = 0;                    // anchor reached
+    if (s_botLtgKind[k] != 0
+        && (plc >= s_botLtgUntil[k] || s_botLtgUntil[k] - plc > 700))
+        s_botLtgKind[k] = 0;                    // commit expired (or plc restarted)
+    if (s_botLtgKind[k] == 0 && !Bot_PlanLtg(k, ps))
+        return 0;
+    s_botGoal[k]       = (s_botLtgKind[k] == 2) ? 2 : 1;
+    s_botGoalX[k]      = s_botLtgX[k];
+    s_botGoalY[k]      = s_botLtgY[k];
+    s_botGoalSect[k]   = s_botLtgSect[k];
+    s_botGoalDoor[k]   = 0;
+    s_botGoalCrouch[k] = 0;
+    s_botGoalTics[k]   = 0;
+    s_botGoalItem[k]   = (s_botLtgKind[k] == 2) ? s_botLtgItem[k] : -1;
+    s_botGoalSeen[k]   = 0;
+    s_botGoalIsLtg[k]  = 1;
+    return 1;
+}
+
+// The sector the current mesh route crosses into next -- the EDGE actually
+// being attempted when a goal stalls. Cross-map LTG bodies fail at their
+// immediate crossing, not at the (possibly far) goal sector, so the avoid
+// mark must land on (cursectnum -> THIS), with the goal sector as fallback
+// for straight-shot/off-mesh legs.
+static int Bot_RouteNextSect(int k, DukePlayer_t *ps)
+{
+    for (int i = s_botRouteIdx[k]; i < s_botRouteLen[k] && i < s_botRouteIdx[k] + 6; i++)
+    {
+        int const t = s_botRtY[k][i] * s_nvgW + s_botRtX[k][i];
+        if (t < 0 || t >= s_nvgW * s_nvgH)
+            break;
+        int const sct = s_nvgSect[t];
+        if (sct >= 0 && sct != ps->cursectnum)
+            return sct;
+    }
+    return -1;
 }
 
 // DM preferred ENGAGE DISTANCE by OUR current weapon (netduke32 fdmatrix
@@ -1681,6 +2154,17 @@ static input_t Bot_GetInput(int k)
             s_botTrapAnchor[k] = ps->pos.xy;
             s_botTrapDir[k]    = (int16_t)(fix16_to_int(ps->q16ang) & 2047);
             s_botBounceAng[k]  = s_botTrapDir[k];
+            // Zero-init garbage sweep for the AUTOLAUNCH path: Net_SeatBots
+            // (which clears combat locks for menu-hosted matches) never runs
+            // under NN_ROLE, so seat 0's static target default of 0 read as
+            // "locked on player 0" -- the HOST bot chasing ITSELF (measured:
+            // a statue host for the whole first life of every native probe).
+            s_botTarget[k]     = -1;
+            s_botMonTgt[k]     = -1;
+            s_botPending[k]    = -1;
+            s_botItemShun[k]   = -1;
+            s_botLastWacked[k] = -1;
+            s_botSightTics[k]  = 400;   // nothing has ever been SEEN
         }
     }
     if (s_botWasDead[k])
@@ -1699,10 +2183,14 @@ static input_t Bot_GetInput(int k)
         s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
         s_botGoal[k]      = 0;      // spawned somewhere new: fresh errand
         s_botMonTgt[k]    = -1;     // no coop monster lock across a respawn
+        s_botTarget[k]    = -1;     // and no player lock either: the old code let
+        s_botPending[k]   = -1;     //   sightTics=200 age it out against the 130-tic
+                                    //   retention; the wider last-seen window (260)
+                                    //   outlived that trick, so drop it EXPLICITLY
         s_botGoalItem[k]  = -1;
         s_botItemShun[k]  = -1;
         s_botPrevSect[k]  = -1;     // teleported in -- no entry door to shun
-        s_botSightTics[k] = 200;    // stale target: must re-SEE (or be shot) to re-engage
+        s_botSightTics[k] = 400;    // stale target: must re-SEE (or be shot) to re-engage
         s_botGoalSeen[k]  = 0;
         s_botNavSeen[k]   = 0;
         s_botTrapAnchor[k] = ps->pos.xy;    // respawn is a teleport: re-anchor
@@ -1714,6 +2202,15 @@ static input_t Bot_GetInput(int k)
         s_botJetCool[k]    = 0;             // (activation tallies persist -- telemetry)
         for (int di = 0; di < BOT_DEAD_N; di++) // a teleport changes reachability:
             s_botDeadCool[k][di] = 0;           // forget which exits were impossible
+        s_botLtgKind[k]   = 0;              // respawned elsewhere: the committed march is void
+        s_botLtgFails[k]  = 0;
+        s_botLtgLocal[k]  = 0;
+        s_botGoalIsLtg[k] = 0;
+        s_botSeenValid[k] = 0;              // last-seen snapshot dies with the body
+        for (int ei = 0; ei < BOT_EAVOID_N; ei++)   // reachability changed with the teleport
+            { s_botEdgeUntil[k][ei] = 0; s_botEdgeTries[k][ei] = 0; }
+        // (the item respawn ring PERSISTS: it is world knowledge, not body state;
+        // the roam bitmap persists too -- the [roam] meter is per-LEVEL)
     }
 
     int const skill = clamp(g_netBotSkill, 0, 3);
@@ -1723,6 +2220,13 @@ static input_t Bot_GetInput(int k)
     // player-targeting below is gated on !botCoop; the coop branch hunts the
     // nearest enemy sprite instead.
     bool const botCoop = (g_gametypeFlags[ud.coop] & GAMETYPE_COOP) != 0;
+    // TEAM game (TDM): seats carry ps->team (set from pteam at spawn,
+    // premap.cpp:1849, re-synced per tic in game.cpp; the same field the
+    // friendly-damage null and frag credit compare against). The DM
+    // acquisition scan and the retaliation/revenge lock below are gated on
+    // it -- without the gate TDM bots hunted TEAMMATES all match, every shot
+    // nulled (audit item 7, bug-level). Pure DM: flag false, zero change.
+    bool const botTeamGame = !botCoop && (g_gametypeFlags[ud.coop] & GAMETYPE_TDM) != 0;
     // LOW-RESOURCE ITEM PRIORITY (netduke32 dukebot.cpp:771 shape, our
     // fields): badly hurt, or nearly dry on the current weapon -> a pickup
     // errand outranks CLOSING on the combat target. It is a priority flip,
@@ -1764,8 +2268,24 @@ static input_t Bot_GetInput(int k)
         s_botVisitT[k][ps->cursectnum] = movefifoplc;
         s_botThreadFails[k] = 0;    // real progress: the field is behind us
         Bot_ClearDeadExit(k, ps->cursectnum);   // reached it -> it was reachable
+        Bot_ClearAvoidEdgeTo(k, ps->cursectnum);// crossings INTO it proven good
+        Bot_RoamStamp(k, ps->cursectnum);       // [roam] distinct-sector meter
         if (s_botGoal[k] == 1)
-            s_botGoal[k] = 0;       // new room reached: pick its far exit fresh
+        {
+            if (!s_botGoalIsLtg[k])
+                s_botGoal[k] = 0;   // neighbor-portal errand consumed: pick fresh
+            else if (ps->cursectnum == s_botGoalSect[k])
+            {
+                s_botGoal[k]     = 0;   // LTG roam anchor REACHED
+                s_botLtgKind[k]  = 0;   // next commit re-planned fresh...
+                s_botLtgLocal[k] = 2;   // ...after two LOCAL explore beats:
+                                        // march there, then sniff around the
+                                        // destination cluster like a player
+            }
+            // else: the errand IS the committed LTG body -- crossing rooms is
+            // its JOB, the march continues (the old discard here was the
+            // spawn-orbit mechanism the two-tier stack exists to cure)
+        }
     }
     else if ((movefifoplc & 31) == 0)
         s_botVisitT[k][ps->cursectnum] = movefifoplc;   // lingering ages a room too
@@ -1774,6 +2294,22 @@ static input_t Bot_GetInput(int k)
     for (int di = 0; di < BOT_DEAD_N; di++)      // age out impossible-exit avoidance
         if (s_botDeadCool[k][di] > 0)
             s_botDeadCool[k][di]--;
+    // [roam] telemetry: cumulative DISTINCT sectors entered this level, one
+    // line per seat per ~10s -- the user-visible depth meter the smoke gates
+    // on (and knob-independent, so baseline and test legs read the same way).
+    {
+        extern int32_t g_netForensics;
+        if (g_netForensics
+            && (movefifoplc - s_botRoamLogPlc[k] >= 260 || movefifoplc < s_botRoamLogPlc[k]))
+        {
+            s_botRoamLogPlc[k] = movefifoplc;
+            Bot_RoamStamp(k, ps->cursectnum);   // count the spawn room too
+            LOG_F(INFO, "[roam] seat=%d visited=%d plc=%d x=%d y=%d sect=%d goal=%d ltg=%d",
+                  k, (int)s_botRoamCnt[k], (int)movefifoplc,
+                  (int)ps->pos.x, (int)ps->pos.y, (int)ps->cursectnum,
+                  (int)s_botGoal[k], (int)s_botLtgKind[k]);
+        }
+    }
 
     // RETALIATION (user 2026-08-10: "if a bot is hit, it should change its
     // targets to lock onto the new target"). Runs EVERY tic, ahead of the
@@ -1809,7 +2345,10 @@ static input_t Bot_GetInput(int k)
             if (wa != s_botLastWacked[k] && atk != s_botTarget[k]
                 && g_player[atk].connected && g_player[atk].ps != NULL
                 && (unsigned)g_player[atk].ps->i < MAXSPRITES
-                && sprite[g_player[atk].ps->i].extra > 0)
+                && sprite[g_player[atk].ps->i].extra > 0
+                // TDM: a teammate's stray splash is not a war (their damage is
+                // nulled anyway -- locking onto them wasted the whole match)
+                && !(botTeamGame && g_player[atk].ps->team == ps->team))
             {
                 s_botTarget[k]     = (int8_t)atk;   // hard-lock onto the attacker NOW
                 s_botTargetHold[k] = 0;
@@ -1817,6 +2356,12 @@ static input_t Bot_GetInput(int k)
                 s_botNoHitTics[k]  = 0;
                 s_botLastTDist[k]  = INT32_MAX;
                 s_botPending[k]    = -1;            // cancel any half-built acquisition
+                {
+                    extern int32_t g_netForensics;  // native lock trace (see [tgt] above)
+                    if (g_netForensics)
+                        LOG_F(INFO, "[tgt] seat=%d locked %d plc=%d (retaliate)",
+                              k, atk, (int)movefifoplc);
+                }
                 s_botSpawnRoam[k]  = 0;            // stop dispersing -- fight back
                 s_botThinkHold[k]  = (int16_t)(holdMax[skill] + (Bot_Rnd() % holdMax[skill]));
             }
@@ -1845,7 +2390,7 @@ static input_t Bot_GetInput(int k)
                 int const to   = Nvg_Snap(sprite[mon].x, sprite[mon].y);
                 static int16_t txx[4], tyy[4];
                 if (from >= 0 && to >= 0
-                    && (from == to || Bot_NvgPath(from, to, txx, tyy, 4) > 0))
+                    && (from == to || Bot_NvgPath(k, from, to, txx, tyy, 4) > 0))
                 {
                     s_botNavOn[k]   = 1;
                     s_botNavSeen[k] = 0;
@@ -1902,6 +2447,7 @@ static input_t Bot_GetInput(int k)
                         s_botGoalTics[k]   = 0;
                         s_botGoalItem[k]   = -1;
                         s_botGoalSeen[k]   = 0;
+                        s_botGoalIsLtg[k]  = 0;     // escort slot: never an LTG body
                     }
                     else
                         s_botGoal[k] = 0;   // in the slot: hold station near the player
@@ -1928,7 +2474,14 @@ static input_t Bot_GetInput(int k)
             int const wa = ps->wackedbyactor;
             if ((unsigned)wa < MAXSPRITES && sprite[wa].picnum == APLAYER
                 && (unsigned)sprite[wa].yvel < MAXPLAYERS)
+            {
                 revenge = sprite[wa].yvel;
+                // TDM: no revenge credit for a same-team splash (their
+                // BotSameTeam veto in the enemy scan, ai_dmq3.c:3083).
+                if (botTeamGame && g_player[revenge].ps != NULL
+                    && g_player[revenge].ps->team == ps->team)
+                    revenge = -1;
+            }
         }
         // FIND before FIGHT (user directive): acquisition needs LINE OF SIGHT
         // -- or revenge, because you know who just shot you. The old
@@ -1946,6 +2499,20 @@ static input_t Bot_GetInput(int k)
             if (cp == NULL || (unsigned)cp->i >= MAXSPRITES || sprite[cp->i].extra <= 0 || cp->dead_flag
                 || (unsigned)cp->cursectnum >= (unsigned)numsectors)
                 continue;
+            // TDM TEAM FILTER (audit item 7, bug-level): teammates are not
+            // targets -- not as locks, not as "heard" hunting hints. Their
+            // damage is nulled (Net_ApplyClientHit / A_IncurDamage), so every
+            // tic spent hunting one accomplished exactly nothing.
+            if (botTeamGame && cp->team == ps->team)
+            {
+                extern int32_t g_netForensics;
+                if (g_netForensics && !s_botTeamLogged[k])
+                {
+                    s_botTeamLogged[k] = 1;     // one-shot proof the filter ran
+                    LOG_F(INFO, "[team] seat=%d skipped teammate %d", k, i);
+                }
+                continue;
+            }
             int32_t d = klabs(cp->pos.x - ps->pos.x) + klabs(cp->pos.y - ps->pos.y)
                         + (klabs(cp->pos.z - ps->pos.z) >> 2);
             int seen = 1;
@@ -1963,9 +2530,14 @@ static input_t Bot_GetInput(int k)
                               cp->pos.x, cp->pos.y, cp->pos.z, cp->cursectnum);
             if (d < bestd) { bestd = d; best = i; bestSeen = seen; }
         }
+        // Pursuit memory: with the last-seen chase live the bot walks to a
+        // SNAPSHOT, so the window stretches to ~10s (their chase_time,
+        // ai_dmnet.c:2296) -- the touch check below usually ends it sooner.
+        // Old wall-tracking pursuit keeps its shorter 130-tic leash.
         if (best < 0 && s_botTarget[k] >= 0 && s_botTarget[k] != avoid
-            && s_botSightTics[k] < 130)
-            best = s_botTarget[k];      // pursuit memory: chase the last sighting briefly
+            && s_botTarget[k] != k      // never retain SELF (stale static garbage)
+            && s_botSightTics[k] < (g_botLtgOn ? 260 : 130))
+            best = s_botTarget[k];      // chase the last sighting briefly
         // REACTION / AWARENESS: don't lock onto a NEWLY-seen player the instant
         // LOS opens -- it must hold sight for reactTics (tracked per-tic below)
         // first, so the bot keeps roaming a beat before it notices. Revenge
@@ -1984,6 +2556,12 @@ static input_t Bot_GetInput(int k)
             s_botNoHitTics[k]  = 0;
             s_botLastTDist[k]  = INT32_MAX;
             s_botSightTics[k]  = 0;
+            // Native-visible lock trace (the [aim] decoupling line is EM_ASM,
+            // wasm-only): every NEW player lock, so the TDM smoke can assert
+            // ZERO teammate acquisitions and the DM legs still show combat.
+            extern int32_t g_netForensics;
+            if (g_netForensics && best >= 0)
+                LOG_F(INFO, "[tgt] seat=%d locked %d plc=%d", k, best, (int)movefifoplc);
         }
         s_botTarget[k] = (int8_t)best;
         // Plot the route: ROUTABLE means the MESH says so. The old portal
@@ -1994,17 +2572,24 @@ static input_t Bot_GetInput(int k)
         if (best >= 0 && g_player[best].ps != NULL)
         {
             auto const tps = g_player[best].ps;
+            // Chase destination: the LIVE position only while the target is in
+            // sight; once sight breaks, the LAST-SEEN snapshot -- routing to
+            // the live position through walls was the omniscient wall-tracking
+            // the audit called out (item 5).
+            int32_t rx = tps->pos.x, ry = tps->pos.y;
+            if (g_botLtgOn && s_botSeenValid[k] && s_botSightTics[k] > 0)
+                { rx = s_botSeenX[k]; ry = s_botSeenY[k]; }
             Bot_NavEnsure();
             int const from = Nvg_Snap(ps->pos.x, ps->pos.y);
-            int const to   = Nvg_Snap(tps->pos.x, tps->pos.y);
+            int const to   = Nvg_Snap(rx, ry);
             static int16_t txx[4], tyy[4];
             if (from >= 0 && to >= 0
-                && (from == to || Bot_NvgPath(from, to, txx, tyy, 4) > 0))
+                && (from == to || Bot_NvgPath(k, from, to, txx, tyy, 4) > 0))
             {
                 s_botNavOn[k]   = 1;
                 s_botNavSeen[k] = 0;
-                s_botNavX[k]    = tps->pos.x;   // the resolver meshes the walk
-                s_botNavY[k]    = tps->pos.y;
+                s_botNavX[k]    = rx;           // the resolver meshes the walk
+                s_botNavY[k]    = ry;
             }
         }
         if (best >= 0 && (bestSeen || s_botNavOn[k])
@@ -2038,14 +2623,42 @@ static input_t Bot_GetInput(int k)
                 s_botGoalTics[k]   = 0;
                 s_botGoalItem[k]   = -1;
                 s_botGoalSeen[k]   = 0;
+                s_botGoalIsLtg[k]  = 0;     // hunt detour: NBG-tier, not the march
             }
             else
             {
+                // Goal ladder, OA shape: nearby-item detour (NBG) on the same
+                // 1-in-4 roll as before; otherwise the COMMITTED map-wide LTG
+                // -- which, because it re-issues here after every fight and
+                // detour, is exactly "resume the march"; the old one-room
+                // explore survives as the off-mesh fallback, and total plan
+                // failure clears the avoid-reach ring (their movement-failure
+                // deadlock break, ai_dmnet.c:2200).
                 int const wantItem = ((Bot_Rnd() & 3) == 0);
-                if ((!wantItem || !Bot_PlanItem(k, ps)) && !Bot_PlanExplore(k, ps))
+                int planned = (wantItem && Bot_PlanItem(k, ps));
+                // Destination sniff: explore beats owed at a just-reached LTG
+                // run BEFORE the next cross-map commit -- the room routine
+                // works the arrival cluster the way it used to work the
+                // spawn cluster, then the march resumes.
+                if (!planned && g_botLtgOn && s_botLtgLocal[k] > 0
+                    && Bot_PlanExplore(k, ps))
+                    { s_botLtgLocal[k]--; planned = 1; }
+                if (!planned
+                    && !Bot_LtgErrand(k, ps) && !Bot_PlanExplore(k, ps))
+                {
+                    if (g_botLtgOn)
+                        Bot_ClearAvoidEdges(k);
                     s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);   // portal-less void
+                }
             }
         }
+        // NBG detour DURING the march (their BotNearbyGoal check every ~1s
+        // while seeking the LTG, ai_dmnet.c:2306): a leashed nearby pickup
+        // may preempt the committed body; Bot_PlanItem's own 3000-unit
+        // walk-line leash keeps it a detour, and the march RESUMES from the
+        // picker the moment the detour resolves.
+        else if (s_botGoalIsLtg[k] && (Bot_Rnd() & 7) == 0)
+            Bot_PlanItem(k, ps);
         if ((Bot_Rnd() & 3) == 0)
             s_botStrafeDir[k] = (Bot_Rnd() & 1) ? 1 : -1;
         if (s_botTurnPref[k] == 0 || (Bot_Rnd() & 63) == 0)
@@ -2216,17 +2829,93 @@ static input_t Bot_GetInput(int k)
         // the 13s timeout below; the staleness gradient would otherwise lure the
         // bot straight back to the one door it can't take.
         if (s_botGoalTics[k] == 0)
-            { s_botGoalNear[k] = goalDist; s_botGoalStall[k] = 0; }
+            { s_botGoalNear[k] = goalDist; s_botGoalStall[k] = 0; s_botLtgAnchor[k] = ps->pos.xy; }
+        else if (s_botGoalIsLtg[k])
+        {
+            // LTG-body watch: MOVEMENT-based, both goal kinds. The approach
+            // test below false-positives on every cross-map march (routes
+            // round buildings, distance-to-goal plateaus for whole legs); a
+            // healthy march never stops MOVING, so the anchor test catches
+            // exactly the grinds (measured: a body wedged in the E1L1 chair
+            // field at ~1.5 units/tic held its full cap with zero aborts,
+            // while the old test killed clean marches every ~150 tics).
+            if (klabs(ps->pos.x - s_botLtgAnchor[k].x)
+                + klabs(ps->pos.y - s_botLtgAnchor[k].y) >= 384)
+                { s_botLtgAnchor[k] = ps->pos.xy; s_botGoalStall[k] = 0; }
+            else if (++s_botGoalStall[k] > 96)
+            {
+                // PRIMARY response is the per-EDGE mark on the crossing
+                // actually being attempted (the route's next sector, not the
+                // possibly-distant goal): short TTL, dead only after repeated
+                // failures. The old sector-wide 2400-tic ban survives as the
+                // ESCALATION tier once one edge racks up 5+ tries.
+                int to = Bot_RouteNextSect(k, ps);
+                if (to < 0) to = s_botGoalSect[k];
+                int const tries = Bot_MarkAvoidEdge(k, ps->cursectnum, to);
+                if (tries >= 5 && (unsigned)s_botGoalSect[k] < (unsigned)numsectors)
+                    Bot_MarkDeadExit(k, s_botGoalSect[k]);
+                s_botRouteLen[k]  = 0;          // force a fresh path next leg
+                s_botRouteCool[k] = 0;
+                if (++s_botLtgFails[k] >= 2)
+                {
+                    s_botLtgKind[k] = 0;        // LTG survives ONE grind (resume
+                                                // from wherever recovery moved
+                                                // us); the second kills it
+                    if ((unsigned)s_botGoalSect[k] < (unsigned)numsectors)
+                        s_botVisitT[k][s_botGoalSect[k]] = movefifoplc;
+                    // A FAILED item commit re-arms its ring stamp from the
+                    // failure, not the choice: the choice-time stamp expired
+                    // right as the local rotation returned, and a seat parked
+                    // in an item-dense cluster cycled the same three
+                    // unreachable pickups all match (measured: the E1L1
+                    // cinema 154<->302<->211 triangle). Blocking failures a
+                    // full window forces the next plan OUTWARD.
+                    if (s_botGoal[k] == 2 && (unsigned)s_botGoalItem[k] < MAXSPRITES)
+                        Bot_ItemAvoidStamp(k, s_botGoalItem[k],
+                                           movefifoplc + g_itemRespawnTime);
+                    // ^ and loses its staleness pull, or the next plan re-picks
+                    // it. Two zero-movement stalls back to back is a certified
+                    // WEDGE (sprite fields): hold the goal picker off for a
+                    // beat. A live goal routes every stuck trip into the LANE
+                    // branch of the (unchanged) recovery ladder and the
+                    // episode-gated JUMP rung never fires; the old brain got
+                    // its jumps through natural goal-less wander gaps, so give
+                    // the ladder the same room to work.
+                    s_botThinkHold[k] = (int16_t)(96 + (Bot_Rnd() & 63));
+                }
+                {
+                    extern int32_t g_netForensics;
+                    if (g_netForensics)
+                        LOG_F(INFO, "[ltgdrop] seat=%d stall edge=%d->%d tries=%d ltgfails=%d plc=%d",
+                              k, (int)ps->cursectnum, to, tries,
+                              (int)s_botLtgFails[k], (int)movefifoplc);
+                }
+                s_botGoal[k] = 0;
+            }
+        }
         else if (goalDist + 256 < s_botGoalNear[k])
             { s_botGoalNear[k] = goalDist; s_botGoalStall[k] = 0; }   // real approach
         else if (s_botGoal[k] == 1 && (unsigned)s_botGoalSect[k] < (unsigned)numsectors
                  && ++s_botGoalStall[k] > 96)
         {
-            Bot_MarkDeadExit(k, s_botGoalSect[k]);
+            if (g_botLtgOn)
+            {
+                // One-room errand stall: same per-edge primary / sector-tier
+                // escalation split as the LTG body above.
+                int const tries = Bot_MarkAvoidEdge(k, ps->cursectnum, s_botGoalSect[k]);
+                if (tries >= 5)
+                    Bot_MarkDeadExit(k, s_botGoalSect[k]);
+            }
+            else
+                Bot_MarkDeadExit(k, s_botGoalSect[k]);
             s_botVisitT[k][s_botGoalSect[k]] = movefifoplc;   // reset its staleness too
             s_botGoal[k] = 0;
         }
-        if (s_botGoal[k] != 0 && ++s_botGoalTics[k] > 390)
+        // A committed LTG body legitimately outlives the one-room errand
+        // budget (a cross-map march is many rooms); its own commit deadline
+        // (~390-520 tics, checked at re-issue) plus the stall watch above
+        // bound it, so the hard cap only backstops a slow-but-moving crawl.
+        if (s_botGoal[k] != 0 && ++s_botGoalTics[k] > (s_botGoalIsLtg[k] ? 600 : 390))
         {
             // 15s on one errand is a locked door / unreachable shelf: mark it
             // satisfied so the gradient stops wanting it, and move on. EVERY
@@ -2234,9 +2923,19 @@ static input_t Bot_GetInput(int k)
             // unreachable neighbor stays the stalest thing in the room and
             // the planner re-picks it forever (the seat-pinned loop).
             if (s_botGoal[k] == 2)
+            {
                 s_botItemShun[k] = s_botGoalItem[k];
+                // Timed-out item LTG: block it a full window from NOW (see
+                // the failure re-stamp in the stall branch above).
+                if (g_botLtgOn && s_botGoalIsLtg[k]
+                    && (unsigned)s_botGoalItem[k] < MAXSPRITES)
+                    Bot_ItemAvoidStamp(k, s_botGoalItem[k],
+                                       movefifoplc + g_itemRespawnTime);
+            }
             else if ((unsigned)s_botGoalSect[k] < (unsigned)numsectors)
                 s_botVisitT[k][s_botGoalSect[k]] = movefifoplc;
+            if (s_botGoalIsLtg[k])
+                s_botLtgKind[k] = 0;            // spent: plan a fresh commit
             s_botGoal[k] = 0;
         }
         else if (s_botGoal[k] == 2)
@@ -2244,17 +2943,38 @@ static input_t Bot_GetInput(int k)
             int const it = s_botGoalItem[k];
             if ((unsigned)it >= MAXSPRITES || (sprite[it].cstat & 32768)
                 || !Bot_IsPickup(sprite[it].picnum))
-                s_botGoal[k] = 0;               // taken (ideally by us): errand done
+            {
+                // Taken (ideally by us): errand done. OBSERVED pickup is the
+                // respawn ring's refresh point -- from here the schedule knows
+                // when this sprite pops back (cstat bit 32768 = pending).
+                if (g_botLtgOn && (unsigned)it < MAXSPRITES && (sprite[it].cstat & 32768))
+                    Bot_ItemAvoidStamp(k, it, movefifoplc + g_itemRespawnTime);
+                if (s_botGoalIsLtg[k])
+                {
+                    s_botLtgKind[k]  = 0;       // LTG satisfied: next think re-plans
+                    s_botLtgLocal[k] = 2;       // destination sniff (see crossing)
+                }
+                s_botGoal[k] = 0;
+            }
             else if (goalDist < 512 && s_botGoalTics[k] > 60)
             {
                 // Standing ON it and nothing happened -- full health/ammo, the
                 // sim refuses. Shun it and get back to the room routine.
                 s_botItemShun[k] = (int16_t)it;
+                if (s_botGoalIsLtg[k])
+                    s_botLtgKind[k] = 0;
                 s_botGoal[k]     = 0;
             }
         }
         else if (goalDist < 384 && s_botGoalSect[k] < 0)
             s_botGoal[k] = 0;                   // free waypoint (heard-them walk) reached
+        // (NO 2D-touch arrival for roam anchors: Build maps stack sectors --
+        // E1L1's rooftops overlap the street in 2D, and a touch test here
+        // "arrived" every time the bot walked UNDERNEATH its anchor, without
+        // stamping it visited -- the same roof then won every re-plan, and
+        // the whole leg burned commuting under it. Arrival is ENTERING the
+        // goal sector (the crossing handler), with the body timeout as the
+        // circles-nearby backstop.)
         if (s_botGoal[k] != 0 && s_botGoalDoor[k] && goalDist < 1600 && (movefifoplc & 7) == 0)
             in.bits |= BIT(SK_OPEN);            // doors get PRESSED, not bumped
         if (s_botGoal[k] != 0 && s_botGoalCrouch[k] && goalDist < 1024)
@@ -2309,6 +3029,42 @@ static input_t Bot_GetInput(int k)
             s_botSightTics[k] = 0;
         else if (s_botSightTics[k] < 30000)
             s_botSightTics[k]++;
+    }
+    // CHASE THE LAST-SEEN POSITION (their lastenemyorigin model,
+    // ai_dmnet.c:2147/:2296). Snapshot the target's position only WHILE
+    // visible; the moment sight breaks, movement/navigation runs at the
+    // SNAPSHOT -- not the live position through walls, which was pursuit
+    // omniscience for the whole memory window. Reaching the snapshot with
+    // nobody there ends the chase on the spot (their touch give-up), which
+    // hands the body straight back to the committed LTG. Applies to the DM
+    // player-chase AND the coop monster-chase: both ride this one unified
+    // tgX/tgY path, so the split brain would cost more than it saved --
+    // coop's own monster-hunt priority and shorter 130-tic memory are
+    // untouched. AIM stays on the LIVE position for a short beat after
+    // losing sight (tgAim*, ~50 tics), then follows the movement heading.
+    int32_t const tgAimX = tgX, tgAimY = tgY;   // live coords for the aim tail
+    if (hasTgt && seesTarget)
+    {
+        s_botSeenX[k]     = tgX; s_botSeenY[k] = tgY; s_botSeenZ[k] = tgZ;
+        s_botSeenSect[k]  = (int16_t)tgSect;
+        s_botSeenValid[k] = 1;
+    }
+    else if (!hasTgt)
+        s_botSeenValid[k] = 0;
+    if (g_botLtgOn && hasTgt && !seesTarget && s_botSeenValid[k])
+    {
+        tgX = s_botSeenX[k]; tgY = s_botSeenY[k]; tgZ = s_botSeenZ[k];
+        tgSect = s_botSeenSect[k];
+        if (klabs(tgX - ps->pos.x) + klabs(tgY - ps->pos.y) < 600)
+        {
+            // Stood where they were LAST SEEN and they are not here: the
+            // trail is cold. Drop the chase; the think block's next pass
+            // resumes the LTG march ("lost him" feeds the roaming layer).
+            s_botSeenValid[k] = 0;
+            s_botSightTics[k] = 30000;          // memory spent
+            if (botCoop) s_botMonTgt[k] = -1; else s_botTarget[k] = -1;
+            hasTgt = false;
+        }
     }
     // Awareness build-up for a PENDING (not-yet-locked) candidate: it must
     // hold line of sight for reactTics before the acquisition block promotes
@@ -2513,9 +3269,14 @@ static input_t Bot_GetInput(int k)
     // holds the track through brief occlusion (strafing behind a pillar) and
     // through the wall-follow, and releases only once the target has been out of
     // sight long enough (~3s) that this is navigation, not combat.
-    bool const engaging = (hasTgt && (seesTarget || canHit || s_botSightTics[k] < 90));
+    // With the last-seen chase live the face-lock tail shortens to ~50 tics
+    // of LIVE tracking after sight breaks (their 2s aim memory), then the
+    // head follows the movement heading toward the snapshot; tgAim* holds
+    // the live coordinates for exactly that tail.
+    bool const engaging = (hasTgt && (seesTarget || canHit
+                                      || s_botSightTics[k] < (g_botLtgOn ? 50 : 90)));
     int const aimAng = engaging
-                       ? getangle(tgX - ps->pos.x, tgY - ps->pos.y)
+                       ? getangle(tgAimX - ps->pos.x, tgAimY - ps->pos.y)
                        : moveAng;
     int diff = (((aimAng - fix16_to_int(ps->q16ang)) + 1024) & 2047) - 1024;
     // Tracking: SMALL wobble while the target is visible (the old +-48 at
@@ -2977,6 +3738,19 @@ void Net_SeatBots(int minPlayers, int skill)
         s_botSterUses[k]  = 0;
         s_botJetActs[k]   = 0;
         s_botInvLogPlc[k] = 0;
+        s_botLtgKind[k]   = 0;      // wave-3a roaming state: fresh match
+        s_botLtgItem[k]   = -1;
+        s_botLtgUntil[k]  = 0;
+        s_botLtgFails[k]  = 0;
+        s_botLtgLocal[k]  = 0;
+        s_botGoalIsLtg[k] = 0;
+        s_botSeenValid[k] = 0;
+        Bot_ItemAvoidReset(k);
+        Bot_ClearAvoidEdges(k);
+        Bmemset(s_botRoamBm[k], 0, sizeof(s_botRoamBm[k]));
+        s_botRoamCnt[k]    = 0;
+        s_botRoamLogPlc[k] = 0;
+        s_botTeamLogged[k] = 0;
     }
     if (myconnectindex != connecthead)
         return;
