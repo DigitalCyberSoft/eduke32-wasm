@@ -7810,23 +7810,12 @@ int G_DoMoveThings(void)
         Net_GlideEnemies();
 #endif
 
-#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
-    // LAST MAN STANDING round manager (host-only, per authoritative tic). Counts
-    // survivors and, on <=1 remaining, announces the winner and starts a fresh
-    // round. No-op unless the gametype is LMS.
-    if (numplayers > 1)
-    {
-        extern int32_t g_netForensics;
-        static int s_lmsProbe;
-        if (g_netForensics && (++s_lmsProbe % 260) == 1)
-            EM_ASM({ console.log('[lmsprobe] coop=' + $0 + ' cnt=' + $1 + ' lmsflag=' + $2); },
-                   ud.coop, g_gametypeCnt, (g_gametypeFlags[ud.coop] & GAMETYPE_LMS) ? 1 : 0);
-        if (g_gametypeFlags[ud.coop] & GAMETYPE_LMS)
-        {
-            extern void Net_LmsTick(void);
-            Net_LmsTick();
-        }
-    }
+#if defined(NETDUKE32) && (defined(__EMSCRIPTEN__) || defined(NETNATIVE))
+    // LAST MAN STANDING round manager (host-only, per authoritative tic), in
+    // the same post-world phase on both transport builds. Counts survivors and,
+    // on <=1 remaining, announces the winner and starts a fresh round.
+    if (numplayers > 1 && (g_gametypeFlags[ud.coop] & GAMETYPE_LMS))
+        Net_LmsTick();
 #endif
 
 #ifdef NETDUKE32

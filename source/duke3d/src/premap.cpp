@@ -2243,6 +2243,13 @@ int G_EnterLevel(int gameMode)
     ud.ffire             = ud.m_ffire;
     ud.noexits           = ud.m_noexits;
 
+#ifdef NETDUKE32
+    // Per-level/match lifecycle boundary for Last Man Standing. This runs for
+    // every entry after ud.coop has been committed and before any authoritative
+    // game tic can spend lives. Non-LMS entries explicitly clear stale state.
+    Net_LmsResetLevel();
+#endif
+
     if ((gameMode & MODE_DEMO) != MODE_DEMO)
         ud.recstat = ud.m_recstat;
     if ((gameMode & MODE_DEMO) == 0 && ud.recstat == 2)

@@ -1885,6 +1885,10 @@ static void netmenu_relaunch(int vol, int lev)
 {
     ud.m_volume_number      = (vol >= 0 && vol < MAXVOLUMES) ? vol : 0;
     ud.m_level_number       = lev;
+    // The gametype is part of bot seating: TDM assigns each new CPU against
+    // the canonical human+bot team counts. Clamp it before Net_SeatBots so
+    // menu relaunches and native autolaunch share the same ordering.
+    ud.m_coop               = clamp(ud.m_coop, 0, g_gametypeCnt - 1);
     // CPU seats ride the normal roster: seated as connected[] before the
     // multimode count and the NEW_GAME seat mask are derived, so guests seat
     // them like any player. Their inputs are host-synthesized (oldnet.cpp).
@@ -1892,12 +1896,11 @@ static void netmenu_relaunch(int vol, int lev)
         Net_SeatBots(s_netMinPlayers, s_netBotSkill);
     ud.multimode            = numplayers;
     g_mostConcurrentPlayers = ud.multimode;
-    // GAME TYPE is now the host's menu pick (ME_NET_CFG_GAMETYPE -> ud.m_coop),
+    // GAME TYPE is the host's menu pick (ME_NET_CFG_GAMETYPE -> ud.m_coop),
     // propagated to guests via Net_SendNewGame. Monsters are DERIVED: on in
     // Cooperative, off in every deathmatch/TDM variant (the guest twin of this
     // derive lives in the NEW_GAME handler, oldnet.cpp -- monsters_off is NOT a
     // networked field, so both peers must compute it from the gametype).
-    ud.m_coop               = clamp(ud.m_coop, 0, g_gametypeCnt - 1);
     ud.m_monsters_off       = (g_gametypeFlags[ud.m_coop] & GAMETYPE_COOP) ? 0 : 1;
     // Coop is REGULAR STORY MODE: killed monsters stay dead (user 2026-08-12
     // "coop ... should not be respawning monsters"). This field is otherwise
@@ -9434,10 +9437,17 @@ void M_DisplayMenus(void)
         {
             net_native_mark_launched();
             ud.m_volume_number      = (NetEpisode >= 0 && NetEpisode < MAXVOLUMES) ? NetEpisode : 0;
+            // Headless gametype pick (NN_GAMETYPE; default 0 = DM) is parsed
+            // before seating because TDM bot teams depend on the selected mode.
+            // This is deliberately the same clamp used by netmenu_relaunch.
+            {
+                const char *gt = getenv("NN_GAMETYPE");
+                ud.m_coop = gt ? clamp(atoi(gt), 0, g_gametypeCnt - 1) : 0;
+            }
 #ifdef NETDUKE32
             // Headless CPU-bot seating (NN_SEATBOTS=N, host only): fill up to N
             // seats with host-authoritative bots, exactly as the net menu's Min
-            // Players does (netmenu_relaunch -> Net_SeatBots, BEFORE multimode is
+            // Players does (netmenu_relaunch -> Net_SeatBots, before multimode is
             // derived so bots ride the roster + NEW_GAME seat mask). The native
             // autolaunch otherwise never seats g_netBotMask bots, so a menu-hosted
             // bot match (and its DM respawn path) had no headless repro. NN_BOTSKILL
@@ -9454,14 +9464,9 @@ void M_DisplayMenus(void)
 #endif
             ud.multimode            = numplayers;
             g_mostConcurrentPlayers = ud.multimode;
-            // Headless gametype pick (NN_GAMETYPE; default 0 = DM) so the native
-            // harness can verify COOP too. Same derives as netmenu_relaunch:
-            // monsters/skill/ffire follow the gametype; guests re-derive from the
-            // NEW_GAME packet's m_coop (monsters_off isn't networked).
-            {
-                const char *gt = getenv("NN_GAMETYPE");
-                ud.m_coop = gt ? clamp(atoi(gt), 0, g_gametypeCnt - 1) : 0;
-            }
+            // Same derives as netmenu_relaunch: monsters/skill/ffire follow the
+            // gametype; guests re-derive from the NEW_GAME packet's m_coop
+            // (monsters_off isn't networked).
             ud.m_monsters_off       = (g_gametypeFlags[ud.m_coop] & GAMETYPE_COOP) ? 0 : 1;
             ud.m_respawn_monsters   = 0;
             if (g_gametypeFlags[ud.m_coop] & GAMETYPE_COOP)

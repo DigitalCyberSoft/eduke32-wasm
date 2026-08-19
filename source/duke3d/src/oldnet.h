@@ -230,6 +230,9 @@ void Net_SeatBots(int minPlayers, int skill); // host: retain/fill seats up to f
 #ifdef NETNATIVE
 int Net_TestSeatBotsRelaunch(void); // deterministic H01 characterization fixture
 #endif
+void Net_LmsResetLevel(void);     // every G_EnterLevel: fresh LMS match state, or clear stale non-LMS state
+void Net_LmsTick(void);           // host authoritative LMS round manager
+int  Net_LmsAllowRespawn(int playerNum); // host spends LMS lives; guests never spend independently
 input_t Net_BotInput(void);       // bot input for the LOCAL peer (test mode)
 void Net_SendStateSnap(int k);    // host: in-place RNG+player correction to one guest
 int  Net_CorrectDivergence(int k);// host: correction ladder (soft snaps -> snapshot heal)
@@ -290,6 +293,7 @@ enum DukePacket_t
     PACKET_TYPE_LEVEL_GO,      // host -> guests, stream mode: EXPLICIT entry release ([1] = host crossing number); the only signal that opens a guest's barrier
     PACKET_TYPE_JOIN_ACK,      // catchup peer -> host, RELIABLE: [1]=epoch, [2..5]=contiguous M2S applied; paces the join/heal flow (s_slaveAck)
     PACKET_TYPE_SEAT_SPAWNED,  // host -> guests, stream: [1]=seat that just spawned (on-demand or respawn). Bystanders get ZERO-FILLED inputs for other guests, so they can never infer another guest's spawn from the input stream -- it must be told.
+    PACKET_TYPE_LMS_ROUND_RESET, // host -> guests, reliable: [1]=winner+1 (0=no survivor), followed by 16 authoritative life bytes; every guest resurrects each dead seat without spending lives
     PACKET_END, // Should remain last in list.
 };
 

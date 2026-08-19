@@ -8,6 +8,7 @@
 static void Net_RebuildConnectChain(void);
 #include "net_predict.h"
 #include "net_transport.h"
+#include "net_phase2.h"
 #include "chatpipe.h"
 #include "demo.h"  // G_CloseDemoWrite (Net_CheckPlayerQuit)
 #include "savegame.h"  // late-join snapshot: sv_saveandmakesnapshot / G_LoadPlayer
@@ -98,6 +99,7 @@ int32_t g_netBotSkill = 2;   // CPU skill 0..3, indexes the Duke skill names
                              // absolute shit job at aiming" (live report).
 int32_t g_netMinPlayers = 5; // host's match-size floor: bots fill up to this
                              // count and yield seats back as humans join
+extern int32_t g_netForensics; // file definition is below; seating/LMS probes use it
 int32_t g_netLocalBot;       // TEST MODE: this peer's OWN input comes from the
                              // bot brain through the full human pipeline --
                              // sampling, staging, S2M, prediction. On the wire
@@ -4433,19 +4435,27 @@ void Net_SeatBots(int minPlayers, int skill)
     // (two writers -> aliased cursors -> garbage inputs -> crash at entry).
     g_player[myconnectindex].connected = 1;
     int occupied = 0, retained = 0;
+    int teamCount[NET_TEAM_COUNT] = {};
+    bool const tdm = (g_gametypeFlags[ud.m_coop] & GAMETYPE_TDM) != 0;
+    // Canonical roster scan: transport humans and retained CPU seats both count
+    // toward the match-size floor and team balance. A connected CPU keeps its
+    // ownership bit across relaunch; only a disconnected prior bit is dropped.
     for (int k = 0; k < MAXPLAYERS; k++)
-        if (g_player[k].connected)
+    {
+        if (!g_player[k].connected)
+            continue;
+        occupied++;
+        if (priorBotMask & (1 << k))
         {
-            occupied++;
-            if (priorBotMask & (1 << k))
-            {
-                g_netBotMask |= (1 << k);
-                retained++;
-            }
+            g_netBotMask |= (1 << k);
+            retained++;
         }
+        if (tdm)
+            teamCount[Net_ClampTeam(g_player[k].pteam)]++;
+    }
     int const want = max(g_netMinPlayers - occupied, 0);
     int seated = 0;
-    for (int k = 0; k < MAXPLAYERS && k < 16 && seated < want; k++)
+    for (int k = 0; k < MAXPLAYERS && seated < want; k++)
     {
         if (k == myconnectindex || g_player[k].connected)
             continue;
@@ -4453,13 +4463,16 @@ void Net_SeatBots(int minPlayers, int skill)
         g_player[k].connected = 1;
         g_netBotMask |= (1 << k);
         Bsprintf(g_player[k].user_name, "CPU-%d", retained + seated + 1);
-        // Team DM: split CPU seats across the two teams so the mode is playable
-        // (all-team-0 + friendly-fire-off = nobody can damage anyone). Spawn
-        // applies the team palette from pteam (premap.cpp). DM/Coop leave it 0.
+        // Place each new TDM CPU on the least-populated valid team in the full
+        // canonical roster, breaking ties by the lowest team. Retained CPUs keep
+        // their existing identity/team; only newly allocated seats are balanced.
+        int team = 0;
+        if (tdm)
         {
-            extern int32_t g_gametypeFlags[];
-            g_player[k].pteam = (g_gametypeFlags[ud.m_coop] & GAMETYPE_TDM) ? (seated & 1) : 0;
+            team = Net_LeastPopulatedTeam(teamCount);
+            teamCount[team]++;
         }
+        g_player[k].pteam = team;
         seated++;
     }
     // Ownership is coherent now; only then publish the connected roster/chain.
@@ -4470,6 +4483,10 @@ void Net_SeatBots(int minPlayers, int skill)
     {
         initprintf("net: retained %d and seated %d CPU player(s), skill %d (mask %x)\n",
                    retained, seated, g_netBotSkill, (unsigned)g_netBotMask);
+        if (tdm && g_netForensics)
+            LOG_F(INFO, "[team] CPUs: p0=%d p1=%d p2=%d p3=%d mask=0x%x",
+                  g_player[0].pteam, g_player[1].pteam, g_player[2].pteam, g_player[3].pteam,
+                  (unsigned)g_netBotMask);
 #ifdef __EMSCRIPTEN__
         EM_ASM({ console.log('[bot] SeatBots: seated=' + $0 + ' np=' + $1 + ' mask=' + $2); },
                seated, numplayers, g_netBotMask);
@@ -4487,23 +4504,57 @@ void Net_SeatBots(int minPlayers, int skill)
 // Gated on GTFLAGS(GAMETYPE_LMS) at every call site, so DM/Coop/TDM are wholly
 // unaffected. "Eliminated" = the respawn is refused, so the player's death is
 // permanent for the round; the sprite stream carries that dead state to guests
-// exactly like any other death (no new wire fields). Guests never decide lives.
+// exactly like any other death. Guests never decide or spend lives.
 #define LMS_LIVES 3   // respawns per round; 0 left -> eliminated on next death
 int8_t  g_lmsLives[MAXPLAYERS];
 static int8_t  s_lmsInit;
 static int16_t s_lmsCooldown;   // tics to wait after a round reset before re-checking
-extern int32_t g_netForensics;  // (defined in game.cpp) — LMS forensics logging below
 
-void Net_LmsInit(void)
+// Explicit level/match boundary. G_EnterLevel calls this after ud.coop has been
+// committed from ud.m_coop and before the authoritative input timeline resumes.
+// Non-LMS entry clears every byte too: a later LMS match can never inherit lives
+// or cooldown from a prior match in the same process. The lazy init in the death
+// and tick paths remains only as a defensive fallback for unusual entry routes.
+void Net_LmsResetLevel(void)
 {
+    Bmemset(g_lmsLives, 0, sizeof(g_lmsLives));
+    s_lmsInit = 0;
+    s_lmsCooldown = 0;
+
+    if (!(g_gametypeFlags[ud.coop] & GAMETYPE_LMS))
+    {
+        if (g_netForensics)
+            LOG_F(INFO, "[lms] level reset: inactive (mode=%d)", ud.coop);
+        return;
+    }
+
     for (int i = 0; i < MAXPLAYERS; i++)
         g_lmsLives[i] = LMS_LIVES;
-    s_lmsInit    = 1;
-    s_lmsCooldown = 260;   // ~8s grace at match start so nobody "wins" before spawns settle
-#ifdef __EMSCRIPTEN__
+    s_lmsInit = 1;
+    s_lmsCooldown = 260;   // ~8s grace so nobody "wins" before spawns settle
     if (g_netForensics)
-        EM_ASM({ console.log('[lms] init lives=' + $0); }, LMS_LIVES);
+        LOG_F(INFO, "[lms] level reset: lives=%d cooldown=%d", LMS_LIVES, (int)s_lmsCooldown);
+}
+
+#ifdef NETNATIVE
+static int32_t Net_LmsTestRoundFromEnv(void)
+{
+    char const *value = getenv("NN_TESTLMSROUND");
+    return (value && *value) ? Batoi(value) : 0;
+}
+static int32_t s_lmsTestRound = Net_LmsTestRoundFromEnv();
 #endif
+
+static void Net_LmsInit(void)
+{
+    // Defensive fallback only. Normal matches were initialized explicitly by
+    // Net_LmsResetLevel at G_EnterLevel.
+    for (int i = 0; i < MAXPLAYERS; i++)
+        g_lmsLives[i] = LMS_LIVES;
+    s_lmsInit = 1;
+    s_lmsCooldown = 260;
+    if (g_netForensics)
+        LOG_F(INFO, "[lms] lazy fallback init: lives=%d", LMS_LIVES);
 }
 
 // Respawn gate (from VM_ResetPlayer). 1 = allow the respawn and spend a life;
@@ -4516,15 +4567,13 @@ int Net_LmsAllowRespawn(int playerNum)
         return 1;
     if (g_lmsLives[playerNum] <= 0)
     {
-#ifdef __EMSCRIPTEN__
-        if (g_netForensics) EM_ASM({ console.log('[lms] ELIMINATED p=' + $0); }, playerNum);
-#endif
+        if (g_netForensics)
+            LOG_F(INFO, "[lms] eliminated seat=%d", playerNum);
         return 0;
     }
     g_lmsLives[playerNum]--;
-#ifdef __EMSCRIPTEN__
-    if (g_netForensics) EM_ASM({ console.log('[lms] p=' + $0 + ' respawn, lives left=' + $1); }, playerNum, g_lmsLives[playerNum]);
-#endif
+    if (g_netForensics)
+        LOG_F(INFO, "[lms] respawn seat=%d lives=%d", playerNum, (int)g_lmsLives[playerNum]);
     return 1;
 }
 
@@ -4538,6 +4587,23 @@ void Net_LmsTick(void)
         return;
     if (!s_lmsInit) Net_LmsInit();   // first LMS tic of this match (browser is fresh each cycle)
     if (s_lmsCooldown > 0) { s_lmsCooldown--; return; }
+#ifdef NETNATIVE
+    // Focused native gate: once per process, after the normal opening cooldown,
+    // make seat 1 eliminated so the ordinary authoritative round-reset path
+    // must announce, resurrect, and telegram the owning guest. Default-off and
+    // RNG-free; production play never enters this block.
+    if (s_lmsTestRound > 0 && s_lmsTestRound < MAXPLAYERS && movefifoplc >= 300
+        && g_player[s_lmsTestRound].connected && g_player[s_lmsTestRound].ps != NULL)
+    {
+        auto const p = g_player[s_lmsTestRound].ps;
+        g_lmsLives[s_lmsTestRound] = 0;
+        p->dead_flag = 1;
+        if ((unsigned)p->i < MAXSPRITES)
+            sprite[p->i].extra = 0;
+        LOG_F(INFO, "[lms-test] eliminated seat=%d at tic=%d", s_lmsTestRound, movefifoplc);
+        s_lmsTestRound = 0;
+    }
+#endif
     int inRound = 0, last = -1, seats = 0;
     for (int i = 0; i < MAXPLAYERS; i++)
     {
@@ -4550,9 +4616,8 @@ void Net_LmsTick(void)
     }
     if (seats >= 2 && inRound <= 1)
     {
-#ifdef __EMSCRIPTEN__
-        if (g_netForensics) EM_ASM({ console.log('[lms] ROUND WIN p=' + $0 + ' seats=' + $1); }, last, seats);
-#endif
+        if (g_netForensics)
+            LOG_F(INFO, "[lms] round win seat=%d seats=%d", last, seats);
         if (last >= 0 && g_player[last].ps != NULL)
         {
             Bsnprintf(apStrings[QUOTE_RESERVED], MAXQUOTELEN, "%s WINS THE ROUND", g_player[last].user_name);
@@ -4565,8 +4630,23 @@ void Net_LmsTick(void)
                 continue;
             g_lmsLives[i] = LMS_LIVES;
             if ((unsigned)p->i < MAXSPRITES && (sprite[p->i].extra <= 0 || p->dead_flag))
-                P_ResetMultiPlayer(i);   // resurrect the eliminated for the new round
+                P_ResetMultiPlayer(i);
         }
+        // One explicit authoritative round command reaches every guest,
+        // including the owning guest. It carries all life counters and causes
+        // each receiver to resurrect its dead copies without consulting the
+        // life-spending gate. The generic seat-spawn telegram remains for
+        // ordinary respawns; LMS reset has its own idempotent lifecycle event.
+        uint8_t pk[2 + NET_TEAM_VECTOR_SIZE] = { PACKET_TYPE_LMS_ROUND_RESET,
+                                                 (uint8_t)(last + 1) };
+        for (int i = 0; i < NET_TEAM_VECTOR_SIZE; i++)
+            pk[2 + i] = (uint8_t)max<int>(g_lmsLives[i], 0);
+        int dest;
+        TRAVERSE_CONNECT(dest)
+            if (dest != myconnectindex && !(g_netBotMask & (1 << dest)))
+                oldnet_sendpacket(dest, pk, sizeof(pk));
+        if (g_netForensics)
+            LOG_F(INFO, "[lms] round reset broadcast winner=%d", last);
         s_lmsCooldown = 260;
     }
 }
@@ -5944,6 +6024,24 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                         break;
                     s_lastLaunchToken = launchToken;
                 }
+                // Extended transport packet: fixed 16-byte pteam vector follows
+                // the launch token. A legacy shorter sender stops at the token,
+                // so length-gate the complete vector and retain locally-known
+                // teams when it is absent. Apply before MODE_NEWGAME/premap so
+                // each seat's initial team palette/body agrees before tic zero.
+                {
+                    int team[NET_TEAM_VECTOR_SIZE];
+                    if (Net_DecodeTeamVector((uint8_t const *)&packbuf[j], packbufleng - j, team))
+                    {
+                        for (int32_t k = 0; k < MAXPLAYERS && k < NET_TEAM_VECTOR_SIZE; k++)
+                            g_player[k].pteam = team[k];
+                        j += NET_TEAM_VECTOR_SIZE;
+                    }
+                }
+                if (g_netForensics && (g_gametypeFlags[ud.m_coop] & GAMETYPE_TDM))
+                    LOG_F(INFO, "[team] NEW_GAME: p0=%d p1=%d p2=%d p3=%d",
+                          g_player[0].pteam, g_player[1].pteam,
+                          g_player[2].pteam, g_player[3].pteam);
                 // [NetDuke32 port] Upstream: G_NewGame(flags | NEWGAME_FROMSERVER).
                 // TODO(netcode): upstream NEWGAME_* flag nuances (NOSEND/RESETALL) are
                 // not modeled by this tree's G_NewGame. Low 16 bits stay reserved for
@@ -6320,6 +6418,38 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     g_netBarrierReadyMask = (uint32_t)B_UNBUF32(&packbuf[1]);
                 return;
             }
+            case PACKET_TYPE_LMS_ROUND_RESET:
+            {
+                // Explicit host-authoritative round boundary. Guests mirror the
+                // fixed life vector, announce the winner, and resurrect every
+                // connected dead body locally. No Net_LmsAllowRespawn call: this
+                // reset grants fresh lives and must never spend one independently.
+                if (packbufleng >= 2 + NET_TEAM_VECTOR_SIZE && other == connecthead
+                    && myconnectindex != connecthead
+                    && (g_gametypeFlags[ud.coop] & GAMETYPE_LMS))
+                {
+                    int const winner = (uint8_t)packbuf[1] - 1;
+                    for (int i = 0; i < MAXPLAYERS && i < NET_TEAM_VECTOR_SIZE; i++)
+                        g_lmsLives[i] = (int8_t)clamp((int32_t)(uint8_t)packbuf[2 + i], 0, LMS_LIVES);
+                    if ((unsigned)winner < MAXPLAYERS && g_player[winner].ps != NULL)
+                    {
+                        Bsnprintf(apStrings[QUOTE_RESERVED], MAXQUOTELEN, "%s WINS THE ROUND", g_player[winner].user_name);
+                        P_DoQuote(QUOTE_RESERVED, g_player[winner].ps);
+                    }
+                    for (int i = 0; i < MAXPLAYERS; i++)
+                    {
+                        auto const p = g_player[i].ps;
+                        if (!g_player[i].connected || p == NULL || (unsigned)p->i >= MAXSPRITES)
+                            continue;
+                        if (sprite[p->i].extra <= 0 || p->dead_flag)
+                            P_ResetMultiPlayer(i);
+                    }
+                    s_lmsInit = 1;
+                    s_lmsCooldown = 260;
+                    LOG_F(INFO, "[lms] authoritative round reset applied winner=%d", winner);
+                }
+                return;
+            }
             case PACKET_TYPE_SEAT_SPAWNED:
             {
                 // Host's "seat pk[1] just spawned" telegram (on-demand join
@@ -6335,7 +6465,10 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                     && myconnectindex != connecthead)
                 {
                     int const seat = packbuf[1];
-                    if ((unsigned)seat < MAXPLAYERS && seat != myconnectindex
+                    // Include the owning guest itself. Its local simulation may
+                    // have remained eliminated because only the host spends LMS
+                    // lives; the telegram is the authoritative resurrection.
+                    if ((unsigned)seat < MAXPLAYERS
                         && g_player[seat].ps != NULL
                         && (unsigned)g_player[seat].ps->i < MAXSPRITES)
                     {
@@ -10364,6 +10497,15 @@ void Net_SendNewGame(uint32_t flags)
     // Per-launch token: lets guests dedupe redeliveries (see the resend
     // machinery) -- a resend can never restart an already-entered level.
     packbuf[j++] = (char)++s_newGameToken;
+    // Fixed-width authoritative team vector. CPU seats cannot send PLAYER_OPTIONS,
+    // and human option packets may race launch, so NEW_GAME owns the complete
+    // pre-entry team state. Exactly 16 bytes keeps the extension deterministic;
+    // receivers accept legacy packets that end immediately after the token.
+    for (int32_t k = 0; k < NET_TEAM_VECTOR_SIZE; k++)
+    {
+        int32_t const team = (k < MAXPLAYERS) ? g_player[k].pteam : 0;
+        packbuf[j++] = (char)Net_ClampTeam(team);
+    }
 
     // Stash for redelivery to slow-booting guests (join_ok -> launch can beat
     // a real browser's engine boot; the missed packet = an empty world).
