@@ -232,6 +232,7 @@ void Net_SeatBots(int minPlayers, int skill); // host: retain/fill seats up to f
 int Net_TestSeatBotsRelaunch(void); // deterministic H01 characterization fixture
 #endif
 void Net_BotResetLevel(void);     // G_EnterLevel: clear all map-indexed bot state
+void Net_BotBuildNavigation(void); // deterministic level-time layered graph build
 void Net_LmsResetLevel(void);     // every G_EnterLevel: fresh LMS match state, or clear stale non-LMS state
 void Net_LmsTick(void);           // host authoritative LMS round manager
 int  Net_LmsAllowRespawn(int playerNum); // host spends LMS lives; guests never spend independently

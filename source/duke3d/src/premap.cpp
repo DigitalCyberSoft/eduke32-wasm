@@ -2400,6 +2400,7 @@ int G_EnterLevel(int gameMode)
     prelevel(gameMode);
 
     G_AlignWarpElevators();
+    Net_BotBuildNavigation();
     G_ResetAllPlayers();
     G_CollectSpawnPoints(gameMode);
 

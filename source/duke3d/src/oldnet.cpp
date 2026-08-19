@@ -11,6 +11,7 @@ static void Net_RebuildConnectChain(void);
 #include "net_transport.h"
 #include "net_phase2.h"
 #include "chatpipe.h"
+#include "timer.h"
 #include "demo.h"  // G_CloseDemoWrite (Net_CheckPlayerQuit)
 #include "savegame.h"  // late-join snapshot: sv_saveandmakesnapshot / G_LoadPlayer
 #if defined(NETNATIVE) && !defined(_WIN32)
@@ -789,7 +790,8 @@ static int8_t  s_botBreakFire[MAXPLAYERS];   // tics of blocker-clearing fire
 static int8_t  s_botStuckEpisodes[MAXPLAYERS]; // consecutive traps -> longer bounces
 static int16_t s_botNoHitTics[MAXPLAYERS];   // visible-but-unhittable streak (fence camping)
 static int32_t s_botLastTDist[MAXPLAYERS];   // pursuit progress: last distance to target
-static int32_t s_botNavX[MAXPLAYERS], s_botNavY[MAXPLAYERS];  // first portal midpoint
+static int32_t s_botNavX[MAXPLAYERS], s_botNavY[MAXPLAYERS], s_botNavZ[MAXPLAYERS];
+static int16_t s_botNavSect[MAXPLAYERS];      // routed combat destination layer
 static int8_t  s_botNavOn[MAXPLAYERS];
 // Latest route verdict for the CURRENT combat target. The verdict is refreshed
 // only by a real route query (think cadence), while failedTics advances once
@@ -807,61 +809,7 @@ static int16_t s_botTrapCool[MAXPLAYERS];    // volley cooldown while trapped
 static int16_t s_botTrapDir[MAXPLAYERS];     // last free-move heading (escape axis)
 static int8_t  s_botTrapRounds[MAXPLAYERS];  // completed escape ladders; 3+ = dormant
 
-// Sector-graph navigation: BFS over wall portals from the bot's sector to the
-// target's, return the FIRST portal's midpoint to steer at. Build maps are a
-// sector graph, and Duke's vertical routes (the E1L1 roof hole, stairwells)
-// are ordinary portal chains -- measured without this, min pairwise bot
-// distance sat pinned at ~6500 units for five straight minutes (fence-ringed
-// roof, no route found by blind homing): bots literally never met. Elevators/
-// teleports are unmodeled; the stuck->bounce machinery remains the backstop.
-static int Bot_NavFirstHop(int fromSect, int toSect, int32_t *px, int32_t *py)
-{
-    if (fromSect == toSect || (unsigned)fromSect >= (unsigned)numsectors
-        || (unsigned)toSect >= (unsigned)numsectors)
-        return 0;
-    static int16_t  parentSect[MAXSECTORS];
-    static int16_t  parentWall[MAXSECTORS];
-    static uint16_t seenGen[MAXSECTORS];
-    static uint16_t gen;
-    static int16_t  queue[MAXSECTORS];
-    if (++gen == 0) { Bmemset(seenGen, 0, sizeof(seenGen)); gen = 1; }
-    int qh = 0, qt = 0;
-    queue[qt++] = (int16_t)fromSect;
-    seenGen[fromSect]   = gen;
-    parentSect[fromSect] = -1;
-    int found = 0;
-    while (qh < qt)
-    {
-        int const s = queue[qh++];
-        if (s == toSect) { found = 1; break; }
-        int const wend = sector[s].wallptr + sector[s].wallnum;
-        for (int w = sector[s].wallptr; w < wend; w++)
-        {
-            int const ns = wall[w].nextsector;
-            // cstat&1 = clip-blocking: fences/rails are two-sided walls WITH a
-            // nextsector -- without this skip the BFS routed straight through
-            // the E1L1 rooftop chain-link and parked the "portal" ON the mesh
-            // (nav measured zero improvement; bots ground the fence at the
-            // exact midpoint the router chose).
-            if (ns < 0 || (unsigned)ns >= (unsigned)numsectors || seenGen[ns] == gen
-                || (wall[w].cstat & 1))
-                continue;
-            seenGen[ns]    = gen;
-            parentSect[ns] = (int16_t)s;
-            parentWall[ns] = (int16_t)w;
-            if (qt < MAXSECTORS) queue[qt++] = (int16_t)ns;
-        }
-    }
-    if (!found)
-        return 0;
-    int s = toSect;
-    while (parentSect[s] != fromSect && parentSect[s] >= 0)
-        s = parentSect[s];
-    int const w = parentWall[s];    // wall in fromSect crossing to the first hop
-    *px = (wall[w].x + wall[wall[w].point2].x) >> 1;
-    *py = (wall[w].y + wall[wall[w].point2].y) >> 1;
-    return 1;
-}
+// Layered graph navigation state is defined below after the walk probes.
 static int8_t  s_botOpenGrace[MAXPLAYERS];   // door-try: keep pushing before bouncing
 static uint8_t s_botBurst[MAXPLAYERS];       // fire cadence phase (24 on / 8 off)
 static int16_t s_botTargetHold[MAXPLAYERS];  // tics on the same target without a kill
@@ -877,7 +825,7 @@ static int16_t s_botTargetHold[MAXPLAYERS];  // tics on the same target without 
 // sectors; percolating stale-ward crosses them like rooms).
 static int32_t s_botVisitT[MAXPLAYERS][MAXSECTORS];
 static int8_t  s_botGoal[MAXPLAYERS];        // 0 none, 1 portal/waypoint, 2 item
-static int32_t s_botGoalX[MAXPLAYERS], s_botGoalY[MAXPLAYERS];
+static int32_t s_botGoalX[MAXPLAYERS], s_botGoalY[MAXPLAYERS], s_botGoalZ[MAXPLAYERS];
 static int16_t s_botGoalSect[MAXPLAYERS];    // sector the goal leads into (-1 = free waypoint)
 static int16_t s_botGoalTics[MAXPLAYERS];    // time spent on this errand
 static int8_t  s_botGoalDoor[MAXPLAYERS];    // portal is a door sector: press OPEN on approach
@@ -986,7 +934,7 @@ void Net_TestFragTick(void)
     actor[tgt].htowner  = (g_player[connecthead].ps != NULL) ? (int16_t)g_player[connecthead].ps->i : (int16_t)tgt;
     LOG_F(INFO, "[testfrag] armed lethal seat=%d spr=%d plc=%d", s_seat, tgt, (int)movefifoplc);
 }
-static int32_t s_botLtgX[MAXPLAYERS], s_botLtgY[MAXPLAYERS];
+static int32_t s_botLtgX[MAXPLAYERS], s_botLtgY[MAXPLAYERS], s_botLtgZ[MAXPLAYERS];
 static int16_t s_botLtgSect[MAXPLAYERS];     // target sector of the committed LTG
 static int8_t  s_botLtgKind[MAXPLAYERS];     // 0 none, 1 roam anchor, 2 item
 static int16_t s_botLtgItem[MAXPLAYERS];     // sprite index when kind==2
@@ -1044,6 +992,7 @@ static int8_t  s_botSeenValid[MAXPLAYERS];
 #define BOT_WSPOT_R 768                       // ~1.5 tiles
 static int32_t s_botWspotX[MAXPLAYERS][BOT_WSPOT_N];
 static int32_t s_botWspotY[MAXPLAYERS][BOT_WSPOT_N];
+static int16_t s_botWspotSect[MAXPLAYERS][BOT_WSPOT_N];
 static int32_t s_botWspotUntil[MAXPLAYERS][BOT_WSPOT_N];
 // Roam telemetry: distinct sectors entered this level, per seat ([roam]),
 // plus honesty meters -- tics spent effectively stationary (the wedge bill)
@@ -1152,72 +1101,79 @@ static int Bot_LineWalkable(DukePlayer_t *ps, int32_t tx, int32_t ty)
     return Bot_LineWalkFrom(ps->cursectnum, ps->pos.x, ps->pos.y, ps->pos.z, tx, ty);
 }
 
-// Floor-only climb check for nav-mesh edges (no wall ray -- Nvg_SegBlocked
-// handles walls). Walks (x0,y0)->(x1,y1) at ~64-unit resolution; every
-// step-up must be within the player's autostep, so a flight of STAIRS
-// connects the cells it spans while a wall/cliff does not.
-static int Bot_FineClimb(int16_t sect0, int32_t x0, int32_t y0, int32_t x1, int32_t y1)
-{
-    if ((unsigned)sect0 >= (unsigned)numsectors)
-        return 0;
-    int32_t const dx = x1 - x0, dy = y1 - y0;
-    int32_t const wd = klabs(dx) + klabs(dy);
-    if (wd < 32)
-        return 1;
-    int const steps = clamp((int)(wd >> 6), 1, 16);
-    int16_t cs = sect0;
-    int32_t lastF = getflorzofslope(cs, x0, y0);
-    for (int i = 1; i <= steps; i++)
-    {
-        int32_t const sx = x0 + (int32_t)(((int64_t)dx * i) / steps);
-        int32_t const sy = y0 + (int32_t)(((int64_t)dy * i) / steps);
-        updatesector(sx, sy, &cs);
-        if (cs < 0)
-            return 0;
-        int32_t const f = getflorzofslope(cs, sx, sy);
-        if (lastF - f > (20 << 8))
-            return 0;
-        lastF = f;
-    }
-    return 1;
-}
+// ── Bounded sparse layered navigation graph ─────────────────────────────────
+// Integration note: oldnet implementations that add their own bot reset/lifecycle
+// contract must clear the route/goal/last-seen/wedge fields declared around this
+// graph; this phase deliberately does not implement lifecycle policy.
+// XY cells are only a deterministic spatial index.  A walkable floor is a node
+// keyed by (cell, sector), so overlapping Build sectors never collapse into the
+// single z-blind tile that updatesector() happened to choose.  Nodes carry the
+// sampled layer explicitly and edges are directed: climbing and dropping have
+// different reachability rules.
+#define NVG_TILE       512
+#define NVG_MAXW       288
+#define NVG_MAXH       288
+#define NVG_MAXCELLS   (NVG_MAXW * NVG_MAXH)
+#define NVG_MAXNODES   16384
+#define NVG_MAXARCS    (NVG_MAXNODES * 8)
+#define NVG_INVALID    UINT32_MAX
+#define NVG_F_DOOR     1u
+#define NVG_F_CRAWL    2u
+#define NVG_MAX_ROUTE  64
 
-// ── OpenArena-style navigation, take two: FLOOR COVERAGE, not a skeleton
-// (user: "you built a 2d graph that doesn't follow the room properly").
-// Q3's AAS covers every walkable square of floor with convex areas; the
-// portal-midpoint graph only knew doorways, so rooms had no interior and
-// bots could not RUN AROUND them. Build-engine equivalent: a walkable grid
-// of 512-unit tiles (convex cells) spanning the map -- per-tile sector +
-// floor data, per-DIRECTION step gates, and build-time wall-crossing tests
-// so every 4-neighbor move is wall-free BY CONSTRUCTION. Door sectors stay
-// walkable (they open) and are flagged so the follower presses OPEN.
-// Sprites (furniture) are deliberately ignored -- clipmove slides around
-// them and the reactive lane layer threads the fields.
-#define NVG_TILE 512
-#define NVG_MAXW 288
-#define NVG_MAXH 288
-#define NVG_MAX  (NVG_MAXW * NVG_MAXH)
-static int32_t s_nvgMinX, s_nvgMinY;
-static int     s_nvgW, s_nvgH;
-static int32_t s_nvgStamp = -1;
-static int16_t s_nvgSect[NVG_MAX];      // containing sector, -1 = unwalkable
-static uint8_t s_nvgPass[NVG_MAX];      // dir bits out of this tile: 1 +x, 2 -x, 4 +y, 8 -y
-static uint8_t s_nvgFlagT[NVG_MAX];     // 1 = door-sector tile
-static uint8_t s_nvgCrawl[NVG_MAX];     // 1 = crawl-height tile (vent/duct)
+struct NvgNode
+{
+    int32_t floorZ, ceilZ;
+    uint32_t firstArc;
+    int32_t cell;
+    int16_t sector;
+    uint8_t flags;
+};
+struct NvgArc { uint32_t to, next; };
+
+static int32_t  s_nvgMinX, s_nvgMinY;
+static int      s_nvgW, s_nvgH;
+static int32_t  s_nvgStamp = -1;
+static uint32_t s_nvgNodeCount, s_nvgArcCount;
+static int      s_nvgReady;
+static int32_t  s_nvgCellHead[NVG_MAXCELLS];
+static int32_t  s_nvgCellNext[NVG_MAXNODES];
+static NvgNode  s_nvgNode[NVG_MAXNODES];
+static NvgArc   s_nvgArc[NVG_MAXARCS];
+static uint32_t s_nvgSectorFirst[MAXSECTORS];
+static uint32_t s_nvgSectorCount[MAXSECTORS];
 
 static inline int32_t Nvg_CX(int tx) { return s_nvgMinX + tx * NVG_TILE + NVG_TILE / 2; }
 static inline int32_t Nvg_CY(int ty) { return s_nvgMinY + ty * NVG_TILE + NVG_TILE / 2; }
+static inline int32_t Nvg_NodeX(uint32_t node)
+{
+    return Nvg_CX(s_nvgNode[node].cell % s_nvgW);
+}
+static inline int32_t Nvg_NodeY(uint32_t node)
+{
+    return Nvg_CY(s_nvgNode[node].cell / s_nvgW);
+}
 static inline int Nvg_TileOf(int32_t x, int32_t y)
 {
-    int const tx = (int)((x - s_nvgMinX) / NVG_TILE);
-    int const ty = (int)((y - s_nvgMinY) / NVG_TILE);
-    if (tx < 0 || ty < 0 || tx >= s_nvgW || ty >= s_nvgH)
+    int64_t const rx = (int64_t)x - s_nvgMinX, ry = (int64_t)y - s_nvgMinY;
+    if (rx < 0 || ry < 0)
         return -1;
-    return ty * s_nvgW + tx;
+    int64_t const tx = rx / NVG_TILE, ty = ry / NVG_TILE;
+    if (tx >= s_nvgW || ty >= s_nvgH)
+        return -1;
+    return (int)(ty * s_nvgW + tx);
 }
 
 // Does segment (x1,y1)-(x2,y2) cross a WALKING-blocking wall of sector s?
-// (one-sided walls and cstat&1 two-sided walls block; open portals do not.)
+// Endpoint contact remains blocking.  If both orientation pairs are zero the
+// segments are collinear, and closed overlap is required on BOTH projections:
+// a wall elsewhere on the same infinite line must not block this edge.
+static int Nvg_ClosedIntervalsOverlap(int32_t a1, int32_t a2,
+                                      int32_t b1, int32_t b2)
+{
+    return max(min(a1, a2), min(b1, b2)) <= min(max(a1, a2), max(b1, b2));
+}
+
 static int Nvg_SegBlocked(int s, int32_t x1, int32_t y1, int32_t x2, int32_t y2)
 {
     int const wend = sector[s].wallptr + sector[s].wallnum;
@@ -1235,103 +1191,387 @@ static int Nvg_SegBlocked(int s, int32_t x1, int32_t y1, int32_t x2, int32_t y2)
         int64_t const d4 = (int64_t)(x2 - x1) * (by - y1) - (int64_t)(y2 - y1) * (bx - x1);
         if ((d3 > 0 && d4 > 0) || (d3 < 0 && d4 < 0))
             continue;
+        if (d1 == 0 && d2 == 0 && d3 == 0 && d4 == 0)
+        {
+            bool const xOverlap = Nvg_ClosedIntervalsOverlap(ax, bx, x1, x2);
+            bool const yOverlap = Nvg_ClosedIntervalsOverlap(ay, by, y1, y2);
+            if (!xOverlap || !yOverlap)
+                continue;
+        }
         return 1;
     }
     return 0;
 }
 
+#if defined(NETNATIVE)
+extern "C" int Net_TestNavCollinear(int32_t x1, int32_t y1, int32_t x2, int32_t y2,
+                                    int32_t ax, int32_t ay, int32_t bx, int32_t by)
+{
+    int64_t const d1 = (int64_t)(bx - ax) * (y1 - ay) - (int64_t)(by - ay) * (x1 - ax);
+    int64_t const d2 = (int64_t)(bx - ax) * (y2 - ay) - (int64_t)(by - ay) * (x2 - ax);
+    int64_t const d3 = (int64_t)(x2 - x1) * (ay - y1) - (int64_t)(y2 - y1) * (ax - x1);
+    int64_t const d4 = (int64_t)(x2 - x1) * (by - y1) - (int64_t)(y2 - y1) * (bx - x1);
+    if (d1 || d2 || d3 || d4)
+        return -1;
+    return Nvg_ClosedIntervalsOverlap(ax, bx, x1, x2)
+        && Nvg_ClosedIntervalsOverlap(ay, by, y1, y2);
+}
+#endif
+
+static int Nvg_AddArc(uint32_t from, uint32_t to)
+{
+    for (uint32_t a = s_nvgNode[from].firstArc; a != NVG_INVALID; a = s_nvgArc[a].next)
+        if (s_nvgArc[a].to == to)
+            return 1;
+    if (s_nvgArcCount >= NVG_MAXARCS)
+        return 0;
+    s_nvgArc[s_nvgArcCount].to   = to;
+    s_nvgArc[s_nvgArcCount].next = s_nvgNode[from].firstArc;
+    s_nvgNode[from].firstArc     = s_nvgArcCount++;
+    return 1;
+}
+
+static int Nvg_SectorPortalNear(int fromSector, int toSector,
+                                int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+{
+    int const wend = sector[fromSector].wallptr + sector[fromSector].wallnum;
+    for (int w = sector[fromSector].wallptr; w < wend; ++w)
+    {
+        if (wall[w].nextsector != toSector || (wall[w].cstat & 1))
+            continue;
+        int32_t const mx = (wall[w].x + wall[wall[w].point2].x) >> 1;
+        int32_t const my = (wall[w].y + wall[wall[w].point2].y) >> 1;
+        if (klabs(mx - ((x0 + x1) >> 1)) + klabs(my - ((y0 + y1) >> 1)) <= NVG_TILE)
+            return 1;
+    }
+    return 0;
+}
+
+// Fine climb that never asks updatesector() to choose a layer.  Same-sector
+// samples stay in that sector.  A portal edge changes sectors at the actual
+// shared wall intersection, so overlapping polygons cannot switch early just
+// because inside() is true in both layers.
+static int Nvg_PortalFraction(int16_t fromSector, int16_t toSector,
+                              int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                              int64_t *numOut, int64_t *denOut)
+{
+    int64_t bestNum = INT64_MAX, bestDen = 1;
+    int const wend = sector[fromSector].wallptr + sector[fromSector].wallnum;
+    int64_t const rx = (int64_t)x1 - x0, ry = (int64_t)y1 - y0;
+    for (int w = sector[fromSector].wallptr; w < wend; ++w)
+    {
+        if (wall[w].nextsector != toSector || (wall[w].cstat & 1))
+            continue;
+        int64_t const qx = wall[w].x, qy = wall[w].y;
+        int64_t const sx = (int64_t)wall[wall[w].point2].x - qx;
+        int64_t const sy = (int64_t)wall[wall[w].point2].y - qy;
+        int64_t den = rx * sy - ry * sx;
+        if (den == 0)
+            continue;
+        int64_t num = (qx - x0) * sy - (qy - y0) * sx;
+        int64_t unum = (qx - x0) * ry - (qy - y0) * rx;
+        if (den < 0) { den = -den; num = -num; unum = -unum; }
+        if (num < 0 || num > den || unum < 0 || unum > den)
+            continue;
+        if (bestNum == INT64_MAX || num * bestDen < bestNum * den)
+            { bestNum = num; bestDen = den; }
+    }
+    if (bestNum == INT64_MAX)
+        return 0;
+    *numOut = bestNum; *denOut = bestDen;
+    return 1;
+}
+
+static int Nvg_FineClimbLayered(int16_t fromSector, int16_t toSector,
+                                int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+{
+    int32_t const dx = x1 - x0, dy = y1 - y0;
+    int32_t const wd = klabs(dx) + klabs(dy);
+    if (wd < 32)
+        return 1;
+    int64_t portalNum = 0, portalDen = 1;
+    if (fromSector != toSector
+        && !Nvg_PortalFraction(fromSector, toSector, x0, y0, x1, y1, &portalNum, &portalDen))
+        return 0;
+    int const steps = clamp((int)(wd >> 6), 1, 16);
+    int32_t lastF = getflorzofslope(fromSector, x0, y0);
+    for (int i = 1; i <= steps; ++i)
+    {
+        int32_t const sx = x0 + (int32_t)(((int64_t)dx * i) / steps);
+        int32_t const sy = y0 + (int32_t)(((int64_t)dy * i) / steps);
+        int16_t const cur = (fromSector == toSector || (int64_t)i * portalDen < portalNum * steps)
+                            ? fromSector : toSector;
+        if (inside(sx, sy, cur) != 1)
+            return 0;
+        int32_t const f = getflorzofslope(cur, sx, sy);
+        int32_t const c = getceilzofslope(cur, sx, sy);
+        if (!Bot_SectorIsDoor(cur) && f - c < (26 << 8))
+            return 0;
+        if (lastF - f > (20 << 8))
+            return 0;
+        lastF = f;
+    }
+    return 1;
+}
+
+static int Nvg_AddDirectedIfWalkable(uint32_t from, uint32_t to)
+{
+    NvgNode const &a = s_nvgNode[from];
+    NvgNode const &b = s_nvgNode[to];
+    int32_t const ax = Nvg_NodeX(from), ay = Nvg_NodeY(from);
+    int32_t const bx = Nvg_NodeX(to),   by = Nvg_NodeY(to);
+    if (a.sector != b.sector
+        && !Nvg_SectorPortalNear(a.sector, b.sector, ax, ay, bx, by))
+        return 1;                       // stacked floors are not portals
+    if (a.sector != b.sector && !(a.flags & NVG_F_DOOR) && !(b.flags & NVG_F_DOOR))
+    {
+        // The vertical intersection of the two explicit sectors at the real
+        // portal must fit a body.  Center-only floor tests miss closed/shallow
+        // portals when either side slopes.
+        int32_t const mx = (ax + bx) >> 1, my = (ay + by) >> 1;
+        int32_t const af = getflorzofslope(a.sector, mx, my);
+        int32_t const bf = getflorzofslope(b.sector, mx, my);
+        int32_t const ac = getceilzofslope(a.sector, mx, my);
+        int32_t const bc = getceilzofslope(b.sector, mx, my);
+        if (min(af, bf) - max(ac, bc) < (26 << 8))
+            return 1;
+    }
+    if (Nvg_SegBlocked(a.sector, ax, ay, bx, by))
+        return 1;
+    if (a.sector != b.sector && Nvg_SegBlocked(b.sector, ax, ay, bx, by))
+        return 1;
+    // Destination must fit a standing player unless it is an intentional crawl
+    // node or a door (doors can be closed while the graph is built).
+    if (!(b.flags & (NVG_F_DOOR | NVG_F_CRAWL)) && b.floorZ - b.ceilZ < (72 << 8))
+        return 1;
+    int32_t const rise = a.floorZ - b.floorZ;  // z grows down: positive is up
+    if (rise > (20 << 8)
+        && (rise > (200 << 8)
+            || !Nvg_FineClimbLayered(a.sector, b.sector, ax, ay, bx, by)))
+        return 1;
+    return Nvg_AddArc(from, to);
+}
+
+static void Nvg_Disable(const char *why, int64_t a, int64_t b)
+{
+    s_nvgReady = 0;
+    s_nvgW = s_nvgH = 0;
+    s_nvgNodeCount = s_nvgArcCount = 0;
+    LOG_F(ERROR, "nav: disabled (%s: %" PRId64 ", %" PRId64 ")", why, a, b);
+}
+
 static void Bot_NavBuild(void)
 {
+    uint64_t const buildStart = timerGetPerformanceCounter();
+    s_nvgReady = 0;
+    s_nvgNodeCount = s_nvgArcCount = 0;
     int32_t minx = INT32_MAX, miny = INT32_MAX, maxx = INT32_MIN, maxy = INT32_MIN;
-    for (int w = 0; w < numwalls; w++)
+    for (int w = 0; w < numwalls; ++w)
     {
-        // cast through the struct-tracker wrapper: gcc won't deduce min/max over
-        // (int32_t, WallTracker<int>); emcc's clang does. Explicit int keeps both.
         minx = min(minx, (int32_t)wall[w].x); maxx = max(maxx, (int32_t)wall[w].x);
         miny = min(miny, (int32_t)wall[w].y); maxy = max(maxy, (int32_t)wall[w].y);
     }
     if (minx > maxx)
-        { s_nvgW = s_nvgH = 0; return; }
-    s_nvgMinX = minx - NVG_TILE; s_nvgMinY = miny - NVG_TILE;
-    s_nvgW = min((int)((maxx - s_nvgMinX) / NVG_TILE) + 2, NVG_MAXW);
-    s_nvgH = min((int)((maxy - s_nvgMinY) / NVG_TILE) + 2, NVG_MAXH);
-    int const total = s_nvgW * s_nvgH;
-    int walkable = 0;
-    int16_t seed = 0;
-    for (int t = 0; t < total; t++)
+        { Nvg_Disable("empty map", 0, 0); return; }
+
+    int64_t const rawBaseX = (int64_t)minx - NVG_TILE;
+    int64_t const rawBaseY = (int64_t)miny - NVG_TILE;
+    int64_t const baseX = (rawBaseX / NVG_TILE) * NVG_TILE;
+    int64_t const baseY = (rawBaseY / NVG_TILE) * NVG_TILE;
+    int64_t const width = ((int64_t)maxx - baseX) / NVG_TILE + 2;
+    int64_t const height = ((int64_t)maxy - baseY) / NVG_TILE + 2;
+    if (baseX < INT32_MIN || baseX > INT32_MAX || baseY < INT32_MIN || baseY > INT32_MAX
+        || width <= 0 || height <= 0 || width > NVG_MAXW || height > NVG_MAXH
+        || width > NVG_MAXCELLS / height)
     {
-        s_nvgSect[t] = -1; s_nvgPass[t] = 0; s_nvgFlagT[t] = 0; s_nvgCrawl[t] = 0;
-        int32_t const cx = Nvg_CX(t % s_nvgW), cy = Nvg_CY(t / s_nvgW);
-        int16_t cs = seed;
-        updatesector(cx, cy, &cs);
-        if (cs < 0)
-            continue;
-        seed = cs;
-        int const isDoor = Bot_SectorIsDoor(cs);
-        if (!isDoor)
-        {
-            int32_t const gap = getflorzofslope(cs, cx, cy) - getceilzofslope(cs, cx, cy);
-            if (gap < (26 << 8))
-                continue;                       // sealed / crush space
-            // Crawl-height tile: WALKABLE (ducking works) but flagged --
-            // the seat-scoped router refuses to route a march INTO ducts
-            // (leave-only, mirroring the wedge-spot rule). E1L1's vent
-            // system is a conveyor that presses a crawling bot into its
-            // sealed grate, the codebase's oldest documented hard trap;
-            // cross-map routing was happily tunneling marches through it
-            // as a shortcut. Bound 72 = the jetpack block's crawl-space
-            // definition: everything below it needs the duck reflex to
-            // move at all (measured pins in clr=60 and clr=68 pockets).
-            s_nvgCrawl[t] = (gap < (72 << 8));
-        }
-        s_nvgSect[t] = cs;
-        s_nvgFlagT[t] = (uint8_t)isDoor;
-        walkable++;
+        Nvg_Disable("grid dimensions", width, height);
+        return;
     }
-    // Directional adjacency: step gate + wall-crossing test per neighbor.
-    for (int ty = 0; ty < s_nvgH; ty++)
+    s_nvgMinX = (int32_t)baseX; s_nvgMinY = (int32_t)baseY;
+    s_nvgW = (int)width; s_nvgH = (int)height;
+    int const total = s_nvgW * s_nvgH;
+    for (int c = 0; c < total; ++c)
+        s_nvgCellHead[c] = -1;
+
+    // Deterministic node IDs: sector order, then cell row-major within the
+    // sector's bounds.  No carried updatesector seed can make the chosen layer
+    // depend on the prior tile.
+    for (int s = 0; s < numsectors; ++s)
     {
-        for (int tx = 0; tx < s_nvgW; tx++)
+        s_nvgSectorFirst[s] = s_nvgNodeCount;
+        int32_t sminx = INT32_MAX, sminy = INT32_MAX, smaxx = INT32_MIN, smaxy = INT32_MIN;
+        int const wend = sector[s].wallptr + sector[s].wallnum;
+        for (int w = sector[s].wallptr; w < wend; ++w)
         {
-            int const t = ty * s_nvgW + tx;
-            if (s_nvgSect[t] < 0)
+            sminx = min(sminx, (int32_t)wall[w].x); smaxx = max(smaxx, (int32_t)wall[w].x);
+            sminy = min(sminy, (int32_t)wall[w].y); smaxy = max(smaxy, (int32_t)wall[w].y);
+        }
+        int const tx0 = clamp((int)(((int64_t)sminx - s_nvgMinX - NVG_TILE / 2 + NVG_TILE - 1) / NVG_TILE), 0, s_nvgW - 1);
+        int const ty0 = clamp((int)(((int64_t)sminy - s_nvgMinY - NVG_TILE / 2 + NVG_TILE - 1) / NVG_TILE), 0, s_nvgH - 1);
+        int const tx1 = clamp((int)(((int64_t)smaxx - s_nvgMinX - NVG_TILE / 2) / NVG_TILE), 0, s_nvgW - 1);
+        int const ty1 = clamp((int)(((int64_t)smaxy - s_nvgMinY - NVG_TILE / 2) / NVG_TILE), 0, s_nvgH - 1);
+        for (int ty = ty0; ty <= ty1; ++ty)
+        for (int tx = tx0; tx <= tx1; ++tx)
+        {
+            int const cell = ty * s_nvgW + tx;
+            int32_t const x = Nvg_CX(tx), y = Nvg_CY(ty);
+            if (inside(x, y, (int16_t)s) != 1)
                 continue;
-            int32_t const cx = Nvg_CX(tx), cy = Nvg_CY(ty);
-            int32_t const fA = getflorzofslope(s_nvgSect[t], cx, cy);
-            static int const dx4[2] = { 1, 0 };
-            static int const dy4[2] = { 0, 1 };
-            for (int d = 0; d < 2; d++)         // +x and +y; mirrors set the reverse
+            int const isDoor = Bot_SectorIsDoor(s);
+            int32_t const floorZ = getflorzofslope((int16_t)s, x, y);
+            int32_t const ceilZ  = getceilzofslope((int16_t)s, x, y);
+            int32_t const gap = floorZ - ceilZ;
+            if (!isDoor && gap < (26 << 8))
+                continue;
+            if (s_nvgNodeCount >= NVG_MAXNODES)
+                { Nvg_Disable("node capacity", s_nvgNodeCount + 1, NVG_MAXNODES); return; }
+            uint32_t const n = s_nvgNodeCount++;
+            s_nvgNode[n].floorZ  = floorZ;
+            s_nvgNode[n].ceilZ   = ceilZ;
+            s_nvgNode[n].firstArc = NVG_INVALID;
+            s_nvgNode[n].cell    = cell;
+            s_nvgNode[n].sector  = (int16_t)s;
+            s_nvgNode[n].flags   = (uint8_t)((isDoor ? NVG_F_DOOR : 0)
+                                             | (!isDoor && gap < (72 << 8) ? NVG_F_CRAWL : 0));
+            s_nvgCellNext[n]     = s_nvgCellHead[cell];
+            s_nvgCellHead[cell]  = (int32_t)n;
+        }
+        s_nvgSectorCount[s] = s_nvgNodeCount - s_nvgSectorFirst[s];
+    }
+
+    // Same-layer cell edges plus declared portal transitions only.  Trying every
+    // node pair in adjacent cells is bounded (E1 cells have very few layers) and
+    // avoids an auxiliary dense per-layer array.
+    static int const dx2[2] = { 1, 0 };
+    static int const dy2[2] = { 0, 1 };
+    for (int ty = 0; ty < s_nvgH; ++ty)
+    for (int tx = 0; tx < s_nvgW; ++tx)
+    {
+        int const cell = ty * s_nvgW + tx;
+        for (int d = 0; d < 2; ++d)
+        {
+            int const nx = tx + dx2[d], ny = ty + dy2[d];
+            if (nx >= s_nvgW || ny >= s_nvgH)
+                continue;
+            int const otherCell = ny * s_nvgW + nx;
+            for (int32_t ai = s_nvgCellHead[cell]; ai >= 0; ai = s_nvgCellNext[ai])
+            for (int32_t bi = s_nvgCellHead[otherCell]; bi >= 0; bi = s_nvgCellNext[bi])
             {
-                int const nx = tx + dx4[d], ny = ty + dy4[d];
-                if (nx >= s_nvgW || ny >= s_nvgH)
+                if (s_nvgNode[ai].sector != s_nvgNode[bi].sector
+                    && !Nvg_SectorPortalNear(s_nvgNode[ai].sector, s_nvgNode[bi].sector,
+                                             Nvg_NodeX(ai), Nvg_NodeY(ai), Nvg_NodeX(bi), Nvg_NodeY(bi))
+                    && !Nvg_SectorPortalNear(s_nvgNode[bi].sector, s_nvgNode[ai].sector,
+                                             Nvg_NodeX(bi), Nvg_NodeY(bi), Nvg_NodeX(ai), Nvg_NodeY(ai)))
                     continue;
-                int const u = ny * s_nvgW + nx;
-                if (s_nvgSect[u] < 0)
-                    continue;
-                int32_t const ux = Nvg_CX(nx), uy = Nvg_CY(ny);
-                if (Nvg_SegBlocked(s_nvgSect[t], cx, cy, ux, uy))
-                    continue;
-                if (s_nvgSect[u] != s_nvgSect[t]
-                    && Nvg_SegBlocked(s_nvgSect[u], cx, cy, ux, uy))
-                    continue;
-                int32_t const fB = getflorzofslope(s_nvgSect[u], ux, uy);
-                // z grows down: climbing means destination floor SMALLER. A
-                // single step within autostep connects trivially; a larger
-                // rise is only passable if it is a STAIRCASE -- Bot_FineClimb
-                // walks it at ~64-unit resolution and each step must be within
-                // autostep (so a flight of stairs connects, a wall does not).
-                int32_t const riseAB = fA - fB, riseBA = fB - fA;
-                if (riseAB <= (20 << 8)
-                    || (riseAB <= (200 << 8) && Bot_FineClimb(s_nvgSect[t], cx, cy, ux, uy)))
-                    s_nvgPass[t] |= (uint8_t)(d == 0 ? 1 : 4);      // t -> u
-                if (riseBA <= (20 << 8)
-                    || (riseBA <= (200 << 8) && Bot_FineClimb(s_nvgSect[u], ux, uy, cx, cy)))
-                    s_nvgPass[u] |= (uint8_t)(d == 0 ? 2 : 8);      // u -> t
+                if (!Nvg_AddDirectedIfWalkable((uint32_t)ai, (uint32_t)bi)
+                    || !Nvg_AddDirectedIfWalkable((uint32_t)bi, (uint32_t)ai))
+                {
+                    Nvg_Disable("arc capacity", s_nvgArcCount + 1, NVG_MAXARCS);
+                    return;
+                }
             }
         }
     }
-    EM_ASM({ console.log('[nav] grid ' + $0 + 'x' + $1 + ' walkable=' + $2 + ' of ' + $3); },
-           s_nvgW, s_nvgH, walkable, total);
+    // Cell centers can straddle a narrow Build sector: a real portal can
+    // sit between centers whose containing sectors are A and C, leaving no
+    // center in the thin B stair/door sector.  Add an explicit directed reach
+    // for every declared portal wall, anchored at that wall's midpoint and the
+    // nearest node in each sector.  These are still ordinary node arcs and use
+    // explicit floor/ceiling/autostep gates; they cannot connect stacked sectors
+    // because only wall.nextsector pairs are considered.
+    for (int s = 0; s < numsectors; ++s)
+    {
+        int const wend = sector[s].wallptr + sector[s].wallnum;
+        for (int w = sector[s].wallptr; w < wend; ++w)
+        {
+            int const ns = wall[w].nextsector;
+            if (ns < 0 || (wall[w].cstat & 1))
+                continue;
+            int32_t const mx = (wall[w].x + wall[wall[w].point2].x) >> 1;
+            int32_t const my = (wall[w].y + wall[wall[w].point2].y) >> 1;
+            uint32_t a = NVG_INVALID, b = NVG_INVALID;
+            int64_t ad = INT64_MAX, bd = INT64_MAX;
+            for (uint32_t n = s_nvgSectorFirst[s]; n < s_nvgSectorFirst[s] + s_nvgSectorCount[s]; ++n)
+            {
+                int64_t const d = klabs(Nvg_NodeX(n) - mx) + klabs(Nvg_NodeY(n) - my);
+                if (d < ad || (d == ad && n < a)) { ad = d; a = n; }
+            }
+            for (uint32_t n = s_nvgSectorFirst[ns]; n < s_nvgSectorFirst[ns] + s_nvgSectorCount[ns]; ++n)
+            {
+                int64_t const d = klabs(Nvg_NodeX(n) - mx) + klabs(Nvg_NodeY(n) - my);
+                if (d < bd || (d == bd && n < b)) { bd = d; b = n; }
+            }
+            // No long teleports: each anchor must still be near this portal.
+            if (a == NVG_INVALID || b == NVG_INVALID || ad > NVG_TILE * 2 || bd > NVG_TILE * 2)
+                continue;
+            int32_t const af = getflorzofslope(s, mx, my);
+            int32_t const bf = getflorzofslope((int16_t)ns, mx, my);
+            int32_t const ac = getceilzofslope(s, mx, my);
+            int32_t const bc = getceilzofslope((int16_t)ns, mx, my);
+            if (!Bot_SectorIsDoor(s) && !Bot_SectorIsDoor(ns)
+                && min(af, bf) - max(ac, bc) < (26 << 8))
+                continue;
+            int32_t const rise = af - bf;
+            if (rise > (20 << 8))
+                continue;
+            if (!Nvg_AddArc(a, b))
+            {
+                Nvg_Disable("portal arc capacity", s, ns);
+                return;
+            }
+        }
+    }
+
+    for (uint32_t n = 0; n < s_nvgNodeCount; ++n)
+    {
+        if ((unsigned)s_nvgNode[n].cell >= (unsigned)total
+            || (unsigned)s_nvgNode[n].sector >= (unsigned)numsectors)
+        {
+            Nvg_Disable("node audit", n, s_nvgNode[n].cell);
+            return;
+        }
+        for (int32_t u = s_nvgCellNext[n]; u >= 0; u = s_nvgCellNext[u])
+            if (s_nvgNode[u].sector == s_nvgNode[n].sector)
+            {
+                Nvg_Disable("duplicate node", n, u);
+                return;
+            }
+        for (uint32_t a = s_nvgNode[n].firstArc; a != NVG_INVALID; a = s_nvgArc[a].next)
+        {
+            if (a >= s_nvgArcCount)
+            {
+                Nvg_Disable("arc index audit", a, s_nvgArcCount);
+                return;
+            }
+            if (s_nvgArc[a].to >= s_nvgNodeCount)
+            {
+                Nvg_Disable("arc target audit", a, s_nvgArc[a].to);
+                return;
+            }
+            for (uint32_t b = s_nvgArc[a].next; b != NVG_INVALID; b = s_nvgArc[b].next)
+            {
+                if (b >= s_nvgArcCount)
+                {
+                    Nvg_Disable("arc link audit", b, s_nvgArcCount);
+                    return;
+                }
+                if (s_nvgArc[b].to == s_nvgArc[a].to)
+                {
+                    Nvg_Disable("duplicate arc", n, s_nvgArc[a].to);
+                    return;
+                }
+            }
+        }
+    }
+    s_nvgReady = 1;
+    uint64_t const elapsedUsec = (timerGetPerformanceCounter() - buildStart) * 1000000u
+                               / timerGetPerformanceFrequency();
+    LOG_F(INFO, "nav: layered grid %dx%d nodes=%u arcs=%u audit=ok build=%" PRIu64 "us mem=%u",
+          s_nvgW, s_nvgH, (unsigned)s_nvgNodeCount, (unsigned)s_nvgArcCount,
+          elapsedUsec, (unsigned)(sizeof(s_nvgCellHead) + sizeof(s_nvgCellNext)
+                                  + sizeof(s_nvgSectorFirst) + sizeof(s_nvgSectorCount)
+                                  + sizeof(s_nvgNode) + sizeof(s_nvgArc)
+                                  + NVG_MAXNODES * (sizeof(uint16_t) + 3 * sizeof(uint32_t))));
 }
 
 static void Bot_NavEnsure(void)
@@ -1345,180 +1585,204 @@ static void Bot_NavEnsure(void)
     }
 }
 
-// Nearest walkable tile to a point (spiral out to radius 2): items sit on
-// tables, players straddle tile edges -- snap to the mesh like AAS does.
-static int Nvg_Snap(int32_t x, int32_t y)
+void Net_BotBuildNavigation(void)
 {
-    int const t = Nvg_TileOf(x, y);
-    if (t >= 0 && s_nvgSect[t] >= 0)
-        return t;
-    int const tx = t < 0 ? -1 : t % s_nvgW, ty = t < 0 ? -1 : t / s_nvgW;
-    if (tx < 0)
-        return -1;
-    for (int r = 1; r <= 2; r++)
-        for (int oy = -r; oy <= r; oy++)
-            for (int ox = -r; ox <= r; ox++)
-            {
-                if (klabs(ox) != r && klabs(oy) != r)
-                    continue;
-                int const nx = tx + ox, ny = ty + oy;
-                if (nx < 0 || ny < 0 || nx >= s_nvgW || ny >= s_nvgH)
-                    continue;
-                if (s_nvgSect[ny * s_nvgW + nx] >= 0)
-                    return ny * s_nvgW + nx;
-            }
-    return -1;
+    // Called after the pristine board and slopes are loaded.  Every peer builds
+    // the same graph, but only the host bot brain consumes it; no simulation RNG
+    // is read and no world state is mutated.  Build unconditionally here: the
+    // cheap runtime stamp is only a fallback, and two different maps can share
+    // its wall/sector counts and first-wall checksum.
+    s_nvgStamp = (int32_t)numwalls ^ ((int32_t)numsectors << 16)
+               ^ (numwalls > 0 ? wall[0].x + wall[0].y : 0);
+    Bot_NavBuild();
 }
 
-// BFS scratch shared by the point-to-point router and the LTG flood pass
-// below (host thread only, never concurrent) -- duplicating the ~500KB of
-// static queue/seen arrays per caller would be pure waste.
-static uint16_t s_nvgBfsSeen[NVG_MAX];
-static uint8_t  s_nvgBfsParent[NVG_MAX];
-static int32_t  s_nvgBfsQueue[NVG_MAX];
-static uint16_t s_nvgBfsGen = 0;
-// Avoid-reach hook INTO the router (defined with its ring below): OpenArena
-// consults avoidreach while CHOOSING reachabilities (BotGetReachabilityToGoal,
-// be_ai_move.c:765), not merely at plan level -- so a crossing that keeps
-// failing gets ROUTED AROUND (the E1L1 auditorium chair field: the mesh is
-// sprite-blind, the straight route through the chairs grinds, and without
-// this hook every re-path chose the same doomed line).
-static int Bot_AvoidEdgeActive(int k, int from, int to);
-static int Bot_NearWedgeSpot(int k, int32_t x, int32_t y);
-static int Bot_SegNearWedgeSpot(int k, int32_t x0, int32_t y0, int32_t x1, int32_t y1);
-
-// BFS over the grid. Rolling horizon: cap stored waypoints; repath when the
-// window empties. parentDir packs the reconstruction into one byte per tile.
-// `k` scopes the per-seat avoid-reach ring; pass -1 for edge-blind routing.
-static int Bot_NvgPath(int k, int fromTile, int destTile, int16_t *outTx, int16_t *outTy, int maxOut)
+// Snap to a node without crossing layers.  Exact declared sector outranks all
+// other candidates; then require z compatibility with the sampled ceiling/floor,
+// rank XY distance, and use stable node ID as the final tiebreak.  A valid
+// declared sector never falls through to an overlapping sector.
+static uint32_t Nvg_Snap(int32_t x, int32_t y, int32_t z, int16_t declaredSector)
 {
-    uint16_t *const seenGen   = s_nvgBfsSeen;
-    uint8_t  *const parentDir = s_nvgBfsParent;
-    int32_t  *const queue     = s_nvgBfsQueue;
-    uint16_t       &gen       = s_nvgBfsGen;
-    if (fromTile < 0 || destTile < 0)
-        return 0;
-    if (++gen == 0) { Bmemset(seenGen, 0, sizeof(s_nvgBfsSeen)); gen = 1; }
-    int qh = 0, qt = 0;
-    queue[qt++] = fromTile;
-    seenGen[fromTile] = gen;
-    parentDir[fromTile] = 255;
-    int found = -1;
-    static int const stepdx[4] = { 1, -1, 0, 0 };
-    static int const stepdy[4] = { 0, 0, 1, -1 };
-    while (qh < qt)
+    if (!s_nvgReady)
+        return NVG_INVALID;
+    int const cell = Nvg_TileOf(x, y);
+    if (cell < 0)
+        return NVG_INVALID;
+    int const tx = cell % s_nvgW, ty = cell / s_nvgW;
+    bool const haveDeclared = (unsigned)declaredSector < (unsigned)numsectors;
+    uint32_t best = NVG_INVALID;
+    int64_t bestXY = INT64_MAX;
+    int32_t bestZ = INT32_MAX, bestExact = 2;
+    for (int r = 0; r <= 2; ++r)
+    for (int oy = -r; oy <= r; ++oy)
+    for (int ox = -r; ox <= r; ++ox)
     {
-        int const t = queue[qh++];
-        if (t == destTile) { found = t; break; }
-        int const tx = t % s_nvgW, ty = t / s_nvgW;
-        for (int d = 0; d < 4; d++)
+        if (r && klabs(ox) != r && klabs(oy) != r)
+            continue;
+        int const nx = tx + ox, ny = ty + oy;
+        if (nx < 0 || ny < 0 || nx >= s_nvgW || ny >= s_nvgH)
+            continue;
+        for (int32_t ni = s_nvgCellHead[ny * s_nvgW + nx]; ni >= 0; ni = s_nvgCellNext[ni])
         {
-            if (!(s_nvgPass[t] & (1 << d)))
+            NvgNode const &n = s_nvgNode[ni];
+            int const exact = haveDeclared && n.sector == declaredSector ? 0 : 1;
+            // A valid declared sector is a hard layer boundary.  Only an invalid
+            // declaration (off-map/free point) may rank sectors by z instead.
+            if (haveDeclared && exact != 0)
                 continue;
-            int const u = (ty + stepdy[d]) * s_nvgW + (tx + stepdx[d]);
-            if (seenGen[u] == gen)
+            // Duke positions are body/eye z rather than foot z.  Rank by the
+            // nearest vertically compatible floor band: a normal body lives
+            // within about 72 pixels above its declared sector's floor.  This
+            // distinguishes overlapping floors even though both z values lie
+            // inside a very tall lower sector volume.
+            int32_t const aboveFloor = n.floorZ - z;
+            int32_t zmiss = 0;
+            if (aboveFloor < -(8 << 8)) zmiss = -aboveFloor;
+            else if (aboveFloor > (96 << 8)) zmiss = aboveFloor - (96 << 8);
+            if (z < n.ceilZ - (8 << 8) || zmiss > (72 << 8))
                 continue;
-            if (k >= 0 && s_nvgSect[u] != s_nvgSect[t]
-                && Bot_AvoidEdgeActive(k, s_nvgSect[t], s_nvgSect[u]))
-                continue;               // dead crossing: route around it
-            if (k >= 0 && s_nvgCrawl[u] && !s_nvgCrawl[t])
-                continue;               // duct: leave-only, never route IN
-            if (k >= 0
-                && Bot_NearWedgeSpot(k, Nvg_CX(u % s_nvgW), Nvg_CY(u / s_nvgW))
-                && !Bot_NearWedgeSpot(k, Nvg_CX(tx), Nvg_CY(ty)))
-                continue;               // wedge pocket: leave-only, never enter
-            seenGen[u] = gen;
-            parentDir[u] = (uint8_t)d;
-            queue[qt++] = u;
+            int64_t const ddx = (int64_t)Nvg_CX(nx) - x;
+            int64_t const ddy = (int64_t)Nvg_CY(ny) - y;
+            int64_t const xy = ddx * ddx + ddy * ddy;
+            if (exact < bestExact || (exact == bestExact
+                && (zmiss < bestZ || (zmiss == bestZ && (xy < bestXY
+                || (xy == bestXY && (uint32_t)ni < best))))))
+            {
+                best = (uint32_t)ni; bestExact = exact; bestZ = zmiss; bestXY = xy;
+            }
         }
     }
-    if (found < 0)
+    return best;
+}
+
+#if defined(NETNATIVE)
+extern "C" int Net_TestNavSnap(int32_t x, int32_t y, int32_t z, int16_t sectorNum)
+{
+    Bot_NavEnsure();
+    uint32_t const n = Nvg_Snap(x, y, z, sectorNum);
+    return n == NVG_INVALID ? -1 : (int)n;
+}
+#endif
+
+static uint16_t s_nvgBfsSeen[NVG_MAXNODES];
+static uint32_t s_nvgBfsParent[NVG_MAXNODES];
+static uint32_t s_nvgBfsQueue[NVG_MAXNODES];
+static uint32_t s_nvgBfsRev[NVG_MAXNODES];
+static uint16_t s_nvgBfsGen;
+static int Bot_AvoidEdgeActive(int k, int from, int to);
+static int Bot_NearWedgeSpot(int k, int32_t x, int32_t y, int16_t sectorNum);
+static int Bot_SegNearWedgeSpot(int k, int32_t x0, int32_t y0, int16_t sect0,
+                               int32_t x1, int32_t y1, int16_t sect1);
+
+static int Bot_NvgPath(int k, uint32_t fromNode, uint32_t destNode,
+                       uint32_t *outNode, int maxOut)
+{
+    if (!s_nvgReady || fromNode >= s_nvgNodeCount || destNode >= s_nvgNodeCount || maxOut <= 0)
         return 0;
-    // Walk back to start, then emit the FIRST maxOut hops in forward order.
-    static int16_t revx[NVG_MAX / 8], revy[NVG_MAX / 8];
-    int rn = 0;
-    for (int t = found; parentDir[t] != 255 && rn < NVG_MAX / 8; )
+    if (++s_nvgBfsGen == 0) { Bmemset(s_nvgBfsSeen, 0, sizeof(s_nvgBfsSeen)); s_nvgBfsGen = 1; }
+    int qh = 0, qt = 0;
+    s_nvgBfsQueue[qt++] = fromNode;
+    s_nvgBfsSeen[fromNode] = s_nvgBfsGen;
+    s_nvgBfsParent[fromNode] = NVG_INVALID;
+    uint32_t found = NVG_INVALID;
+    while (qh < qt)
     {
-        revx[rn] = (int16_t)(t % s_nvgW); revy[rn] = (int16_t)(t / s_nvgW); rn++;
-        int const d = parentDir[t];
-        t -= stepdy[d] * s_nvgW + stepdx[d];
+        uint32_t const n = s_nvgBfsQueue[qh++];
+        if (n == destNode) { found = n; break; }
+        for (uint32_t a = s_nvgNode[n].firstArc; a != NVG_INVALID; a = s_nvgArc[a].next)
+        {
+            uint32_t const u = s_nvgArc[a].to;
+            if (s_nvgBfsSeen[u] == s_nvgBfsGen)
+                continue;
+            if (k >= 0 && s_nvgNode[u].sector != s_nvgNode[n].sector
+                && Bot_AvoidEdgeActive(k, s_nvgNode[n].sector, s_nvgNode[u].sector))
+                continue;
+            if (k >= 0 && (s_nvgNode[u].flags & NVG_F_CRAWL)
+                && !(s_nvgNode[n].flags & NVG_F_CRAWL))
+                continue;
+            if (k >= 0
+                && Bot_NearWedgeSpot(k, Nvg_NodeX(u), Nvg_NodeY(u), s_nvgNode[u].sector)
+                && !Bot_NearWedgeSpot(k, Nvg_NodeX(n), Nvg_NodeY(n), s_nvgNode[n].sector))
+                continue;
+            s_nvgBfsSeen[u] = s_nvgBfsGen;
+            s_nvgBfsParent[u] = n;
+            s_nvgBfsQueue[qt++] = u;
+        }
     }
+    if (found == NVG_INVALID)
+        return 0;
+    int rn = 0;
+    for (uint32_t n = found; s_nvgBfsParent[n] != NVG_INVALID; n = s_nvgBfsParent[n])
+        s_nvgBfsRev[rn++] = n;            // full reconstruction: no truncation
     int cnt = 0;
-    for (int i = rn - 1; i >= 0 && cnt < maxOut; i--)
-        { outTx[cnt] = revx[i]; outTy[cnt] = revy[i]; cnt++; }
+    for (int i = rn - 1; i >= 0 && cnt < maxOut; --i)
+        outNode[cnt++] = s_nvgBfsRev[i];
     return cnt;
 }
 
-// ── LTG travel-cost pass: ONE flood prices every candidate on the map ───────
-// OA prices each LTG candidate with AAS_AreaTravelTimeToGoalArea
-// (be_ai_goal.c:1372) against a precompiled all-pairs routing cache; our
-// Bot_NvgPath is strictly point-to-point, so instead of N point queries this
-// runs a single destination-less BFS from the bot's tile and records, for
-// every SECTOR, the depth (in tiles) and identity of the first -- nearest --
-// walkable tile inside it. Same worst-case cost as ONE full point-to-point
-// call, prices ALL candidates, and runs at most once per LTG re-plan per
-// seat (~every 15-20s). The recorded tile doubles as a guaranteed-on-mesh
-// goal point for roam anchors (a concave sector's centroid can land outside
-// the sector; the flood tile cannot).
-static int16_t s_ltgSectDist[MAXSECTORS];   // tiles from the bot; -1 unreachable
-static int32_t s_ltgSectTile[MAXSECTORS];   // nearest walkable tile in the sector
-static int Bot_NvgFloodSectDist(int k, int fromTile)
+#if defined(NETNATIVE)
+extern "C" int Net_TestNavPath(int fromNode, int toNode)
 {
-    if (fromTile < 0 || s_nvgW <= 0)
+    static uint32_t path[NVG_MAX_ROUTE];
+    return Bot_NvgPath(-1, (uint32_t)fromNode, (uint32_t)toNode, path, ARRAY_SIZE(path));
+}
+#endif
+
+static int16_t  s_ltgSectDist[MAXSECTORS];
+static uint32_t s_ltgSectNode[MAXSECTORS];
+static int Bot_NvgFloodSectDist(int k, uint32_t fromNode)
+{
+    if (!s_nvgReady || fromNode >= s_nvgNodeCount)
         return 0;
-    for (int s = 0; s < numsectors; s++)
-        { s_ltgSectDist[s] = -1; s_ltgSectTile[s] = -1; }
+    for (int s = 0; s < numsectors; ++s)
+        { s_ltgSectDist[s] = -1; s_ltgSectNode[s] = NVG_INVALID; }
     if (++s_nvgBfsGen == 0) { Bmemset(s_nvgBfsSeen, 0, sizeof(s_nvgBfsSeen)); s_nvgBfsGen = 1; }
     int qh = 0, qt = 0, depth = 0, found = 0;
-    s_nvgBfsQueue[qt++] = fromTile;
-    s_nvgBfsSeen[fromTile] = s_nvgBfsGen;
-    static int const stepdx[4] = { 1, -1, 0, 0 };
-    static int const stepdy[4] = { 0, 0, 1, -1 };
+    s_nvgBfsQueue[qt++] = fromNode;
+    s_nvgBfsSeen[fromNode] = s_nvgBfsGen;
     while (qh < qt)
     {
-        int const levelEnd = qt;                // frontier == one BFS depth
-        for (; qh < levelEnd; qh++)
+        int const levelEnd = qt;
+        for (; qh < levelEnd; ++qh)
         {
-            int const t   = s_nvgBfsQueue[qh];
-            int const sct = s_nvgSect[t];
-            if ((unsigned)sct < (unsigned)numsectors && s_ltgSectDist[sct] < 0)
+            uint32_t const n = s_nvgBfsQueue[qh];
+            int const sct = s_nvgNode[n].sector;
+            if (s_ltgSectDist[sct] < 0)
             {
                 s_ltgSectDist[sct] = (int16_t)min(depth, 32000);
-                s_ltgSectTile[sct] = t;
-                found++;
+                s_ltgSectNode[sct] = n;
+                ++found;
             }
-            int const tx = t % s_nvgW, ty = t / s_nvgW;
-            for (int d = 0; d < 4; d++)
+            for (uint32_t a = s_nvgNode[n].firstArc; a != NVG_INVALID; a = s_nvgArc[a].next)
             {
-                if (!(s_nvgPass[t] & (1 << d)))
-                    continue;
-                int const u = (ty + stepdy[d]) * s_nvgW + (tx + stepdx[d]);
+                uint32_t const u = s_nvgArc[a].to;
                 if (s_nvgBfsSeen[u] == s_nvgBfsGen)
                     continue;
-                if (k >= 0 && s_nvgSect[u] != sct
-                    && Bot_AvoidEdgeActive(k, sct, s_nvgSect[u]))
-                    continue;           // price candidates over ROUTABLE ground
-                if (k >= 0 && s_nvgCrawl[u] && !s_nvgCrawl[t])
-                    continue;           // duct: priced as unroutable inward
+                if (k >= 0 && s_nvgNode[u].sector != sct
+                    && Bot_AvoidEdgeActive(k, sct, s_nvgNode[u].sector))
+                    continue;
+                if (k >= 0 && (s_nvgNode[u].flags & NVG_F_CRAWL)
+                    && !(s_nvgNode[n].flags & NVG_F_CRAWL))
+                    continue;
                 if (k >= 0
-                    && Bot_NearWedgeSpot(k, Nvg_CX(u % s_nvgW), Nvg_CY(u / s_nvgW))
-                    && !Bot_NearWedgeSpot(k, Nvg_CX(tx), Nvg_CY(ty)))
-                    continue;           // wedge pocket: priced as unroutable
+                    && Bot_NearWedgeSpot(k, Nvg_NodeX(u), Nvg_NodeY(u), s_nvgNode[u].sector)
+                    && !Bot_NearWedgeSpot(k, Nvg_NodeX(n), Nvg_NodeY(n), s_nvgNode[n].sector))
+                    continue;
                 s_nvgBfsSeen[u] = s_nvgBfsGen;
                 s_nvgBfsQueue[qt++] = u;
             }
         }
-        depth++;
+        ++depth;
     }
     return found;
 }
 
-// Per-bot route follower state.
-static int16_t s_botRtX[MAXPLAYERS][32], s_botRtY[MAXPLAYERS][32];
-static int8_t  s_botRouteLen[MAXPLAYERS], s_botRouteIdx[MAXPLAYERS];
-static int32_t s_botRouteDX[MAXPLAYERS], s_botRouteDY[MAXPLAYERS];
-static int16_t s_botRouteCool[MAXPLAYERS];
-static int8_t  s_botWpDoor[MAXPLAYERS];      // upcoming waypoint is a door tile
+static uint32_t s_botRtNode[MAXPLAYERS][NVG_MAX_ROUTE];
+static int8_t   s_botRouteLen[MAXPLAYERS], s_botRouteIdx[MAXPLAYERS];
+static int32_t  s_botRouteDX[MAXPLAYERS], s_botRouteDY[MAXPLAYERS], s_botRouteDZ[MAXPLAYERS];
+static int16_t  s_botRouteDSect[MAXPLAYERS];
+static int16_t  s_botRouteCool[MAXPLAYERS];
+static int8_t   s_botWpDoor[MAXPLAYERS];
 
 // Central lifecycle contract. BODY is every state bit owned by one physical
 // incarnation/seat use; LEVEL additionally clears all identities, coordinates,
@@ -1589,6 +1853,8 @@ static void Bot_ResetSeat(int k, BotResetScope scope)
     // Goal, navigation, route and reachability verdict state.
     s_botNavX[k]         = 0;
     s_botNavY[k]         = 0;
+    s_botNavZ[k]         = 0;
+    s_botNavSect[k]      = -1;
     s_botNavOn[k]        = 0;
     s_botNavSeen[k]      = 0;
     s_botRouteFail[k]    = {};
@@ -1597,6 +1863,7 @@ static void Bot_ResetSeat(int k, BotResetScope scope)
     s_botGoal[k]         = 0;
     s_botGoalX[k]        = 0;
     s_botGoalY[k]        = 0;
+    s_botGoalZ[k]        = 0;
     s_botGoalSect[k]     = -1;
     s_botGoalTics[k]     = 0;
     s_botGoalDoor[k]     = 0;
@@ -1610,10 +1877,12 @@ static void Bot_ResetSeat(int k, BotResetScope scope)
     s_botRouteIdx[k]     = 0;
     s_botRouteDX[k]      = 0;
     s_botRouteDY[k]      = 0;
+    s_botRouteDZ[k]      = 0;
+    s_botRouteDSect[k]   = -1;
     s_botRouteCool[k]    = 0;
     s_botWpDoor[k]       = 0;
-    Bmemset(s_botRtX[k], 0, sizeof(s_botRtX[k]));
-    Bmemset(s_botRtY[k], 0, sizeof(s_botRtY[k]));
+    for (int i = 0; i < NVG_MAX_ROUTE; i++)
+        s_botRtNode[k][i] = NVG_INVALID;
 
     // Jet navigation is body-transient. Activation counters are level telemetry.
     s_botJetHold[k]      = 0;
@@ -1645,12 +1914,14 @@ static void Bot_ResetSeat(int k, BotResetScope scope)
     {
         s_botWspotX[k][i]     = 0;
         s_botWspotY[k][i]     = 0;
+        s_botWspotSect[k][i]  = -1;
         s_botWspotUntil[k][i] = 0;
     }
     s_botPrevSect[k]     = -1;
     s_botItemShun[k]     = -1;
     s_botLtgX[k]         = 0;
     s_botLtgY[k]         = 0;
+    s_botLtgZ[k]         = 0;
     s_botLtgSect[k]      = -1;
     s_botLtgKind[k]      = 0;
     s_botLtgItem[k]      = -1;
@@ -1677,10 +1948,8 @@ void Net_BotResetLevel(void)
     for (int k = 0; k < MAXPLAYERS; k++)
         Bot_ResetSeat(k, BOT_RESET_LEVEL);
 
-    // Force reconstruction from the freshly-loaded board and clear scratch
-    // identities that otherwise retain old sector/tile indices across maps.
-    s_nvgStamp = -1;
-    s_nvgW = s_nvgH = 0;
+    // The graph itself is rebuilt unconditionally by Net_BotBuildNavigation at
+    // level entry. Clear only scratch identities that can survive between calls.
     s_nvgBfsGen = 0;
     Bmemset(s_nvgBfsSeen, 0, sizeof(s_nvgBfsSeen));
     Bmemset(s_nvgBfsParent, 0, sizeof(s_nvgBfsParent));
@@ -1688,7 +1957,7 @@ void Net_BotResetLevel(void)
     for (int s = 0; s < MAXSECTORS; s++)
     {
         s_ltgSectDist[s] = -1;
-        s_ltgSectTile[s] = -1;
+        s_ltgSectNode[s] = NVG_INVALID;
     }
     s_botSepPlc = -1;
 }
@@ -1761,123 +2030,185 @@ static void Bot_SetCombatRouteResult(int k, int kind, int target, bool success)
     BotRouteStoreResult(s_botRouteFail[k], kind, target, success);
 }
 
-// Does the straight walk cross a crawl-height (duct) tile? Bot_LineWalkable
+// Does the straight walk cross a crawl-height (duct) node? Bot_LineWalkable
 // is deliberately CEILING-blind, so the straight-shot legs could tunnel a
-// march into the vent system the router now refuses -- same bypass the
-// wedge spots needed closing. Endpoints inside ducts are exempt (leaving,
-// or a genuine duct goal, is allowed; blind ENTRY is not).
-static int Bot_SegCrossesCrawl(int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+// march into the vent system the layered router refuses. Endpoints inside
+// ducts are exempt: leaving or a genuine duct goal is allowed; blind entry is not.
+static int Bot_SegCrossesCrawl(int32_t x0, int32_t y0, int32_t z0, int16_t sect0,
+                               int32_t x1, int32_t y1, int32_t z1, int16_t sect1)
 {
-    if (s_nvgW <= 0)
+    if (!s_nvgReady)
         return 0;
-    int const t1 = Nvg_TileOf(x1, y1);
-    if (t1 >= 0 && s_nvgCrawl[t1])
-        return 0;                       // goal itself is duct: caller's call
-    int const t0 = Nvg_TileOf(x0, y0);
-    int32_t const dx = x1 - x0, dy = y1 - y0;
+    uint32_t const end = Nvg_Snap(x1, y1, z1, sect1);
+    if (end != NVG_INVALID && (s_nvgNode[end].flags & NVG_F_CRAWL))
+        return 0;
+    int32_t const dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
     int const steps = clamp((int)((klabs(dx) + klabs(dy)) >> 8), 1, 64);
-    for (int s2 = 1; s2 < steps; s2++)
+    for (int i = 1; i < steps; ++i)
     {
-        int const t = Nvg_TileOf(x0 + (int32_t)(((int64_t)dx * s2) / steps),
-                                 y0 + (int32_t)(((int64_t)dy * s2) / steps));
-        if (t >= 0 && t != t0 && s_nvgCrawl[t])
+        int16_t declared = sect0;
+        if (sect0 != sect1 && (unsigned)sect1 < (unsigned)numsectors && i * 2 >= steps)
+            declared = sect1;
+        uint32_t const n = Nvg_Snap(x0 + (int32_t)(((int64_t)dx * i) / steps),
+                                    y0 + (int32_t)(((int64_t)dy * i) / steps),
+                                    z0 + (int32_t)(((int64_t)dz * i) / steps), declared);
+        if (n != NVG_INVALID && (s_nvgNode[n].flags & NVG_F_CRAWL))
             return 1;
     }
     return 0;
 }
 
-// Resolve a destination to the CURRENT steering waypoint over the floor
-// grid. String-pulled: aim at the FARTHEST stored waypoint the feet can walk
-// straight to, so tile chains become natural diagonal runs across the room
-// instead of Manhattan stair-steps. Falls back to the raw point off-mesh.
-// Returns 1 when the waypoint is MESH-GUIDED (straight shot or an on-route
-// tile): guided steering goes DIRECT every tic -- mesh legs are walkable by
-// construction, and any blocked-line fallback layered on top just injects
-// frozen-heading runaways (live report: "the walking is still wrong").
-// Returns 0 only when off-mesh (no route found): caller keeps the old
-// blocked-line crutch for that raw fallback alone.
-static int Bot_Waypoint(int k, DukePlayer_t *ps, int32_t dx2, int32_t dy2,
-                        int16_t dsect, int32_t *wx, int32_t *wy)
+static int Nvg_LineWalkSameSector(DukePlayer_t *ps, int32_t x1, int32_t y1, int16_t sectorNum)
 {
-    (void)dsect;
-    *wx = dx2; *wy = dy2;
+    if (ps->cursectnum != sectorNum)
+        return 0;
+    if (Nvg_SegBlocked(sectorNum, ps->pos.x, ps->pos.y, x1, y1))
+        return 0;
+    return Nvg_FineClimbLayered(sectorNum, sectorNum, ps->pos.x, ps->pos.y, x1, y1);
+}
+
+static int Bot_Waypoint(int k, DukePlayer_t *ps, int32_t dx2, int32_t dy2, int32_t dz2,
+                        int16_t dsect, int32_t *wx, int32_t *wy, int32_t *wz, int16_t *wsect)
+{
+    *wx = dx2; *wy = dy2; *wz = dz2; *wsect = dsect;
     s_botWpDoor[k] = 0;
     Bot_NavEnsure();
-    if (s_nvgW <= 0)
+    if (!s_nvgReady)
         return 0;
-    if (Bot_LineWalkable(ps, dx2, dy2)
-        && !Bot_SegNearWedgeSpot(k, ps->pos.x, ps->pos.y, dx2, dy2)
-        && !Bot_SegCrossesCrawl(ps->pos.x, ps->pos.y, dx2, dy2))
-    { s_botRouteLen[k] = 0; return 1; }         // straight shot IS mesh-guided
-                                                // (unless it grazes a stamped
-                                                // wedge pocket or tunnels a
-                                                // duct: mesh-route then)
+    if (Nvg_LineWalkSameSector(ps, dx2, dy2, dsect)
+        && !Bot_SegNearWedgeSpot(k, ps->pos.x, ps->pos.y, ps->cursectnum,
+                                 dx2, dy2, dsect)
+        && !Bot_SegCrossesCrawl(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
+                                dx2, dy2, dz2, dsect))
+    { s_botRouteLen[k] = 0; return 1; }
     if (s_botRouteCool[k] > 0)
-        s_botRouteCool[k]--;
-    int const moved = klabs(s_botRouteDX[k] - dx2) + klabs(s_botRouteDY[k] - dy2);
-    int needPath = (s_botRouteIdx[k] >= s_botRouteLen[k]) || (moved > 1024);
+        --s_botRouteCool[k];
+    int const moved = klabs(s_botRouteDX[k] - dx2) + klabs(s_botRouteDY[k] - dy2)
+                    + (klabs(s_botRouteDZ[k] - dz2) >> 4);
+    int const needPath = s_botRouteIdx[k] >= s_botRouteLen[k] || moved > 1024
+                       || s_botRouteDSect[k] != dsect;
     if (needPath && s_botRouteCool[k] == 0)
     {
-        int const from = Nvg_Snap(ps->pos.x, ps->pos.y);
-        int const dest = Nvg_Snap(dx2, dy2);
-        s_botRouteLen[k]  = (int8_t)Bot_NvgPath(k, from, dest, s_botRtX[k], s_botRtY[k], 32);
-        s_botRouteIdx[k]  = 0;
-        s_botRouteDX[k]   = dx2; s_botRouteDY[k] = dy2;
-        s_botRouteCool[k] = 26;                 // repath at most once a second
+        uint32_t const from = Nvg_Snap(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum);
+        uint32_t const dest = Nvg_Snap(dx2, dy2, dz2, dsect);
+        s_botRouteLen[k] = (int8_t)Bot_NvgPath(k, from, dest, s_botRtNode[k], NVG_MAX_ROUTE);
+        s_botRouteIdx[k] = 0;
+        s_botRouteDX[k] = dx2; s_botRouteDY[k] = dy2; s_botRouteDZ[k] = dz2;
+        s_botRouteDSect[k] = dsect;
+        s_botRouteCool[k] = 26;
     }
-    if (s_botRouteLen[k] == 0)
+    if (s_botRouteLen[k] <= 0)
         return 0;
-    // Advance past REACHED waypoints only -- arrival is the sole consumer.
+
     while (s_botRouteIdx[k] < s_botRouteLen[k])
     {
-        int32_t const tx = Nvg_CX(s_botRtX[k][s_botRouteIdx[k]]);
-        int32_t const ty = Nvg_CY(s_botRtY[k][s_botRouteIdx[k]]);
-        if (klabs(tx - ps->pos.x) + klabs(ty - ps->pos.y) < 400)
-            s_botRouteIdx[k]++;
+        uint32_t const n = s_botRtNode[k][s_botRouteIdx[k]];
+        if (n >= s_nvgNodeCount) { s_botRouteLen[k] = 0; return 0; }
+        int32_t const dist = klabs(Nvg_NodeX(n) - ps->pos.x) + klabs(Nvg_NodeY(n) - ps->pos.y);
+        bool const door = (s_nvgNode[n].flags & NVG_F_DOOR) != 0;
+        // A door node is consumed only after entering its declared sector and
+        // reaching the threshold.  The old generic <400 test spent it from the
+        // approach side and immediately repathed/string-pulled into the jamb.
+        if ((!door && dist < 400) || (door && ps->cursectnum == s_nvgNode[n].sector && dist < 128))
+            ++s_botRouteIdx[k];
         else
             break;
     }
     if (s_botRouteIdx[k] >= s_botRouteLen[k])
-        return 0;                               // window spent: next call repaths
-    // String pull AIMS at the farthest clean waypoint but never consumes it:
-    // committing the peek threw away the fallback chain the moment a peeked
-    // line broke, and the follower face-planted into raw-goal steering.
+        return 0;
+
     int pick = s_botRouteIdx[k];
-    for (int a = 1; a <= 6; a++)
+    uint32_t const current = s_botRtNode[k][pick];
+    // If routeIdx itself is a door, keep it as the waypoint.  Otherwise extend
+    // only to the first future door and never beyond it.
+    if (!(s_nvgNode[current].flags & NVG_F_DOOR))
+    for (int ahead = 1; ahead <= 6; ++ahead)
     {
-        int const i2 = s_botRouteIdx[k] + a;
-        if (i2 >= s_botRouteLen[k])
+        int const i = s_botRouteIdx[k] + ahead;
+        if (i >= s_botRouteLen[k])
             break;
-        int32_t const i2x   = Nvg_CX(s_botRtX[k][i2]);
-        int32_t const i2y   = Nvg_CY(s_botRtY[k][i2]);
-        bool const    i2Door = s_nvgFlagT[s_botRtY[k][i2] * s_nvgW + s_botRtX[k][i2]] != 0;
-        if (Bot_LineWalkable(ps, i2x, i2y)
-            && !Bot_SegNearWedgeSpot(k, ps->pos.x, ps->pos.y, i2x, i2y)
-            && !Bot_SegCrossesCrawl(ps->pos.x, ps->pos.y, i2x, i2y))
-            pick = i2;
-        // Never string-pull PAST a door tile: a straight line to a waypoint
-        // BEYOND the opening clips the door frame beside it, so the bot drives
-        // into the wall next to the door ("trying to pass through a door to the
-        // side of it, not through the entry", live 2026-08-18). A door tile's
-        // centre sits inside the door sector = on the threshold, so aim AT it
-        // and pass through head-on; the far side repaths once the bot is
-        // through. `pick` is already the door tile if the straight shot to it
-        // was clean, else the last clear waypoint before it -- the bot
-        // approaches and the door becomes a clean straight shot as it nears,
-        // so it is never aimed through the frame. Stop extending at the door.
-        if (i2Door)
+        uint32_t const n = s_botRtNode[k][i];
+        if (n >= s_nvgNodeCount)
+            { s_botRouteLen[k] = 0; return 0; }
+        int32_t const nx = Nvg_NodeX(n), ny = Nvg_NodeY(n);
+        bool const door = (s_nvgNode[n].flags & NVG_F_DOOR) != 0;
+        if (s_nvgNode[n].sector == ps->cursectnum
+            && Nvg_LineWalkSameSector(ps, nx, ny, s_nvgNode[n].sector)
+            && !Bot_SegNearWedgeSpot(k, ps->pos.x, ps->pos.y, ps->cursectnum,
+                                     nx, ny, s_nvgNode[n].sector)
+            && !Bot_SegCrossesCrawl(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
+                                    nx, ny, s_nvgNode[n].floorZ, s_nvgNode[n].sector))
+            pick = i;
+        if (door)
             break;
     }
-    *wx = Nvg_CX(s_botRtX[k][pick]);
-    *wy = Nvg_CY(s_botRtY[k][pick]);
-    s_botWpDoor[k] = 0;
-    for (int a = s_botRouteIdx[k]; a <= pick + 2 && a < s_botRouteLen[k]; a++)
+    uint32_t const picked = s_botRtNode[k][pick];
+    *wx = Nvg_NodeX(picked); *wy = Nvg_NodeY(picked);
+    *wz = s_nvgNode[picked].floorZ; *wsect = s_nvgNode[picked].sector;
+    for (int i = s_botRouteIdx[k]; i < s_botRouteLen[k]; ++i)
     {
-        if (s_nvgFlagT[s_botRtY[k][a] * s_nvgW + s_botRtX[k][a]])
+        uint32_t const n = s_botRtNode[k][i];
+        if (n >= s_nvgNodeCount)
+            { s_botRouteLen[k] = 0; return 0; }
+        if (s_nvgNode[n].flags & NVG_F_DOOR)
             { s_botWpDoor[k] = 1; break; }
     }
     return 1;
 }
+
+#if defined(NETNATIVE)
+extern "C" int Net_TestNavDoorRoute(int seat, int routeIdx, int playerDist,
+                                     int sameDoorSector, int currentDoor, int futureDoor)
+{
+    if ((unsigned)seat >= MAXPLAYERS || routeIdx < 0 || routeIdx + 2 >= NVG_MAX_ROUTE)
+        return 0;
+    uint32_t door = NVG_INVALID, nearPlain = NVG_INVALID, farPlain = NVG_INVALID;
+    for (uint32_t n = 0; n < s_nvgNodeCount; ++n)
+    {
+        if (door == NVG_INVALID && (s_nvgNode[n].flags & NVG_F_DOOR))
+            door = n;
+        if (!(s_nvgNode[n].flags & NVG_F_DOOR))
+        {
+            if (nearPlain == NVG_INVALID)
+                nearPlain = n;
+            if (door != NVG_INVALID && s_nvgNode[n].sector != s_nvgNode[door].sector
+                && klabs(Nvg_NodeX(n) - Nvg_NodeX(door))
+                 + klabs(Nvg_NodeY(n) - Nvg_NodeY(door)) > 2048)
+                { farPlain = n; break; }
+        }
+    }
+    if (door == NVG_INVALID || nearPlain == NVG_INVALID || farPlain == NVG_INVALID)
+        return 0;
+
+    uint32_t const first = currentDoor ? door : nearPlain;
+    uint32_t const second = futureDoor ? door : farPlain;
+    s_botRouteIdx[seat] = (int8_t)routeIdx;
+    s_botRouteLen[seat] = (int8_t)(routeIdx + 3);
+    s_botRtNode[seat][routeIdx] = first;
+    s_botRtNode[seat][routeIdx + 1] = second;
+    s_botRtNode[seat][routeIdx + 2] = farPlain;
+    s_botRouteDX[seat] = Nvg_NodeX(farPlain);
+    s_botRouteDY[seat] = Nvg_NodeY(farPlain);
+    s_botRouteDZ[seat] = s_nvgNode[farPlain].floorZ;
+    s_botRouteDSect[seat] = s_nvgNode[farPlain].sector;
+    s_botRouteCool[seat] = 1;
+
+    DukePlayer_t fake = {};
+    fake.cursectnum = (currentDoor && sameDoorSector)
+                      ? s_nvgNode[door].sector : s_nvgNode[nearPlain].sector;
+    fake.pos.x = Nvg_NodeX(first) + playerDist;
+    fake.pos.y = Nvg_NodeY(first);
+    fake.pos.z = s_nvgNode[first].floorZ - (38 << 8);
+    int32_t wx, wy, wz;
+    int16_t ws;
+    int const guided = Bot_Waypoint(seat, &fake, Nvg_NodeX(farPlain), Nvg_NodeY(farPlain),
+                                    s_nvgNode[farPlain].floorZ, s_nvgNode[farPlain].sector,
+                                    &wx, &wy, &wz, &ws);
+    uint32_t const expected = s_botRtNode[seat][s_botRouteIdx[seat]];
+    int const retained = guided && wx == Nvg_NodeX(expected) && wy == Nvg_NodeY(expected);
+    return (s_botRouteIdx[seat] << 8) | (retained ? 2 : 0) | (s_botWpDoor[seat] ? 1 : 0);
+}
+#endif
 
 static int Bot_IsPickup(int picnum)
 {
@@ -2029,62 +2360,53 @@ static void Bot_ClearAvoidEdgeTo(int k, int sect)   // entered it: edges in are 
             { s_botEdgeUntil[k][i] = 0; s_botEdgeTries[k][i] = 0; }
 }
 
-// --- wedge-spot ring (see the s_botWspot* declarations) ----------------------
-static void Bot_MarkWedgeSpot(int k, int32_t x, int32_t y)
+// --- wedge-spot ring (layer-aware) -------------------------------------------
+static void Bot_MarkWedgeSpot(int k, int32_t x, int32_t y, int16_t sectorNum)
 {
     int32_t const plc = movefifoplc;
     int slot = 0;
-    for (int i = 0; i < BOT_WSPOT_N; i++)
+    for (int i = 0; i < BOT_WSPOT_N; ++i)
     {
-        // refresh a spot we are basically standing on again
-        if (s_botWspotUntil[k][i] >= plc
+        if (s_botWspotUntil[k][i] >= plc && s_botWspotSect[k][i] == sectorNum
             && klabs(s_botWspotX[k][i] - x) + klabs(s_botWspotY[k][i] - y) < BOT_WSPOT_R)
             { slot = i; break; }
         if (s_botWspotUntil[k][i] < s_botWspotUntil[k][slot])
-            slot = i;                           // LRU by expiry
+            slot = i;
     }
-    s_botWspotX[k][slot]     = x;
-    s_botWspotY[k][slot]     = y;
-    s_botWspotUntil[k][slot] = plc + 1560;      // ~60s of "do not route back in"
+    s_botWspotX[k][slot] = x;
+    s_botWspotY[k][slot] = y;
+    s_botWspotSect[k][slot] = sectorNum;
+    s_botWspotUntil[k][slot] = plc + 1560;
 }
-static int Bot_NearWedgeSpot(int k, int32_t x, int32_t y)
+static int Bot_NearWedgeSpot(int k, int32_t x, int32_t y, int16_t sectorNum)
 {
     int32_t const plc = movefifoplc;
-    for (int i = 0; i < BOT_WSPOT_N; i++)
+    for (int i = 0; i < BOT_WSPOT_N; ++i)
         if (s_botWspotUntil[k][i] >= plc && s_botWspotUntil[k][i] - plc <= 2000
+            && s_botWspotSect[k][i] == sectorNum
             && klabs(s_botWspotX[k][i] - x) + klabs(s_botWspotY[k][i] - y) < BOT_WSPOT_R)
             return 1;
     return 0;
 }
 static void Bot_ClearWedgeSpots(int k)
 {
-    for (int i = 0; i < BOT_WSPOT_N; i++)
-        s_botWspotUntil[k][i] = 0;
+    for (int i = 0; i < BOT_WSPOT_N; ++i)
+        { s_botWspotUntil[k][i] = 0; s_botWspotSect[k][i] = -1; }
 }
-// Does the straight walk (x0,y0)->(x1,y1) pass within an active wedge spot?
-// The route follower's straight-shot and string-pull legs are approved by
-// Bot_LineWalkable, which is deliberately SPRITE-BLIND -- so they sailed
-// right back into a freshly-stamped chair pocket after every escape
-// (measured: the bot broke 2000 units free, then bee-lined into the exact
-// same coordinates for the next item). Any mesh detour the router found was
-// bypassed by the straight line; this check closes that bypass.
-static int Bot_SegNearWedgeSpot(int k, int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+static int Bot_SegNearWedgeSpot(int k, int32_t x0, int32_t y0, int16_t sect0,
+                               int32_t x1, int32_t y1, int16_t sect1)
 {
     int32_t const plc = movefifoplc;
-    int live = 0;
-    for (int i = 0; i < BOT_WSPOT_N; i++)
-        if (s_botWspotUntil[k][i] >= plc && s_botWspotUntil[k][i] - plc <= 2000)
-            { live = 1; break; }
-    if (!live)
-        return 0;
     int32_t const dx = x1 - x0, dy = y1 - y0;
     int const steps = clamp((int)((klabs(dx) + klabs(dy)) >> 8), 1, 64);
-    for (int s2 = 0; s2 <= steps; s2++)
+    for (int step = 0; step <= steps; ++step)
     {
-        int32_t const sx = x0 + (int32_t)(((int64_t)dx * s2) / steps);
-        int32_t const sy = y0 + (int32_t)(((int64_t)dy * s2) / steps);
-        for (int i = 0; i < BOT_WSPOT_N; i++)
+        int16_t const layer = (sect0 == sect1 || step * 2 < steps) ? sect0 : sect1;
+        int32_t const sx = x0 + (int32_t)(((int64_t)dx * step) / steps);
+        int32_t const sy = y0 + (int32_t)(((int64_t)dy * step) / steps);
+        for (int i = 0; i < BOT_WSPOT_N; ++i)
             if (s_botWspotUntil[k][i] >= plc && s_botWspotUntil[k][i] - plc <= 2000
+                && s_botWspotSect[k][i] == layer
                 && klabs(s_botWspotX[k][i] - sx) + klabs(s_botWspotY[k][i] - sy) < BOT_WSPOT_R)
                 return 1;
     }
@@ -2230,6 +2552,7 @@ static int Bot_PlanExplore(int k, DukePlayer_t *ps)
     s_botGoalX[k]      = (wall[bestW].x + wall[wall[bestW].point2].x) >> 1;
     s_botGoalY[k]      = (wall[bestW].y + wall[wall[bestW].point2].y) >> 1;
     s_botGoalSect[k]   = (int16_t)bestNs;
+    s_botGoalZ[k]      = getflorzofslope((int16_t)bestNs, s_botGoalX[k], s_botGoalY[k]) - (20 << 8);
     s_botGoalDoor[k]   = (int8_t)bestDoor;
     s_botGoalCrouch[k] = (int8_t)bestCrouch;
     s_botGoalTics[k]   = 0;
@@ -2287,6 +2610,7 @@ static int Bot_PlanItem(int k, DukePlayer_t *ps)
     s_botGoal[k]       = 2;
     s_botGoalX[k]      = sprite[best].x;
     s_botGoalY[k]      = sprite[best].y;
+    s_botGoalZ[k]      = sprite[best].z;
     s_botGoalSect[k]   = bestSect;
     s_botGoalDoor[k]   = 0;
     s_botGoalCrouch[k] = 0;
@@ -2361,10 +2685,10 @@ static int Bot_PlanLtg(int k, DukePlayer_t *ps)
 {
     extern int32_t g_netForensics;
     Bot_NavEnsure();
-    if (s_nvgW <= 0)
+    if (!s_nvgReady)
         return 0;
-    int const from = Nvg_Snap(ps->pos.x, ps->pos.y);
-    if (from < 0 || Bot_NvgFloodSectDist(k, from) <= 0)
+    uint32_t const from = Nvg_Snap(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum);
+    if (from == NVG_INVALID || Bot_NvgFloodSectDist(k, from) <= 0)
         return 0;
     int32_t const plc = movefifoplc;
     bool prioritize;
@@ -2416,6 +2740,7 @@ static int Bot_PlanLtg(int k, DukePlayer_t *ps)
         s_botLtgItem[k] = (int16_t)bestItem;
         s_botLtgX[k]    = sprite[bestItem].x;
         s_botLtgY[k]    = sprite[bestItem].y;
+        s_botLtgZ[k]    = sprite[bestItem].z;
         s_botLtgSect[k] = sprite[bestItem].sectnum;
         // Stamp on CHOICE (their BotAddToAvoidGoals at :1425): predicted absent
         // for one respawn window from now, so the next re-plan doesn't bounce
@@ -2457,9 +2782,11 @@ static int Bot_PlanLtg(int k, DukePlayer_t *ps)
             return 0;
         s_botLtgKind[k] = 1;
         s_botLtgItem[k] = -1;
-        s_botLtgX[k]    = Nvg_CX(s_ltgSectTile[bestS] % s_nvgW);
-        s_botLtgY[k]    = Nvg_CY(s_ltgSectTile[bestS] / s_nvgW);
-        s_botLtgSect[k] = (int16_t)bestS;
+        uint32_t const anchor = s_ltgSectNode[bestS];
+        s_botLtgX[k]    = Nvg_NodeX(anchor);
+        s_botLtgY[k]    = Nvg_NodeY(anchor);
+        s_botLtgZ[k]    = s_nvgNode[anchor].floorZ - (20 << 8);
+        s_botLtgSect[k] = s_nvgNode[anchor].sector;
         bestDist        = s_ltgSectDist[bestS];
     }
     s_botLtgUntil[k] = plc + 390 + (int32_t)(Bot_Rnd() % 131);   // ~15-20s commit
@@ -2505,6 +2832,7 @@ static int Bot_LtgErrand(int k, DukePlayer_t *ps)
     s_botGoal[k]       = (s_botLtgKind[k] == 2) ? 2 : 1;
     s_botGoalX[k]      = s_botLtgX[k];
     s_botGoalY[k]      = s_botLtgY[k];
+    s_botGoalZ[k]      = s_botLtgZ[k];
     s_botGoalSect[k]   = s_botLtgSect[k];
     s_botGoalDoor[k]   = 0;
     s_botGoalCrouch[k] = 0;
@@ -2522,13 +2850,13 @@ static int Bot_LtgErrand(int k, DukePlayer_t *ps)
 // for straight-shot/off-mesh legs.
 static int Bot_RouteNextSect(int k, DukePlayer_t *ps)
 {
-    for (int i = s_botRouteIdx[k]; i < s_botRouteLen[k] && i < s_botRouteIdx[k] + 6; i++)
+    for (int i = s_botRouteIdx[k]; i < s_botRouteLen[k] && i < s_botRouteIdx[k] + 6; ++i)
     {
-        int const t = s_botRtY[k][i] * s_nvgW + s_botRtX[k][i];
-        if (t < 0 || t >= s_nvgW * s_nvgH)
+        uint32_t const n = s_botRtNode[k][i];
+        if (n >= s_nvgNodeCount)
             break;
-        int const sct = s_nvgSect[t];
-        if (sct >= 0 && sct != ps->cursectnum)
+        int const sct = s_nvgNode[n].sector;
+        if (sct != ps->cursectnum)
             return sct;
     }
     return -1;
@@ -2882,16 +3210,19 @@ static input_t Bot_GetInput(int k)
             if (mon >= 0)
             {
                 Bot_NavEnsure();
-                int const from = Nvg_Snap(ps->pos.x, ps->pos.y);
-                int const to   = Nvg_Snap(sprite[mon].x, sprite[mon].y);
-                static int16_t txx[4], tyy[4];
-                if (from >= 0 && to >= 0
-                    && (from == to || Bot_NvgPath(k, from, to, txx, tyy, 4) > 0))
+                uint32_t const from = Nvg_Snap(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum);
+                uint32_t const to   = Nvg_Snap(sprite[mon].x, sprite[mon].y,
+                                               sprite[mon].z, sprite[mon].sectnum);
+                static uint32_t probe[4];
+                if (from != NVG_INVALID && to != NVG_INVALID
+                    && (from == to || Bot_NvgPath(k, from, to, probe, ARRAY_SIZE(probe)) > 0))
                 {
                     s_botNavOn[k]   = 1;
                     s_botNavSeen[k] = 0;
                     s_botNavX[k]    = sprite[mon].x;
                     s_botNavY[k]    = sprite[mon].y;
+                    s_botNavZ[k]    = sprite[mon].z;
+                    s_botNavSect[k] = sprite[mon].sectnum;
                 }
                 Bot_SetCombatRouteResult(k, 2, mon, s_botNavOn[k] != 0);
                 // A monster to fight: drop the errand -- unless resources are
@@ -2938,6 +3269,7 @@ static input_t Bot_GetInput(int k)
                     {
                         s_botGoalX[k]      = fx;
                         s_botGoalY[k]      = fy;
+                        s_botGoalZ[k]      = hp->pos.z;
                         s_botGoalSect[k]   = hp->cursectnum;
                         s_botGoal[k]       = 1;
                         s_botGoalDoor[k]   = 0;
@@ -3098,20 +3430,23 @@ static input_t Bot_GetInput(int k)
             // sight; once sight breaks, the LAST-SEEN snapshot -- routing to
             // the live position through walls was the omniscient wall-tracking
             // the audit called out (item 5).
-            int32_t rx = tps->pos.x, ry = tps->pos.y;
+            int32_t rx = tps->pos.x, ry = tps->pos.y, rz = tps->pos.z;
+            int16_t rsect = tps->cursectnum;
             if (g_botLtgOn && s_botSeenValid[k] && s_botSightTics[k] > 0)
-                { rx = s_botSeenX[k]; ry = s_botSeenY[k]; }
+                { rx = s_botSeenX[k]; ry = s_botSeenY[k]; rz = s_botSeenZ[k]; rsect = s_botSeenSect[k]; }
             Bot_NavEnsure();
-            int const from = Nvg_Snap(ps->pos.x, ps->pos.y);
-            int const to   = Nvg_Snap(rx, ry);
-            static int16_t txx[4], tyy[4];
-            if (from >= 0 && to >= 0
-                && (from == to || Bot_NvgPath(k, from, to, txx, tyy, 4) > 0))
+            uint32_t const from = Nvg_Snap(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum);
+            uint32_t const to   = Nvg_Snap(rx, ry, rz, rsect);
+            static uint32_t probe[4];
+            if (from != NVG_INVALID && to != NVG_INVALID
+                && (from == to || Bot_NvgPath(k, from, to, probe, ARRAY_SIZE(probe)) > 0))
             {
                 s_botNavOn[k]   = 1;
                 s_botNavSeen[k] = 0;
-                s_botNavX[k]    = rx;           // the resolver meshes the walk
+                s_botNavX[k]    = rx;
                 s_botNavY[k]    = ry;
+                s_botNavZ[k]    = rz;
+                s_botNavSect[k] = rsect;
             }
         }
         // Store the newest route verdict; the per-input-tic block below owns
@@ -3141,6 +3476,7 @@ static input_t Bot_GetInput(int k)
                 // of freezing at a doorway it cannot climb.
                 s_botGoalX[k]      = g_player[heard].ps->pos.x;
                 s_botGoalY[k]      = g_player[heard].ps->pos.y;
+                s_botGoalZ[k]      = g_player[heard].ps->pos.z;
                 s_botGoal[k]       = 1;
                 s_botGoalSect[k]   = g_player[heard].ps->cursectnum;
                 s_botGoalDoor[k]   = 0;
@@ -3441,7 +3777,7 @@ static input_t Bot_GetInput(int k)
     // one-shot jump at stall-kill time (~every 200 tics) was the only jump
     // pressure a wedged march ever produced (measured: 50s frozen).
     if (g_botLtgOn && stepped < 16 && s_botJumpCool[k] == 0
-        && Bot_NearWedgeSpot(k, ps->pos.x, ps->pos.y))
+        && Bot_NearWedgeSpot(k, ps->pos.x, ps->pos.y, ps->cursectnum))
     {
         in.bits |= BIT(SK_JUMP);
         s_botJumpCool[k] = 78;
@@ -3513,7 +3849,7 @@ static input_t Bot_GetInput(int k)
                     // existing cooldown; the duct-crouch block still strips
                     // jumps where the ceiling is low). Planning continues
                     // the same tic; the next commit routes around the spot.
-                    Bot_MarkWedgeSpot(k, ps->pos.x, ps->pos.y);
+                    Bot_MarkWedgeSpot(k, ps->pos.x, ps->pos.y, ps->cursectnum);
                     if (s_botJumpCool[k] == 0)
                     {
                         in.bits |= BIT(SK_JUMP);
@@ -3874,10 +4210,12 @@ static input_t Bot_GetInput(int k)
         {
             // Follow-until-clear (chase flavor): straight at the waypoint
             // only while the walk line is open, else hold the follow heading.
-            int32_t nx2 = s_botNavX[k], ny2 = s_botNavY[k];
+            int32_t nx2 = s_botNavX[k], ny2 = s_botNavY[k], nz2 = s_botNavZ[k];
+            int16_t nsect2 = s_botNavSect[k];
             int guided2 = 0;
             if ((unsigned)tgSect < (unsigned)numsectors)
-                guided2 = Bot_Waypoint(k, ps, tgX, tgY, tgSect, &nx2, &ny2);
+                guided2 = Bot_Waypoint(k, ps, tgX, tgY, tgZ, (int16_t)tgSect,
+                                       &nx2, &ny2, &nz2, &nsect2);
             if (s_botWpDoor[k] && (movefifoplc & 7) == 0
                 && klabs(nx2 - ps->pos.x) + klabs(ny2 - ps->pos.y) < 1600)
                 in.bits |= BIT(SK_OPEN);
@@ -3925,9 +4263,10 @@ static input_t Bot_GetInput(int k)
         // ROUTE FIRST (OpenArena-style): mesh-guided waypoints get DIRECT
         // steering every tic; the blocked-line crutch survives only for the
         // off-mesh raw fallback.
-        int32_t sx2, sy2;
-        int const guided = Bot_Waypoint(k, ps, s_botGoalX[k], s_botGoalY[k],
-                                        s_botGoalSect[k], &sx2, &sy2);
+        int32_t sx2, sy2, sz2;
+        int16_t ssect2;
+        int const guided = Bot_Waypoint(k, ps, s_botGoalX[k], s_botGoalY[k], s_botGoalZ[k],
+                                        s_botGoalSect[k], &sx2, &sy2, &sz2, &ssect2);
         if (s_botWpDoor[k] && (movefifoplc & 7) == 0
             && klabs(sx2 - ps->pos.x) + klabs(sy2 - ps->pos.y) < 1600)
             in.bits |= BIT(SK_OPEN);        // mid-route door: press through it
@@ -4262,7 +4601,7 @@ static input_t Bot_GetInput(int k)
         else if (s_botGoal[k] == 2 && (unsigned)s_botGoalItem[k] < MAXSPRITES)
             { goalZ = sprite[s_botGoalItem[k]].z; haveGoalZ = true; }
         else if (s_botGoal[k] != 0 && (unsigned)s_botGoalSect[k] < (unsigned)numsectors)
-            { goalZ = getflorzofslope(s_botGoalSect[k], s_botGoalX[k], s_botGoalY[k]) - (20 << 8); haveGoalZ = true; }
+            { goalZ = s_botGoalZ[k]; haveGoalZ = true; }
         int32_t const dz = haveGoalZ ? ps->pos.z - goalZ : 0;   // >0: goal ABOVE
         // No flying in crawl spaces: mirrors their (truefz-truecz) <= 72<<8
         // descend clause (:1101) and keeps this block from fighting the duct
