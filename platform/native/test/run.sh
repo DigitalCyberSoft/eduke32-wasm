@@ -36,6 +36,12 @@ $CXX -DNETNATIVE -DNN_TRANSPORT_TEST $INC -I "$ROOT/source/duke3d/src" \
      "$ROOT/platform/native/test/nn_bot_seat_test.cpp" "$ROOT/source/duke3d/src/net_transport_native.cpp" \
      "$ROOT/source/build/src/crc32.cpp" \
      -o "$OUT/bot_seat_test" $LIBDIRS -ldatachannel -lsecp256k1 -lcrypto -lpthread -lcurl -lminiupnpc
+$CXX -DNETDUKE32 -DNOASM -DRENDERTYPESDL=1 -DSDL_TARGET=2 -funsigned-char \
+     $INC -I "$ROOT/source/duke3d/src" -I "$ROOT/source/glad/include" \
+     -I "$ROOT/source/mact/include" -I "$ROOT/source/audiolib/include" \
+     -I "$ROOT/source/voidwrap/include" -I "$ROOT/source/imgui/include" \
+     -I "$ROOT/source/mimalloc/include" -I/usr/include/SDL2 -D_GNU_SOURCE=1 -D_REENTRANT \
+     "$ROOT/platform/native/test/nn_bot_combat_test.cpp" -o "$OUT/bot_combat_test"
 
 export LD_LIBRARY_PATH="$PREFIX/usr/lib64:$PREFIX/lib64:${LD_LIBRARY_PATH:-}"
 
@@ -57,6 +63,8 @@ echo "== seam end-to-end: join handshake + frames through net_transport.h =="
 node "$ROOT/platform/native/test/seam_e2e.mjs" "$OUT/seam_test"
 echo "== CPU-reserved seat and full-roster allocation =="
 "$OUT/bot_seat_test"
+echo "== bot combat model + break-fire safety =="
+"$OUT/bot_combat_test"
 
 echo
 echo "ALL NATIVE TRANSPORT TESTS PASSED"

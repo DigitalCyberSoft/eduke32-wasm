@@ -1,6 +1,7 @@
 #define OLDNET_CPP_
 
 #include "duke3d.h"
+#include "bot_combat.h"
 #include "oldnet.h"
 #include "bot_lifecycle.h"
 
@@ -786,7 +787,13 @@ static int16_t s_botBounceHold[MAXPLAYERS];  // tics left steering to bounceAng
 static int16_t s_botBounceAng[MAXPLAYERS];
 static int8_t  s_botWasDead[MAXPLAYERS];
 static int16_t s_botSpawnRoam[MAXPLAYERS];   // post-respawn target-blind roam
-static int8_t  s_botBreakFire[MAXPLAYERS];   // tics of blocker-clearing fire
+// Exact blocker latch. kind: 0 none, 1 sprite, 2 wall. It is armed only by the
+// conservative classifier below and survives just long enough to drive the
+// current weapon cycle; every trigger/discharge revalidates first-hit identity.
+static int8_t  s_botBreakFire[MAXPLAYERS];
+static int8_t  s_botBreakKind[MAXPLAYERS];
+static int16_t s_botBreakIndex[MAXPLAYERS];
+static int16_t s_botBreakTile[MAXPLAYERS];
 static int8_t  s_botStuckEpisodes[MAXPLAYERS]; // consecutive traps -> longer bounces
 static int16_t s_botNoHitTics[MAXPLAYERS];   // visible-but-unhittable streak (fence camping)
 static int32_t s_botLastTDist[MAXPLAYERS];   // pursuit progress: last distance to target
@@ -1817,6 +1824,9 @@ static void Bot_ResetSeat(int k, BotResetScope scope)
     s_botThrShoot[k]     = 0;
     s_botBurst[k]        = 0;
     s_botBreakFire[k]    = 0;
+    s_botBreakKind[k]    = 0;
+    s_botBreakIndex[k]   = -1;
+    s_botBreakTile[k]    = -1;
     s_botSeenX[k]        = 0;
     s_botSeenY[k]        = 0;
     s_botSeenZ[k]        = 0;
@@ -2884,31 +2894,181 @@ static int16_t const s_botEngageDist[MAX_WEAPONS] = {
     512,   // FLAMETHROWER (not in their matrix; short-range spray)
 };
 
-// PROJECTILE SPEED by OUR current weapon, Build units per tic, for aim leading
-// (audit item 6c). 0 = HITSCAN weapon: no leading, the shot lands instantly
-// (pistol/chaingun/shotgun/knee/tripbomb/flamethrower). Non-zero = the fired
-// projectile's travel speed, so the lead is aimPt = tgt + (dist/projSpeed)*tgtVel
-// (their VectorMA(origin,(dist/wi.speed)*speed,dir,bestorigin), ai_dmq3.c:3480).
-// The live values are CON-data-driven (g_tile[aplWeaponShoots[w][k]].proj->vel),
-// which IS reachable at runtime but adds NULL-check + per-player-index failure
-// modes; this is the classic Duke3D constant table instead -- deterministic on
-// every peer regardless of CON load, and only the MAGNITUDE scales the lead
-// (the leading gate asserts the aim angle CHANGED, not an exact intercept).
-static int16_t const s_botProjSpeed[MAX_WEAPONS] = {
-    0,     // KNEE        (contact / hitscan)
-    0,     // PISTOL      (hitscan)
-    0,     // SHOTGUN     (hitscan)
-    0,     // CHAINGUN    (hitscan)
-    644,   // RPG         (classic rocket velocity)
-    0,     // HANDBOMB    (thrown ballistic arc -- no linear lead)
-    768,   // SHRINKER    (SHRINKSPARK)
-    644,   // DEVISTATOR  (fires RPG-class projectiles)
-    0,     // TRIPBOMB    (placed)
-    1024,  // FREEZE      (FREEZEBLAST -- fast, bounces)
-    0,     // HANDREMOTE  (pipebomb detonator)
-    768,   // GROW        (GROWSPARK / expander)
-    0,     // FLAMETHROWER (short spray)
-};
+// Live weapon/projectile model. PWEAPON(Shoots) is the source of truth; stock
+// hardcoded cases mirror A_ShootHardcoded because DefaultProjectile metadata
+// cannot describe them. Custom projectiles use the public read-only accessor.
+// Pure/read-only: no Bot_Rnd or krand draws.
+static BotShotModel Bot_GetShotModel(int k)
+{
+    BotShotModel out = { -1, 0, 0, BOT_SHOT_NONE };
+    auto const ps = g_player[k].ps;
+    if (ps == NULL || (unsigned)ps->curr_weapon >= MAX_WEAPONS)
+        return out;
+
+    int const tile = PWEAPON(k, ps->curr_weapon, Shoots);
+    out = Bot_CombatStockShotModel(tileGetMapping(tile), ps->curr_weapon, g_rpgRadius);
+    out.tile = (int16_t)tile;
+    if (out.kind != BOT_SHOT_NONE)
+        return out;
+
+    if (!A_CheckSpriteTileFlags(tile, SFLAG_PROJECTILE))
+        return out;
+    projectile_t const *const proj = Proj_GetProjectileData(tile);
+    unsigned const type = proj->workslike & PROJECTILE_TYPE_MASK;
+    if (type == PROJECTILE_HITSCAN || type == PROJECTILE_KNEE)
+        out.kind = BOT_SHOT_HITSCAN;
+    else if (type == PROJECTILE_RPG && proj->vel > 0)
+    {
+        out.speed  = proj->vel;
+        out.splash = (int16_t)clamp(proj->hitradius, 0, 32767);
+        out.kind   = BOT_SHOT_LINEAR;
+    }
+    return out;
+}
+
+static bool Bot_IsProtectedPlayer(int k, int other, bool botCoop, bool botTeamGame)
+{
+    if ((unsigned)other >= MAXPLAYERS || other == k || !g_player[other].connected
+        || g_player[other].ps == NULL)
+        return false;
+    auto const op = g_player[other].ps;
+    if ((unsigned)op->i >= MAXSPRITES || op->dead_flag || sprite[op->i].extra <= 0)
+        return false;
+    return botCoop || (botTeamGame && op->team == g_player[k].ps->team);
+}
+
+static void Bot_ClearBreakLatch(int k)
+{
+    s_botBreakFire[k] = 0; s_botBreakKind[k] = 0;
+    s_botBreakIndex[k] = -1; s_botBreakTile[k] = -1;
+}
+
+static bool Bot_IsRouteClearingSprite(int spriteNum)
+{
+    if ((unsigned)spriteNum >= MAXSPRITES || sprite[spriteNum].statnum >= MAXSTATUS
+        || !(sprite[spriteNum].cstat & CSTAT_SPRITE_BLOCK))
+        return false;
+    switch (tileGetMapping(sprite[spriteNum].picnum))
+    {
+    // Only blockers whose damage path immediately removes blocking/deletes them.
+    case GRATE1__: case FANSPRITE__: case CIRCLEPANNEL__:
+    case PANNEL1__: case PANNEL2__: case PANNEL3__:
+    case TOILET__: case STALL__:
+    case CHAIR1__: case CHAIR2__: case CHAIR3__:
+    case MOVIECAMERA__: case SCALE__: case VACUUM__: case CAMERALIGHT__:
+    case IVUNIT__: case POT1__: case POT2__: case POT3__: case TRIPODCAMERA__:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool Bot_IsRouteClearingWall(int wallNum)
+{
+    if ((unsigned)wallNum >= (unsigned)numwalls || !(wall[wallNum].cstat & 1))
+        return false;
+    // GLASS clears both sides' cstat immediately. Forcefields ripple but do not
+    // clear, and GLASS2 is already the broken tile, so neither is armed.
+    return tileGetMapping(wall[wallNum].overpicnum) == GLASS__;
+}
+
+static bool Bot_ClassifyBreakHit(int k, hitdata_t const &hit)
+{
+    int kind = 0, index = -1, tile = -1;
+    if (hit.sprite >= 0 && Bot_IsRouteClearingSprite(hit.sprite))
+        { kind = 1; index = hit.sprite; tile = sprite[hit.sprite].picnum; }
+    else if (hit.wall >= 0 && Bot_IsRouteClearingWall(hit.wall))
+        { kind = 2; index = hit.wall; tile = wall[hit.wall].overpicnum; }
+    if (!kind)
+        return false;
+    s_botBreakKind[k] = (int8_t)kind;
+    s_botBreakIndex[k] = (int16_t)index;
+    s_botBreakTile[k] = (int16_t)tile;
+    s_botBreakFire[k] = 8;
+    return true;
+}
+
+static bool Bot_BreakHitMatches(int k, hitdata_t const &hit)
+{
+    if (s_botBreakKind[k] == 1)
+        return hit.sprite == s_botBreakIndex[k] && (unsigned)hit.sprite < MAXSPRITES
+            && sprite[hit.sprite].picnum == s_botBreakTile[k]
+            && Bot_IsRouteClearingSprite(hit.sprite);
+    if (s_botBreakKind[k] == 2)
+        return hit.wall == s_botBreakIndex[k] && (unsigned)hit.wall < (unsigned)numwalls
+            && wall[hit.wall].overpicnum == s_botBreakTile[k]
+            && Bot_IsRouteClearingWall(hit.wall);
+    return false;
+}
+
+struct botshotprobe_t { bool canHit, safetyVeto, breakMatch; int protectedSeat; hitdata_t hit; };
+
+// Projected end-of-this-tic trace. Future yaw/pitch are exactly current plus the
+// command deltas P_ProcessInput will integrate before P_ProcessWeapon. The common
+// ray uses the same direction ratio as both hardcoded and custom firing paths.
+static botshotprobe_t Bot_ProbeShot(int k, fix16_t futureAng, fix16_t futureHoriz,
+                                    BotShotModel const &model, bool botCoop,
+                                    bool botTeamGame, int targetSprite,
+                                    int32_t tgX, int32_t tgY, int32_t tgZ)
+{
+    botshotprobe_t out = {};
+    out.protectedSeat = -1;
+    auto const ps = g_player[k].ps;
+    if (model.kind == BOT_SHOT_NONE || ps == NULL || (unsigned)ps->cursectnum >= (unsigned)numsectors)
+        return out;
+
+    int const ang = fix16_to_int(futureAng) & 2047;
+    int const horiz = fix16_to_int(futureHoriz + ps->q16horizoff);
+    int32_t const vx = sintable[(ang + 512) & 2047];
+    int32_t const vy = sintable[ang & 2047];
+    // Both stock and custom projectile launch ratios reduce to the hitscan
+    // direction (100-horiz)<<11; trace that common ray. `model` still decides
+    // leading and splash, while this line decides the first blocker/victim.
+    int32_t const traceZ = (100 - horiz) << 11;
+    hitscan(&ps->pos, ps->cursectnum, vx, vy, traceZ, &out.hit, CLIPMASK1);
+
+    int const hitPlayer = (out.hit.sprite >= 0 && sprite[out.hit.sprite].picnum == APLAYER)
+                        ? P_Get(out.hit.sprite) : -1;
+    if (Bot_IsProtectedPlayer(k, hitPlayer, botCoop, botTeamGame))
+    {
+        out.safetyVeto = true; out.protectedSeat = hitPlayer;
+    }
+
+    int32_t const targetDist = FindDistance2D(tgX - ps->pos.x, tgY - ps->pos.y);
+    int32_t const hitDist = FindDistance2D(out.hit.xyz.x - ps->pos.x, out.hit.xyz.y - ps->pos.y);
+    if (targetSprite >= 0 && out.hit.sprite == targetSprite)
+        out.canHit = true;
+    else if (hitDist + 256 >= targetDist)
+    {
+        int64_t cross = (int64_t)(tgX - ps->pos.x) * vy - (int64_t)(tgY - ps->pos.y) * vx;
+        if (cross < 0) cross = -cross;
+        int32_t const along = max<int32_t>(targetDist, 1);
+        int32_t const lateral = (int32_t)(cross >> 14);
+        // Same z slope as the engine hitscan: horizontal direction magnitude is
+        // 16384 and z direction is (100-horiz)<<11.
+        int32_t const rayZ = ps->pos.z + (int32_t)(((int64_t)((100 - horiz) << 11) * along) >> 14);
+        out.canHit = lateral < 1024 && klabs(rayZ - tgZ) < (32 << 8);
+    }
+    out.breakMatch = Bot_BreakHitMatches(k, out.hit);
+
+    if (model.splash > 0)
+    {
+        int32_t const impactZ = out.hit.xyz.z;
+        for (int i = 0; i < MAXPLAYERS; i++)
+        {
+            if (!Bot_IsProtectedPlayer(k, i, botCoop, botTeamGame))
+                continue;
+            auto const op = g_player[i].ps;
+            if (FindDistance3D(out.hit.xyz.x - op->pos.x, out.hit.xyz.y - op->pos.y,
+                               impactZ - op->pos.z) < model.splash)
+                { out.safetyVeto = true; out.protectedSeat = i; break; }
+        }
+        if (FindDistance3D(out.hit.xyz.x - ps->pos.x, out.hit.xyz.y - ps->pos.y,
+                           impactZ - ps->pos.z) < model.splash)
+            out.safetyVeto = true;
+    }
+    return out;
+}
 
 static input_t Bot_GetInput(int k)
 {
@@ -3685,23 +3845,10 @@ static input_t Bot_GetInput(int k)
                 int const a = fix16_to_int(ps->q16ang) & 2047;
                 hitscan(&ps->pos, ps->cursectnum, sintable[(a + 512) & 2047],
                         sintable[a & 2047], 0, &hit, CLIPMASK1);
-                if (hit.sprite >= 0
-                    && klabs(sprite[hit.sprite].x - ps->pos.x)
-                       + klabs(sprite[hit.sprite].y - ps->pos.y) < 2048)
-                    s_botBreakFire[k] = 8;
-                else if (hit.wall >= 0
-                         && klabs(hit.xyz.x - ps->pos.x) + klabs(hit.xyz.y - ps->pos.y) < 2048)
-                {
-                    // A breakable pane/grate/forcefield between us and the
-                    // route is an exit with a health bar: shoot it open
-                    // ("if it can destroy something to get to an exit").
-                    switch (tileGetMapping(wall[hit.wall].overpicnum))
-                    {
-                    case GLASS__: case GLASS2__: case BIGFORCE__: case W_FORCEFIELD__:
-                        s_botBreakFire[k] = 8;
-                        break;
-                    }
-                }
+                int32_t const hitDist = FindDistance2D(hit.xyz.x - ps->pos.x,
+                                                       hit.xyz.y - ps->pos.y);
+                if (hitDist < 2048)
+                    Bot_ClassifyBreakHit(k, hit);
             }
             else
             {
@@ -3971,7 +4118,7 @@ static input_t Bot_GetInput(int k)
     // fire-solution hit test keys on whatever the ray actually strikes
     // (ray.sprite), so the target's own sprite index is not needed here.
     int32_t tgX = 0, tgY = 0, tgZ = 0;
-    int tgSect = -1;
+    int tgSect = -1, targetSprite = -1;
     bool hasTgt = false;
     if (botCoop)
     {
@@ -3979,7 +4126,7 @@ static input_t Bot_GetInput(int k)
         if (s_botSpawnRoam[k] <= 0 && Bot_IsLiveMonsterTarget(ms)
             && !Bot_DeadExitActive(k, sprite[ms].sectnum))
         {
-            hasTgt = true;
+            hasTgt = true; targetSprite = ms;
             tgX = sprite[ms].x; tgY = sprite[ms].y; tgZ = sprite[ms].z - (8 << 8);
             tgSect = sprite[ms].sectnum;
         }
@@ -3988,7 +4135,7 @@ static input_t Bot_GetInput(int k)
     }
     else if (tp != NULL)
     {
-        hasTgt = true;
+        hasTgt = true; targetSprite = tp->i;
         tgX = tp->pos.x; tgY = tp->pos.y; tgZ = tp->pos.z; tgSect = tp->cursectnum;
     }
     bool const seesTarget = (hasTgt && (unsigned)tgSect < (unsigned)numsectors
@@ -4099,77 +4246,12 @@ static input_t Bot_GetInput(int k)
         else { s_botSeeStreak[k] = 0; s_botPending[k] = -1; }
     }
 
-    // "Can SEE" is not "can HIT": cansee() threads through masked walls
-    // (chain-link fences, window bars) that hitscan bullets terminate on. The
-    // dominant idiot-mode measured live: a bot at the rooftop fence, target
-    // visible on the far side at the same height (pitch pinned at 100), hosing
-    // pellets into the mesh forever -- 98% of ALL bot fire ended on walls with
-    // zero frags across two 3-minute probes, and the collateral shot out
-    // lights/screens map-wide. Fire only when the ACTUAL fire solution
-    // (current angle + pitch) lands on a player or near the target.
-    bool canHit  = false;
-    int  ffMate  = -1;   // (#6) FF-veto: teammate the fire solution would cross (-1 none)
-    if (seesTarget)
-    {
-        int const fireAng   = fix16_to_int(ps->q16ang) & 2047;
-        int const fireHoriz = fix16_to_int(ps->q16horiz);
-        int32_t const vx = sintable[(fireAng + 512) & 2047];
-        int32_t const vy = sintable[fireAng & 2047];
-        hitdata_t ray = {};
-        hitscan(&ps->pos, ps->cursectnum, vx, vy, (100 - fireHoriz) << 5, &ray, CLIPMASK1);
-        int32_t const distT  = klabs(tgX - ps->pos.x) + klabs(tgY - ps->pos.y);
-        int32_t const rayLen = klabs(ray.xyz.x - ps->pos.x) + klabs(ray.xyz.y - ps->pos.y);
-        // FRIENDLY-FIRE LINE VETO (audit item 7 / 6): the fire solution's FIRST
-        // sprite hit being a teammate means the shot would strike a friend
-        // crossing the line to the real enemy behind them (their BotSameTeam
-        // trace check in BotCheckAttack, ai_dmq3.c:3690). Same team test as the
-        // TDM acquisition filter. Recorded now, vetoes the FIRE bit below; DM
-        // (no teams) never trips it. canHit stays true so tracking is unchanged.
-        if (botTeamGame && ray.sprite >= 0 && sprite[ray.sprite].picnum == APLAYER
-            && (unsigned)sprite[ray.sprite].yvel < MAXPLAYERS
-            && sprite[ray.sprite].yvel != k)
-        {
-            auto const rmp = g_player[sprite[ray.sprite].yvel].ps;
-            if (rmp != NULL && rmp->team == ps->team)
-                ffMate = sprite[ray.sprite].yvel;
-        }
-        // Fire solution lands on a valid victim: a player in DM, ANY enemy
-        // monster in coop (the shot damages whatever monster it hits).
-        if (ray.sprite >= 0 && (botCoop ? A_CheckEnemySprite(&sprite[ray.sprite])
-                                        : sprite[ray.sprite].picnum == APLAYER))
-            canHit = true;
-        else if (rayLen + 256 < distT)
-            canHit = false;   // ray died SHORT of the target: fence/wall between
-                              // (256 = torso slack only; the old 1024 let a
-                              // target one THIN WALL away count as hittable --
-                              // the bot fired into masonry, canHit kept
-                              // resetting the no-hit breaker, and the chase
-                              // branch drove it face-first into the wall
-                              // indefinitely: the user's screenshot)
-        else
-        {
-            // Ray reaches the target's range (or beyond): decide by how far
-            // the fire line passes from the target laterally. Endpoint
-            // proximity was WRONG here -- a clean near-miss ends on a wall far
-            // BEHIND the target and must still count as hittable (v1 gated on
-            // it and bots stopped firing entirely: 16 discharges in 3 min).
-            int64_t cross = (int64_t)(tgX - ps->pos.x) * vy
-                          - (int64_t)(tgY - ps->pos.y) * vx;
-            if (cross < 0) cross = -cross;
-            canHit = (int32_t)(cross >> 14) < 1024;
-        }
-        // Fence-camping breaker, PURSUIT-SAFE: only a bot that is unhittable
-        // AND not closing distance rotates away -- a bot descending toward
-        // its target is unhittable the whole way down and must keep coming.
-        if (canHit || distT + 64 < s_botLastTDist[k])
-            s_botNoHitTics[k] = 0;
-        else if (++s_botNoHitTics[k] > 60)
-        {
-            s_botTargetHold[k] = 1000;
-            s_botNoHitTics[k]  = 0;
-        }
-        s_botLastTDist[k] = distT;
-    }
+    // Pre-turn target presence is navigation-only. Trigger eligibility is
+    // computed after aim yaw/pitch below against their projected end-of-tic
+    // values; keep this provisional value false so movement never treats stale current
+    // view as an authoritative shot solution.
+    bool canHit = false;
+    int ffMate = -1;
 
     // Steering priority: wall-bounce > visible chase > blind homing/wander.
     int wantAng;
@@ -4322,15 +4404,15 @@ static input_t Bot_GetInput(int k)
     // (#3) PROJECTILE LEADING: aim where the target WILL be, not where it is --
     // aimPt = tgt + (dist/projSpeed)*tgtVel (their VectorMA(origin,(dist/
     // wi.speed)*speed,dir,bestorigin), ai_dmq3.c:3480). Projectile weapons only
-    // (s_botProjSpeed>0; hitscan never leads), and gated by the AIM_SKILL tier
+    // (live shotModel.speed>0; hitscan never leads), and gated by AIM_SKILL
     // so the dumbest column fires straight. Uses the velocity estimate (#2).
-    if (engaging && seesTarget && aimLead[skill]
-        && (unsigned)ps->curr_weapon < MAX_WEAPONS && s_botProjSpeed[ps->curr_weapon] > 0
+    BotShotModel const shotModel = Bot_GetShotModel(k);
+    if (engaging && seesTarget && aimLead[skill] && shotModel.speed > 0
         && (s_botTgtVX[k] || s_botTgtVY[k]))
     {
-        int32_t const projS  = s_botProjSpeed[ps->curr_weapon];
-        int32_t const ldist  = klabs(tgAimX - ps->pos.x) + klabs(tgAimY - ps->pos.y);
-        int32_t const flight = ldist / projS;               // tics for the shot to arrive
+        int32_t const projS  = shotModel.speed;
+        int32_t const flight = Bot_CombatLeadTicsFromDistance(
+            FindDistance2D(tgAimX - ps->pos.x, tgAimY - ps->pos.y), projS); // tics to arrive
         int const     leadAng = getangle(tgAimX + flight * s_botTgtVX[k] - ps->pos.x,
                                           tgAimY + flight * s_botTgtVY[k] - ps->pos.y);
         if (leadAng != rawAng)
@@ -4389,27 +4471,36 @@ static input_t Bot_GetInput(int k)
     s_botViewVel[k] = 0;
     in.q16avel = fix16_from_int(clamp(diff + aimErr, -cap, cap));
 
-    int32_t const dist2d = hasTgt ? klabs(tgX - ps->pos.x) + klabs(tgY - ps->pos.y) : INT32_MAX;
+    int32_t const dist2d = hasTgt ? FindDistance2D(tgX - ps->pos.x, tgY - ps->pos.y) : INT32_MAX;
 
-    // VERTICAL AIM via the sim's OWN aim keys: raw q16horz deltas fought the
-    // auto-centering and OSCILLATED (measured: shot-time horiz swinging
-    // 59..127 -- pistols into the floor, 384 shots 0 hits). Holding
-    // SK_AIM_UP/DOWN moves pitch at the sim's rate with centering suspended,
-    // so overshoot is structurally impossible; SK_CENTER_VIEW levels back
-    // off-combat.
+    // Authoritative fixed-point pitch. The old aim/center bits were consumed by
+    // local UI-side view machinery and fought MP centering; q16horz is the field
+    // every peer actually integrates in P_ProcessInput. Preserve wantHoriz and
+    // bound the per-tic command to six horizon units.
+    int32_t const aimDz = seesTarget ? tgZ - ps->pos.z : 0; // z grows down
+    in.q16horz = Bot_CombatHorizonDelta(ps->q16horiz, ps->q16horizoff, aimDz,
+                                         seesTarget ? dist2d : 0);
+
+    fix16_t const futureAng = fix16_sadd(ps->q16ang, in.q16avel) & 0x7ffffff;
+    fix16_t const futureHoriz = fix16_clamp(fix16_sadd(ps->q16horiz, in.q16horz),
+                                            F16(HORIZ_MIN), F16(HORIZ_MAX));
+    botshotprobe_t shotProbe = {};
+    shotProbe.protectedSeat = -1;
+    if (seesTarget)
     {
-        int const curHoriz = fix16_to_int(ps->q16horiz);
-        if (seesTarget && dist2d > 256)
+        shotProbe = Bot_ProbeShot(k, futureAng, futureHoriz, shotModel, botCoop,
+                                  botTeamGame, targetSprite, tgX, tgY, tgZ);
+        canHit = shotProbe.canHit;
+        ffMate = shotProbe.protectedSeat;
+        int32_t const distT = FindDistance2D(tgX - ps->pos.x, tgY - ps->pos.y);
+        if (canHit || distT + 64 < s_botLastTDist[k])
+            s_botNoHitTics[k] = 0;
+        else if (++s_botNoHitTics[k] > 60)
         {
-            int32_t const dz = tgZ - ps->pos.z;   // eye-to-eye; z grows down
-            int const wantHoriz = clamp(100 - (int)(((int64_t)dz * 16) / max(dist2d, 256)), 60, 140);
-            if (curHoriz < wantHoriz - 6)
-                in.bits |= BIT(SK_AIM_UP);
-            else if (curHoriz > wantHoriz + 6)
-                in.bits |= BIT(SK_AIM_DOWN);
+            s_botTargetHold[k] = 1000;
+            s_botNoHitTics[k] = 0;
         }
-        else if (klabs(curHoriz - 100) > 10)
-            in.bits |= BIT(SK_CENTER_VIEW);
+        s_botLastTDist[k] = distT;
     }
     // MOVEMENT AS A WORLD VELOCITY VECTOR (decoupled from facing). Pick a
     // forward magnitude along the MOVE heading and a strafe magnitude
@@ -4534,7 +4625,14 @@ static input_t Bot_GetInput(int k)
             // The bot still counts as trapped for the join-yield preference.
             if (s_botTrapRounds[k] < 3 && s_botTrapCool[k] == 0)
             {
-                s_botBreakFire[k] = 8;
+                // Hard-trap status alone is never authority to shoot. Arm only
+                // if the exact forward first hit is a verified clearing blocker.
+                hitdata_t hit = {};
+                int const a = fix16_to_int(ps->q16ang) & 2047;
+                hitscan(&ps->pos, ps->cursectnum, sintable[(a + 512) & 2047],
+                        sintable[a & 2047], 0, &hit, CLIPMASK1);
+                if (FindDistance2D(hit.xyz.x - ps->pos.x, hit.xyz.y - ps->pos.y) < 2048)
+                    Bot_ClassifyBreakHit(k, hit);
                 s_botTrapCool[k]  = 52;
                 in.bits |= BIT(SK_OPEN);
             }
@@ -4761,7 +4859,7 @@ static input_t Bot_GetInput(int k)
     // (#6) FRIENDLY-FIRE LINE VETO: a teammate on the fire solution suppresses
     // the shot (ffMate was resolved in the canHit trace; DM has no teams so it
     // is always -1 and this is a no-op there).
-    bool const fire = aimReady && reactReady && throttleOK && ffMate < 0;
+    bool const fire = aimReady && reactReady && throttleOK && !shotProbe.safetyVeto;
     if (fire)
         in.bits |= BIT(SK_FIRE);
     {
@@ -4772,18 +4870,27 @@ static input_t Bot_GetInput(int k)
         if (g_netForensics && canHit)
             LOG_F(INFO, "[aimr] seat=%d sightTics=%d react=%d fired=%d",
                   k, (int)s_botFireSight[k], (int)reactTics[skill], (int)fire);
-        if (g_netForensics && aimReady && reactReady && throttleOK && ffMate >= 0)
+        if (g_netForensics && aimReady && reactReady && throttleOK && shotProbe.safetyVeto)
             LOG_F(INFO, "[ffveto] seat=%d blocked teammate=%d", k, ffMate);
     }
-    // Blocker-clearing burst ("if an item is in the way of exiting a room,
-    // destroy it"): fires along the facing while stuck, only when no player
-    // is visible and outside the post-spawn pacifist window. Bullets against
-    // walls/doors are harmless; barrels and crates stop blocking.
-    if (!fire && s_botBreakFire[k] > 0 && s_botSpawnRoam[k] == 0)
+    // Exact blocker latch: it does not bypass reaction/throttle/FF discipline.
+    // Require no combat target, the same mapped first blocker, and a safe direct/
+    // splash corridor. Any mismatch clears the latch rather than spraying.
+    if (!hasTgt && s_botBreakFire[k] > 0 && s_botSpawnRoam[k] == 0)
     {
-        s_botBreakFire[k]--;
-        in.bits |= BIT(SK_FIRE);
+        botshotprobe_t const breakProbe = Bot_ProbeShot(k, futureAng, futureHoriz,
+            shotModel, botCoop, botTeamGame, -1, 0, 0, 0);
+        if (Bot_CombatBreakFireAllowed(hasTgt, breakProbe.breakMatch,
+                                       breakProbe.safetyVeto, throttleOK))
+        {
+            s_botBreakFire[k]--;
+            in.bits |= BIT(SK_FIRE);
+        }
+        else
+            Bot_ClearBreakLatch(k);
     }
+    else if (hasTgt || s_botSpawnRoam[k] != 0)
+        Bot_ClearBreakLatch(k);
 
     // WORLD-SPACE VELOCITIES: P_ProcessInput consumes input.fvel/svel as
     // vel.x/vel.y DIRECTLY (player.cpp ~5903). The brain computes LOCAL
@@ -5972,9 +6079,11 @@ void Net_HandleInput(void)
     // synthesized echo like everyone else, so nobody diverges.
     for (;;)
     {
-        // CPU seats: the master IS their input source. Synthesize their column
-        // for the aggregation tic the moment it is required -- they can never
-        // block, never fill, and their inputs are canonical like anyone's.
+        // CPU seats: the master IS their input source. Build all bot columns for
+        // this exact tic as one host-world decision, then publish the discharge
+        // allow/veto mask reliably. Inputs may be buffered ahead; the auth mask is
+        // computed from the host's current authoritative world and every peer
+        // waits for it before consuming this tic.
         for (i = 0; i < MAXPLAYERS; i++)
             if ((g_netBotMask & (1 << i)) && g_player[i].connected
                 && g_player[i].movefifoend <= movefifosendplc)
@@ -5982,7 +6091,6 @@ void Net_HandleInput(void)
                 inputfifo[g_player[i].movefifoend & (MOVEFIFOSIZ - 1)][i] = Bot_GetInput(i);
                 g_player[i].movefifoend++;
             }
-
         // Required columns for the NEXT aggregation tic: the live chain plus
         // announced joiners whose boundary the cursor has reached. The cursor
         // runs AHEAD of the sim, so an announced joiner may not be seated in

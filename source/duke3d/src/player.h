@@ -424,6 +424,9 @@ extern "C" {
 int     P_GetOverheadPal(const DukePlayer_t *pPlayer);
 
 int Proj_GetDamage(projectile_t const *pProj);
+// Read-only live projectile definition used by draw-free bot shot modelling.
+// Returns DefaultProjectile for an invalid/unconfigured tile, matching A_Shoot.
+projectile_t const *Proj_GetProjectileData(int tile);
 
 void P_SetWeaponGamevars(int playerNum, const DukePlayer_t *pPlayer);
 

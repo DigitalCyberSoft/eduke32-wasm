@@ -172,9 +172,14 @@ static void Proj_DoWaterTracers(vec3_t startPos, vec3_t const *endPos, int n, in
     }
 }
 
-static inline projectile_t *Proj_GetProjectile(int tile)
+projectile_t const *Proj_GetProjectileData(int tile)
 {
     return ((unsigned)tile < MAXTILES && g_tile[tile].proj) ? g_tile[tile].proj : &DefaultProjectile;
+}
+
+static inline projectile_t *Proj_GetProjectile(int tile)
+{
+    return const_cast<projectile_t *>(Proj_GetProjectileData(tile));
 }
 
 static void A_HitscanProjTrail(const vec3_t *startPos, const vec3_t *endPos, int projAng, int tileNum, int16_t sectNum)
