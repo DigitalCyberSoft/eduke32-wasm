@@ -608,7 +608,11 @@ public:
             tokenToDevice_[slots[i]] = device;
             deviceToToken_[device] = slots[i];
         }
-        return nextFreeSlot();
+        uint32_t occupiedMask = 0;
+        for (auto const &entry : tokenToDevice_)
+            if (net_native_valid_guest_slot(entry.first))
+                occupiedMask |= 1u << entry.first;
+        return net_native_allocate_guest_slot(occupiedMask, (uint32_t)Net_GetBotMask());
     }
 #endif
 

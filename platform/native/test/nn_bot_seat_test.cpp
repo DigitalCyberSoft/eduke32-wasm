@@ -21,11 +21,11 @@ void Net_ReceiveFrame(int, int, const unsigned char *, int) {}
 void Net_PeerEvent(int, int) {}
 void Net_SetLocalIndex(int) {}
 void Net_SnapshotReady(int, int, int) {}
+int Net_GetBotMask(void) { return 1 << 1; }
 void NetMenu_SetStatus(const char *) {}
 void NetMenu_SetRoster(const char *) {}
 void NetMenu_OnJoined(int) {}
 const char *Net_NativeGrpPath(void) { return ""; }
-uint32_t Bcrc32(const void *, int, uint32_t crc) { return crc; }
 }
 
 static int expectEq(const char *id, int actual, int expected)
