@@ -2461,9 +2461,11 @@ int G_EnterLevel(int gameMode)
     // weapons grant ammo afresh (see g_coopWeapGrab in gameexec.cpp).
     { extern uint16_t g_coopWeapGrab[MAXSPRITES]; Bmemset(g_coopWeapGrab, 0, sizeof(g_coopWeapGrab)); }
 
-    // Stream-mode coop: sprite indices are reused across levels, so drop every
-    // stale replay-kill latch before the new map's actors take those slots.
+    // Stream-mode coop and bot planners both retain map-indexed identities.
+    // Board/spawn setup is complete here and the input barrier has not resumed,
+    // so invalidate them before any generated bot tic can inspect the new map.
     Net_StreamClearDeadActors();
+    Net_BotResetLevel();
 
     ud.last_level = ud.level_number+1;
 

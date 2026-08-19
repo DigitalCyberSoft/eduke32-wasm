@@ -18,6 +18,8 @@ LIBDIRS="-L $PREFIX/lib -L $PREFIX/usr/lib64 -L $PREFIX/lib64 -Wl,-rpath,$PREFIX
 CXX="${CXX:-g++} -std=c++17 -O2 -Wall -Wno-narrowing"
 
 echo "== build native transport test CLIs (prefix=$PREFIX) =="
+$CXX $INC -I "$ROOT/source/duke3d/src" \
+     "$ROOT/platform/native/test/nn_bot_lifecycle_test.cpp" -o "$OUT/bot_lifecycle_test"
 $CXX $INC "$ROOT/platform/native/test/nn_crypto_test.cpp" -o "$OUT/crypto_test" $LIBDIRS -lsecp256k1 -lcrypto
 $CXX $INC "$ROOT/platform/native/test/nn_nostr_test.cpp"  -o "$OUT/nostr_test"  $LIBDIRS -lsecp256k1 -lcrypto
 # relay transport now runs over libcurl (OpenSSL WebSocket), not libdatachannel.
@@ -39,6 +41,8 @@ export LD_LIBRARY_PATH="$PREFIX/usr/lib64:$PREFIX/lib64:${LD_LIBRARY_PATH:-}"
 
 echo "== Phase 2 mode/team deterministic gate =="
 "$OUT/phase2_mode_test"
+echo "== bot lifecycle policy =="
+"$OUT/bot_lifecycle_test"
 echo "== crypto selftest =="
 "$OUT/crypto_test" selftest
 echo "== crypto interop vs nostr-tools/WebCrypto =="

@@ -1639,6 +1639,9 @@ extern "C" {
 
 static void netmenu_host(void)
 {
+    // A new transport match starts with human ownership. Localbot is a
+    // diagnostic for the session that enabled it, never a sticky preference.
+    Net_SetLocalBot(0);
     // Commit the autoaim match rule before hosting: the flag rides
     // ud.m_dmflags in the settings replication, so every guest enforces it.
     if (s_netAutoAim)
@@ -1664,6 +1667,7 @@ static void netmenu_host(void)
 }
 static void netmenu_join_row(int idx)
 {
+    Net_SetLocalBot(0);
 #ifdef __EMSCRIPTEN__
     char player[80], script[160];
     netmenu_js_quote(player, sizeof player, szPlayerName);
@@ -1675,6 +1679,7 @@ static void netmenu_join_row(int idx)
 }
 static void netmenu_join_code(void)
 {
+    Net_SetLocalBot(0);
 #ifdef __EMSCRIPTEN__
     // Static: a full invite is ~500 chars and js_quote can double it; the old
     // code[176]/script[320] silently truncated every real invite into "invalid code".
@@ -1715,6 +1720,7 @@ static void netmenu_browse(int start)
 static void netmenu_leave(void)
 {
     s_netHosting = 0;
+    Net_SetLocalBot(0);
 #ifdef __EMSCRIPTEN__
     emscripten_run_script("window.NetMenu&&window.NetMenu.leave()");
 #else

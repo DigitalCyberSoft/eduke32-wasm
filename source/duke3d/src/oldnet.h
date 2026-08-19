@@ -226,10 +226,12 @@ int Net_GetBotMask(void);
 extern int32_t g_netBotSkill;     // 0..2, host-side only
 extern int32_t g_netMinPlayers;   // bots fill to this count, yield as humans join
 extern int32_t g_netLocalBot;     // TEST MODE: own input from the bot brain
+void Net_SetLocalBot(int on);     // session-scoped toggle; resets local BODY state
 void Net_SeatBots(int minPlayers, int skill); // host: retain/fill seats up to floor pre-launch/relaunch
 #ifdef NETNATIVE
 int Net_TestSeatBotsRelaunch(void); // deterministic H01 characterization fixture
 #endif
+void Net_BotResetLevel(void);     // G_EnterLevel: clear all map-indexed bot state
 void Net_LmsResetLevel(void);     // every G_EnterLevel: fresh LMS match state, or clear stale non-LMS state
 void Net_LmsTick(void);           // host authoritative LMS round manager
 int  Net_LmsAllowRespawn(int playerNum); // host spends LMS lives; guests never spend independently

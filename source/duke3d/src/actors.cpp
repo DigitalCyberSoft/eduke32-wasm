@@ -1477,7 +1477,7 @@ int A_IncurDamage(int const spriteNum)
 #endif
         pSprite->extra -= pActor->htextra;
 
-#if defined(__EMSCRIPTEN__) && defined(NETDUKE32)
+#if defined(NETDUKE32) && (defined(__EMSCRIPTEN__) || defined(NETNATIVE))
         // BOT RETALIATION on ANY hit (user 2026-08-10): stock stamps
         // wackedbyactor only on death, so a bot never knew who was chipping at
         // it. For a surviving BOT victim on the host, record the attacking

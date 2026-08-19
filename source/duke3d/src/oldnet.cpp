@@ -2,6 +2,7 @@
 
 #include "duke3d.h"
 #include "oldnet.h"
+#include "bot_lifecycle.h"
 
 // Forward decl: file-static, defined mid-file; the seat-mask receive path in the
 // packet dispatch runs before it textually.
@@ -790,8 +791,15 @@ static int16_t s_botNoHitTics[MAXPLAYERS];   // visible-but-unhittable streak (f
 static int32_t s_botLastTDist[MAXPLAYERS];   // pursuit progress: last distance to target
 static int32_t s_botNavX[MAXPLAYERS], s_botNavY[MAXPLAYERS];  // first portal midpoint
 static int8_t  s_botNavOn[MAXPLAYERS];
-static int16_t s_botUnreach[MAXPLAYERS];      // tics the locked target has had NO mesh route (unreachable elevation)
+// Latest route verdict for the CURRENT combat target. The verdict is refreshed
+// only by a real route query (think cadence), while failedTics advances once
+// per generated input tic below. This keeps "40 failed tics" independent of
+// skill/reaction cadence without running extra pathfinds or consuming RNG.
+static BotRouteFailureState s_botRouteFail[MAXPLAYERS];
 static int16_t s_botLastSect[MAXPLAYERS];    // re-plan the route on sector crossings
+static uint8_t s_botLive[MAXPLAYERS];       // body has been anchored to a live spawn
+static int32_t s_botSepPlc = -1;            // level-scoped separation telemetry
+static int32_t s_botCamLogPlc[MAXPLAYERS];  // level-scoped viewscreen telemetry
 static int8_t  s_botTurnPref[MAXPLAYERS];    // wall-following handedness (+1/-1)
 static int16_t s_botTrapTics[MAXPLAYERS];    // zero-net-displacement streak (hard trap)
 static vec2_t  s_botTrapAnchor[MAXPLAYERS];
@@ -1512,6 +1520,247 @@ static int32_t s_botRouteDX[MAXPLAYERS], s_botRouteDY[MAXPLAYERS];
 static int16_t s_botRouteCool[MAXPLAYERS];
 static int8_t  s_botWpDoor[MAXPLAYERS];      // upcoming waypoint is a door tile
 
+// Central lifecycle contract. BODY is every state bit owned by one physical
+// incarnation/seat use; LEVEL additionally clears all identities, coordinates,
+// timestamps and telemetry whose meaning depends on the current board. Keep
+// this helper draw-free: in particular it never touches s_botRng.
+enum BotResetScope { BOT_RESET_BODY, BOT_RESET_LEVEL };
+static void Bot_ResetSeat(int k, BotResetScope scope)
+{
+    if ((unsigned)k >= MAXPLAYERS)
+        return;
+
+    // Target, awareness, retaliation, aim and fire state.
+    s_botTarget[k]       = -1;
+    s_botMonTgt[k]       = -1;
+    s_botPending[k]      = -1;
+    s_botSeeStreak[k]    = 0;
+    s_botLastWacked[k]   = -1;
+    s_botSightTics[k]    = 400;
+    s_botTargetHold[k]   = 0;
+    s_botNoHitTics[k]    = 0;
+    s_botLastTDist[k]    = INT32_MAX;
+    s_botFireSight[k]    = 0;
+    s_botTgtSX[k]        = 0;
+    s_botTgtSY[k]        = 0;
+    s_botTgtVX[k]        = 0;
+    s_botTgtVY[k]        = 0;
+    s_botTgtSnap[k]      = 0;
+    s_botTgtVValid[k]    = 0;
+    s_botAimDegrade[k]   = 0;
+    s_botViewVel[k]      = 0;
+    s_botThrWait[k]      = 0;
+    s_botThrShoot[k]     = 0;
+    s_botBurst[k]        = 0;
+    s_botBreakFire[k]    = 0;
+    s_botSeenX[k]        = 0;
+    s_botSeenY[k]        = 0;
+    s_botSeenZ[k]        = 0;
+    s_botSeenSect[k]     = -1;
+    s_botSeenValid[k]    = 0;
+
+    // Body motion, bounce/lane/open/stuck/trap and fresh-anchor state.
+    s_botLive[k]         = 0;
+    s_botWasDead[k]      = 0;
+    s_botSpawnRoam[k]    = 0;
+    s_botStrafeDir[k]    = 0;
+    s_botStrafeTic[k]    = 0;
+    s_botStrafeFail[k]   = 0;
+    s_botWantStrafe[k]   = 0;
+    s_botWanderAng[k]    = 0;
+    s_botThinkHold[k]    = 0;
+    s_botLastPos[k]      = {};
+    s_botStuckTics[k]    = 0;
+    s_botStuckEpisodes[k]= 0;
+    s_botBounceHold[k]   = 0;
+    s_botBounceAng[k]    = 0;
+    s_botTurnPref[k]     = 0;
+    s_botOpenGrace[k]    = 0;
+    s_botLaneAng[k]      = 0;
+    s_botLaneHold[k]     = 0;
+    s_botThreadFails[k]  = 0;
+    s_botJumpCool[k]     = 0;
+    s_botTrapTics[k]     = 0;
+    s_botTrapAnchor[k]   = {};
+    s_botTrapCool[k]     = 0;
+    s_botTrapDir[k]      = 0;
+    s_botTrapRounds[k]   = 0;
+
+    // Goal, navigation, route and reachability verdict state.
+    s_botNavX[k]         = 0;
+    s_botNavY[k]         = 0;
+    s_botNavOn[k]        = 0;
+    s_botNavSeen[k]      = 0;
+    s_botRouteFail[k]    = {};
+    s_botRouteFail[k].target = -1;
+    s_botLastSect[k]     = -1;
+    s_botGoal[k]         = 0;
+    s_botGoalX[k]        = 0;
+    s_botGoalY[k]        = 0;
+    s_botGoalSect[k]     = -1;
+    s_botGoalTics[k]     = 0;
+    s_botGoalDoor[k]     = 0;
+    s_botGoalCrouch[k]   = 0;
+    s_botGoalItem[k]     = -1;
+    s_botGoalSeen[k]     = 0;
+    s_botGoalNear[k]     = 0;
+    s_botGoalStall[k]    = 0;
+    s_botGoalIsLtg[k]    = 0;
+    s_botRouteLen[k]     = 0;
+    s_botRouteIdx[k]     = 0;
+    s_botRouteDX[k]      = 0;
+    s_botRouteDY[k]      = 0;
+    s_botRouteCool[k]    = 0;
+    s_botWpDoor[k]       = 0;
+    Bmemset(s_botRtX[k], 0, sizeof(s_botRtX[k]));
+    Bmemset(s_botRtY[k], 0, sizeof(s_botRtY[k]));
+
+    // Jet navigation is body-transient. Activation counters are level telemetry.
+    s_botJetHold[k]      = 0;
+    s_botJetCool[k]      = 0;
+
+    if (scope != BOT_RESET_LEVEL)
+        return;
+
+    // Every board-indexed identity or sentinel is invalid on a new map.
+    Bmemset(s_botVisitT[k], 0, sizeof(s_botVisitT[k]));
+    for (int i = 0; i < BOT_DEAD_N; i++)
+    {
+        s_botDeadSect[k][i] = -1;
+        s_botDeadCool[k][i] = 0;
+    }
+    for (int i = 0; i < BOT_IAVOID_N; i++)
+    {
+        s_botItemAvoid[k][i]    = -1;
+        s_botItemAvoidTil[k][i] = 0;
+    }
+    for (int i = 0; i < BOT_EAVOID_N; i++)
+    {
+        s_botEdgeFrom[k][i]  = -1;
+        s_botEdgeTo[k][i]    = -1;
+        s_botEdgeTries[k][i] = 0;
+        s_botEdgeUntil[k][i] = 0;
+    }
+    for (int i = 0; i < BOT_WSPOT_N; i++)
+    {
+        s_botWspotX[k][i]     = 0;
+        s_botWspotY[k][i]     = 0;
+        s_botWspotUntil[k][i] = 0;
+    }
+    s_botPrevSect[k]     = -1;
+    s_botItemShun[k]     = -1;
+    s_botLtgX[k]         = 0;
+    s_botLtgY[k]         = 0;
+    s_botLtgSect[k]      = -1;
+    s_botLtgKind[k]      = 0;
+    s_botLtgItem[k]      = -1;
+    s_botLtgUntil[k]     = 0;
+    s_botLtgFails[k]     = 0;
+    s_botLtgAnchor[k]    = {};
+    s_botLtgLocal[k]     = 0;
+    Bmemset(s_botRoamBm[k], 0, sizeof(s_botRoamBm[k]));
+    s_botRoamCnt[k]      = 0;
+    s_botRoamLogPlc[k]   = 0;
+    s_botStillTics[k]    = 0;
+    s_botIdleTics[k]     = 0;
+    s_botTeamLogged[k]   = 0;
+    s_botJumps[k]        = 0;
+    s_botMedUses[k]      = 0;
+    s_botSterUses[k]     = 0;
+    s_botJetActs[k]      = 0;
+    s_botInvLogPlc[k]    = 0;
+    s_botCamLogPlc[k]    = 0;
+}
+
+void Net_BotResetLevel(void)
+{
+    for (int k = 0; k < MAXPLAYERS; k++)
+        Bot_ResetSeat(k, BOT_RESET_LEVEL);
+
+    // Force reconstruction from the freshly-loaded board and clear scratch
+    // identities that otherwise retain old sector/tile indices across maps.
+    s_nvgStamp = -1;
+    s_nvgW = s_nvgH = 0;
+    s_nvgBfsGen = 0;
+    Bmemset(s_nvgBfsSeen, 0, sizeof(s_nvgBfsSeen));
+    Bmemset(s_nvgBfsParent, 0, sizeof(s_nvgBfsParent));
+    Bmemset(s_nvgBfsQueue, 0, sizeof(s_nvgBfsQueue));
+    for (int s = 0; s < MAXSECTORS; s++)
+    {
+        s_ltgSectDist[s] = -1;
+        s_ltgSectTile[s] = -1;
+    }
+    s_botSepPlc = -1;
+}
+
+// Side-effect-free validity check for a retained/acquired player target. Callers
+// decide how to clear state; this predicate only reads canonical roster/body
+// state. Team filtering belongs here so every retention/materialization path uses
+// the same definition as acquisition.
+static bool Bot_IsLivePlayerTarget(int k, int target, DukePlayer_t const *bot,
+                                   bool teamGame)
+{
+    if ((unsigned)k >= MAXPLAYERS || (unsigned)target >= MAXPLAYERS || target == k
+        || bot == NULL || !g_player[target].connected)
+        return false;
+    auto const tp = g_player[target].ps;
+    if (tp == NULL || (unsigned)tp->i >= MAXSPRITES
+        || (unsigned)tp->cursectnum >= (unsigned)numsectors || tp->dead_flag)
+        return false;
+    auto const &sp = sprite[tp->i];
+    return BotLivePlayerTarget({ k, target, MAXPLAYERS, 1, 1,
+        tp->i, MAXSPRITES, tp->cursectnum, numsectors, tp->dead_flag,
+        sp.statnum, MAXSTATUS, sp.picnum, APLAYER, sp.yvel, sp.extra,
+        teamGame ? 1 : 0, bot->team, tp->team });
+}
+
+static bool Bot_IsLiveMonsterTarget(int target)
+{
+    if ((unsigned)target >= MAXSPRITES)
+        return false;
+    auto const &sp = sprite[target];
+    return sp.statnum < MAXSTATUS && !(sp.cstat & 32768) && sp.extra > 0
+        && (unsigned)sp.sectnum < (unsigned)numsectors && A_CheckEnemySprite(&sp);
+}
+
+// Clear only combat-owned state: disengagement must hand movement back to the
+// roam/escort planner rather than resetting unrelated body/world memory.
+static void Bot_ClearTargetState(int k)
+{
+    s_botTarget[k]       = -1;
+    s_botMonTgt[k]       = -1;
+    s_botPending[k]      = -1;
+    s_botSeeStreak[k]    = 0;
+    s_botLastWacked[k]   = -1;
+    s_botSightTics[k]    = 400;
+    s_botTargetHold[k]   = 0;
+    s_botNoHitTics[k]    = 0;
+    s_botLastTDist[k]    = INT32_MAX;
+    s_botFireSight[k]    = 0;
+    s_botTgtVValid[k]    = 0;
+    s_botTgtVX[k]        = 0;
+    s_botTgtVY[k]        = 0;
+    s_botTgtSnap[k]      = 0;
+    s_botAimDegrade[k]   = 0;
+    s_botViewVel[k]      = 0;
+    s_botThrWait[k]      = 0;
+    s_botThrShoot[k]     = 0;
+    s_botSeenValid[k]    = 0;
+    s_botNavOn[k]        = 0;
+    s_botNavSeen[k]      = 0;
+    s_botRouteFail[k]    = {};
+    s_botRouteFail[k].target = -1;
+    s_botRouteLen[k]     = 0;
+    s_botRouteIdx[k]     = 0;
+    s_botRouteCool[k]    = 0;
+    s_botWpDoor[k]       = 0;
+}
+
+static void Bot_SetCombatRouteResult(int k, int kind, int target, bool success)
+{
+    BotRouteStoreResult(s_botRouteFail[k], kind, target, success);
+}
+
 // Does the straight walk cross a crawl-height (duct) tile? Bot_LineWalkable
 // is deliberately CEILING-blind, so the straight-shot legs could tunnel a
 // march into the vent system the router now refuses -- same bypass the
@@ -1868,7 +2117,8 @@ static int Bot_AcquireMonster(int k, DukePlayer_t *ps)
     {
         auto const &s = sprite[i];
         if (s.extra <= 0 || (s.cstat & 32768) || !A_CheckEnemySprite(&s)
-            || (unsigned)s.sectnum >= (unsigned)numsectors)
+            || (unsigned)s.sectnum >= (unsigned)numsectors
+            || Bot_DeadExitActive(k, s.sectnum))
             continue;
         int32_t const d = klabs(s.x - ps->pos.x) + klabs(s.y - ps->pos.y) + (klabs(s.z - ps->pos.z) >> 2);
         if (d >= bestd)
@@ -1880,7 +2130,7 @@ static int Bot_AcquireMonster(int k, DukePlayer_t *ps)
     if (best < 0)   // pursuit memory: keep the last enemy briefly through occlusion
     {
         int const m = s_botMonTgt[k];
-        if ((unsigned)m < MAXSPRITES && sprite[m].extra > 0 && A_CheckEnemySprite(&sprite[m])
+        if (Bot_IsLiveMonsterTarget(m) && !Bot_DeadExitActive(k, sprite[m].sectnum)
             && s_botSightTics[k] < 130)
             best = m;
     }
@@ -2342,10 +2592,9 @@ static input_t Bot_GetInput(int k)
     // conversion (close but missing).
     {
         extern int32_t g_netForensics;
-        static int32_t s_sepPlc = -1;
-        if (g_netForensics && (movefifoplc & 511) == 0 && movefifoplc != s_sepPlc)
+        if (g_netForensics && (movefifoplc & 511) == 0 && movefifoplc != s_botSepPlc)
         {
-            s_sepPlc = movefifoplc;
+            s_botSepPlc = movefifoplc;
             int32_t minSep = INT32_MAX; int a, b;
             TRAVERSE_CONNECT(a)
             {
@@ -2402,81 +2651,28 @@ static input_t Bot_GetInput(int k)
     // computed a garbage "escape heading" from the origin vector, and a bot
     // that got pinned before real travel held that compass line into a wall
     // forever (the user's "doing that east thing", live 2026-08-10).
+    if (!s_botLive[k])
     {
-        static uint8_t s_botLive[MAXPLAYERS];
-        if (!s_botLive[k])
-        {
-            s_botLive[k]       = 1;
-            s_botTrapAnchor[k] = ps->pos.xy;
-            s_botTrapDir[k]    = (int16_t)(fix16_to_int(ps->q16ang) & 2047);
-            s_botBounceAng[k]  = s_botTrapDir[k];
-            // Zero-init garbage sweep for the AUTOLAUNCH path: Net_SeatBots
-            // (which clears combat locks for menu-hosted matches) never runs
-            // under NN_ROLE, so seat 0's static target default of 0 read as
-            // "locked on player 0" -- the HOST bot chasing ITSELF (measured:
-            // a statue host for the whole first life of every native probe).
-            s_botTarget[k]     = -1;
-            s_botMonTgt[k]     = -1;
-            s_botUnreach[k]    = 0;
-            s_botPending[k]    = -1;
-            s_botItemShun[k]   = -1;
-            s_botLastWacked[k] = -1;
-            s_botSightTics[k]  = 400;   // nothing has ever been SEEN
-        }
+        // The authoritative reset paths should have run already. Keep this
+        // first-live fallback centralized too: no ad-hoc target fragments.
+        Bot_ResetSeat(k, BOT_RESET_BODY);
+        s_botLive[k]       = 1;
+        s_botTrapAnchor[k] = ps->pos.xy;
+        s_botTrapDir[k]    = (int16_t)(fix16_to_int(ps->q16ang) & 2047);
+        s_botBounceAng[k]  = s_botTrapDir[k];
     }
     if (s_botWasDead[k])
     {
-        // Fresh spawn: DISPERSE before re-engaging. Without this, mutually
-        // visible spawns lock bots into an endless in-place kill loop (seen:
-        // 90s soak, position spread 220 map units) -- nobody ever roams the
-        // map to find the humans.
-        s_botWasDead[k]  = 0;
-        // No post-spawn dispersal: it was built to stop a pistol-era spawn
-        // bloodbath, but it turned the deterministic bot ballet into bots
-        // orbiting an empty map (measured: ~88 discharges and near-zero body
-        // hits in 8 minutes). Respawns now re-enter the fight -- with the
-        // shotgun loadout, continuous spawn-cluster combat IS the arena.
-        s_botSpawnRoam[k] = 0;
-        s_botWanderAng[k] = (int16_t)(Bot_Rnd() & 2047);
-        s_botGoal[k]      = 0;      // spawned somewhere new: fresh errand
-        s_botMonTgt[k]    = -1;     // no coop monster lock across a respawn
-        s_botUnreach[k]   = 0;      // fresh body: no unreachable-target timer
-        s_botTarget[k]    = -1;     // and no player lock either: the old code let
-        s_botPending[k]   = -1;     //   sightTics=200 age it out against the 130-tic
-                                    //   retention; the wider last-seen window (260)
-                                    //   outlived that trick, so drop it EXPLICITLY
-        s_botGoalItem[k]  = -1;
-        s_botItemShun[k]  = -1;
-        s_botPrevSect[k]  = -1;     // teleported in -- no entry door to shun
-        s_botSightTics[k] = 400;    // stale target: must re-SEE (or be shot) to re-engage
-        s_botGoalSeen[k]  = 0;
-        s_botNavSeen[k]   = 0;
-        s_botTrapAnchor[k] = ps->pos.xy;    // respawn is a teleport: re-anchor
+        // A respawn is a new physical incarnation. Run the same BODY contract as
+        // seat reuse/localbot toggles, but preserve the private RNG cadence: the
+        // historical respawn path consumed exactly one wander draw here.
+        int16_t const respawnWander = (int16_t)(Bot_Rnd() & 2047);
+        Bot_ResetSeat(k, BOT_RESET_BODY);
+        s_botWanderAng[k]  = respawnWander;
+        s_botLive[k]       = 1;
+        s_botTrapAnchor[k] = ps->pos.xy;
         s_botTrapDir[k]    = (int16_t)(fix16_to_int(ps->q16ang) & 2047);
-        s_botTrapTics[k]   = 0;
-        s_botRouteLen[k]   = 0;             // routes don't survive teleports
-        s_botRouteCool[k]  = 0;
-        s_botJetHold[k]    = 0;             // fresh body: no jet-nav carryover
-        s_botJetCool[k]    = 0;             // (activation tallies persist -- telemetry)
-        for (int di = 0; di < BOT_DEAD_N; di++) // a teleport changes reachability:
-            s_botDeadCool[k][di] = 0;           // forget which exits were impossible
-        Bot_LtgEnd(k, "death");             // respawned elsewhere: the committed march is void
-        s_botLtgFails[k]  = 0;
-        s_botLtgLocal[k]  = 0;
-        s_botGoalIsLtg[k] = 0;
-        s_botSeenValid[k] = 0;              // last-seen snapshot dies with the body
-        for (int ei = 0; ei < BOT_EAVOID_N; ei++)   // reachability changed with the teleport
-            { s_botEdgeUntil[k][ei] = 0; s_botEdgeTries[k][ei] = 0; }
-        // wave-3b combat/aim model: a new body has no target sight, no velocity
-        // baseline, no carried view momentum or throttle/strafe phase
-        s_botFireSight[k]  = 0;
-        s_botTgtVValid[k]  = 0;  s_botTgtVX[k] = 0;  s_botTgtVY[k] = 0;  s_botTgtSnap[k] = 0;
-        s_botAimDegrade[k] = 0;
-        s_botViewVel[k]    = 0;
-        s_botThrWait[k]    = 0;  s_botThrShoot[k] = 0;
-        s_botStrafeTic[k]  = 0;  s_botStrafeFail[k] = 0;  s_botWantStrafe[k] = 0;
-        // (the item respawn ring PERSISTS: it is world knowledge, not body state;
-        // the roam bitmap persists too -- the [roam] meter is per-LEVEL)
+        s_botBounceAng[k]  = s_botTrapDir[k];
     }
 
     int const skill = clamp(g_botSkillEnv >= 0 ? g_botSkillEnv : g_netBotSkill, 0, 3);
@@ -2614,8 +2810,9 @@ static input_t Bot_GetInput(int k)
             // Coop retaliation targets a MONSTER attacker only. A hit from a
             // human teammate (stray shot, splash) NEVER makes the bot turn on a
             // player -- it stays on monsters and roaming.
-            if ((unsigned)wa < MAXSPRITES && wa != s_botLastWacked[k] && wa != s_botMonTgt[k]
-                && sprite[wa].extra > 0 && A_CheckEnemySprite(&sprite[wa]))
+            if (wa != s_botLastWacked[k] && wa != s_botMonTgt[k]
+                && Bot_IsLiveMonsterTarget(wa)
+                && !Bot_DeadExitActive(k, sprite[wa].sectnum))
             {
                 s_botMonTgt[k]     = (int16_t)wa;   // lock the monster that hit us
                 s_botTargetHold[k] = 0;
@@ -2636,12 +2833,7 @@ static input_t Bot_GetInput(int k)
         {
             int const atk = sprite[wa].yvel;
             if (wa != s_botLastWacked[k] && atk != s_botTarget[k]
-                && g_player[atk].connected && g_player[atk].ps != NULL
-                && (unsigned)g_player[atk].ps->i < MAXSPRITES
-                && sprite[g_player[atk].ps->i].extra > 0
-                // TDM: a teammate's stray splash is not a war (their damage is
-                // nulled anyway -- locking onto them wasted the whole match)
-                && !(botTeamGame && g_player[atk].ps->team == ps->team))
+                && Bot_IsLivePlayerTarget(k, atk, ps, botTeamGame))
             {
                 s_botTarget[k]     = (int8_t)atk;   // hard-lock onto the attacker NOW
                 s_botTargetHold[k] = 0;
@@ -2675,7 +2867,15 @@ static input_t Bot_GetInput(int k)
             // route to it, and drop the room errand so the fight is prosecuted.
             // No monster in sight -> patrol via the explore planner (players are
             // never hunted). This whole branch is player-blind by construction.
+            int const oldMon = s_botMonTgt[k];
             int const mon = Bot_AcquireMonster(k, ps);
+            if (mon != oldMon)
+            {
+                Bot_SetCombatRouteResult(k, BOT_TARGET_NONE, -1, false);
+                s_botFireSight[k] = 0;
+                s_botTgtVValid[k] = 0;
+                s_botSeenValid[k] = 0;
+            }
             s_botMonTgt[k] = (int16_t)mon;
             s_botTarget[k] = -1;              // never a player target in coop
             s_botNavOn[k]  = 0;
@@ -2693,6 +2893,7 @@ static input_t Bot_GetInput(int k)
                     s_botNavX[k]    = sprite[mon].x;
                     s_botNavY[k]    = sprite[mon].y;
                 }
+                Bot_SetCombatRouteResult(k, 2, mon, s_botNavOn[k] != 0);
                 // A monster to fight: drop the errand -- unless resources are
                 // low and the errand IS the resupply (the priority flip).
                 if (!(prioritizeItems && s_botGoal[k] == 2))
@@ -2700,6 +2901,7 @@ static input_t Bot_GetInput(int k)
             }
             else
             {
+                Bot_SetCombatRouteResult(k, 0, -1, false);
                 // No monster in sight: ESCORT the humans -- but only APPROACH
                 // DIRECTLY when the bot can actually reach the nearest human
                 // (line of sight, i.e. the same room). If the human is in
@@ -2774,10 +2976,7 @@ static input_t Bot_GetInput(int k)
                 && (unsigned)sprite[wa].yvel < MAXPLAYERS)
             {
                 revenge = sprite[wa].yvel;
-                // TDM: no revenge credit for a same-team splash (their
-                // BotSameTeam veto in the enemy scan, ai_dmq3.c:3083).
-                if (botTeamGame && g_player[revenge].ps != NULL
-                    && g_player[revenge].ps->team == ps->team)
+                if (!Bot_IsLivePlayerTarget(k, revenge, ps, botTeamGame))
                     revenge = -1;
             }
         }
@@ -2792,11 +2991,9 @@ static input_t Bot_GetInput(int k)
         int bestSeen = 0;
         TRAVERSE_CONNECT(i)
         {
-            if (i == k || i == avoid) continue;
-            auto const cp = g_player[i].ps;
-            if (cp == NULL || (unsigned)cp->i >= MAXSPRITES || sprite[cp->i].extra <= 0 || cp->dead_flag
-                || (unsigned)cp->cursectnum >= (unsigned)numsectors)
+            if (i == k || i == avoid || !Bot_IsLivePlayerTarget(k, i, ps, botTeamGame))
                 continue;
+            auto const cp = g_player[i].ps;
             // TDM TEAM FILTER (audit item 7, bug-level): teammates are not
             // targets -- not as locks, not as "heard" hunting hints. Their
             // damage is nulled (Net_ApplyClientHit / A_IncurDamage), so every
@@ -2851,7 +3048,8 @@ static input_t Bot_GetInput(int k)
         // ai_dmnet.c:2296) -- the touch check below usually ends it sooner.
         // Old wall-tracking pursuit keeps its shorter 130-tic leash.
         if (best < 0 && s_botTarget[k] >= 0 && s_botTarget[k] != avoid
-            && s_botTarget[k] != k      // never retain SELF (stale static garbage)
+            && Bot_IsLivePlayerTarget(k, s_botTarget[k], ps, botTeamGame)
+            && !Bot_DeadExitActive(k, g_player[s_botTarget[k]].ps->cursectnum)
             && s_botSightTics[k] < (g_botLtgOn ? 260 : 130))
             best = s_botTarget[k];      // chase the last sighting briefly
         // REACTION / AWARENESS: don't lock onto a NEWLY-seen player the instant
@@ -2862,7 +3060,9 @@ static input_t Bot_GetInput(int k)
         {
             if (s_botPending[k] != best) { s_botPending[k] = (int8_t)best; s_botSeeStreak[k] = 0; }
             if (s_botSeeStreak[k] < reactTics[skill])
-                best = (s_botTarget[k] >= 0 && s_botSightTics[k] < 130) ? s_botTarget[k] : -1;
+                best = (Bot_IsLivePlayerTarget(k, s_botTarget[k], ps, botTeamGame)
+                        && !Bot_DeadExitActive(k, g_player[s_botTarget[k]].ps->cursectnum)
+                        && s_botSightTics[k] < 130) ? s_botTarget[k] : -1;
             else
                 s_botPending[k] = -1;   // awareness met: promote to a real lock
         }
@@ -2914,35 +3114,9 @@ static input_t Bot_GetInput(int k)
                 s_botNavY[k]    = ry;
             }
         }
-        // ELEVATION-UNREACHABLE TARGET (user 2026-08-18: "bots attack enemies on
-        // elevations they can't reach / keep trying an impossible room change").
-        // The resolver found NO mesh route to this enemy (s_botNavOn stayed 0,
-        // having tried both its live and last-seen spot) -- it is up a ledge or
-        // on a level the bot can't climb to. The steering/fwdSpd gates below
-        // HOLD instead of grinding toward it. If it stays unreachable for ~3s,
-        // LEARN it: blacklist its sector (Bot_MarkDeadExit) so acquisition stops
-        // re-locking it, and drop the lock so the bot finds a reachable enemy or
-        // roams. Reachable target (or none) resets the timer.
-        if (best >= 0 && !s_botNavOn[k])
-        {
-            if (s_botUnreach[k] < 3000)
-                s_botUnreach[k]++;
-            if (s_botUnreach[k] >= 40)           // ~1.5s of no route: give this one up + roam
-            {
-                int const tsect = (g_player[best].ps != NULL) ? g_player[best].ps->cursectnum : -1;
-                if ((unsigned)tsect < (unsigned)numsectors)
-                    Bot_MarkDeadExit(k, tsect);
-                extern int32_t g_netForensics;
-                if (g_netForensics)
-                    LOG_F(INFO, "[unreach] seat=%d dropped tgt=%d sect=%d plc=%d",
-                          k, best, tsect, (int)movefifoplc);
-                s_botTarget[k]  = -1;
-                best            = -1;
-                s_botUnreach[k] = 0;
-            }
-        }
-        else
-            s_botUnreach[k] = 0;
+        // Store the newest route verdict; the per-input-tic block below owns
+        // elapsed failure time. A think pass never advances the counter itself.
+        Bot_SetCombatRouteResult(k, best >= 0 ? 1 : 0, best, s_botNavOn[k] != 0);
         if (best >= 0 && (bestSeen || s_botNavOn[k])
             && !(prioritizeItems && s_botGoal[k] == 2))
             s_botGoal[k] = 0;           // a fight we can PROSECUTE: drop the errand
@@ -3027,6 +3201,45 @@ static input_t Bot_GetInput(int k)
             && (s_botTarget[k] >= 0 || (botCoop && s_botMonTgt[k] >= 0)))
             Bot_PlanItem(k, ps);
     }
+
+    // UNREACHABLE COMBAT TARGET: the latest route result is sampled at think
+    // cadence, but elapsed failure time advances exactly once per generated bot
+    // input tic. Success/no target/target change reset it immediately. The same
+    // state machine serves DM players and coop monsters.
+    {
+        int const kind = botCoop ? 2 : 1;
+        int const target = botCoop ? s_botMonTgt[k] : s_botTarget[k];
+        bool const live = botCoop ? Bot_IsLiveMonsterTarget(target)
+                                  : Bot_IsLivePlayerTarget(k, target, ps, botTeamGame);
+        bool const disengage = BotRouteFailureTick(s_botRouteFail[k], kind, target, live);
+
+        if (disengage)
+        {
+            int const tsect = botCoop ? sprite[target].sectnum
+                                      : g_player[target].ps->cursectnum;
+            if ((unsigned)tsect < (unsigned)numsectors)
+                Bot_MarkDeadExit(k, tsect);
+            extern int32_t g_netForensics;
+            if (g_netForensics)
+                LOG_F(INFO, "[unreach] seat=%d dropped %s=%d sect=%d failedTics=%d plc=%d",
+                      k, botCoop ? "mon" : "tgt", target, tsect,
+                      (int)s_botRouteFail[k].failedTics, (int)movefifoplc);
+            Bot_ClearTargetState(k);
+            s_botThinkHold[k] = 0; // next input replans roam/escort immediately
+        }
+    }
+
+    // If the current identity/body stopped being a legal target, release it
+    // before any target coordinate is read. This also covers invalidation between
+    // think passes (disconnect, death/corpse, team change, sprite reuse).
+    if (botCoop)
+    {
+        if (s_botMonTgt[k] >= 0 && !Bot_IsLiveMonsterTarget(s_botMonTgt[k]))
+            Bot_ClearTargetState(k);
+    }
+    else if (s_botTarget[k] >= 0
+             && !Bot_IsLivePlayerTarget(k, s_botTarget[k], ps, botTeamGame))
+        Bot_ClearTargetState(k);
 
     // Stuck detection: intending to move but the feet aren't (walls, doors,
     // ledges). Trip the wall-bounce: hard random turn held for a while, press
@@ -3414,7 +3627,8 @@ static input_t Bot_GetInput(int k)
     if (s_botTarget[k] >= 0 && s_botTargetHold[k] < 32000)
         s_botTargetHold[k]++;
     int const t = (s_botSpawnRoam[k] > 0) ? -1 : s_botTarget[k];
-    auto const tp = (t >= 0 && g_player[t].connected && g_player[t].ps != NULL) ? g_player[t].ps : NULL;
+    auto const tp = (t >= 0 && Bot_IsLivePlayerTarget(k, t, ps, botTeamGame))
+                  ? g_player[t].ps : NULL;
     // Unified target COORDINATES: a player (DM/TDM) or a monster sprite (coop).
     // Every aim/face/fire computation below reads tgX/tgY/tgZ/tgSect instead of
     // tp-> so one path serves both modes; hasTgt means "there is a target". The
@@ -3426,8 +3640,8 @@ static input_t Bot_GetInput(int k)
     if (botCoop)
     {
         int const ms = s_botMonTgt[k];
-        if (s_botSpawnRoam[k] <= 0 && (unsigned)ms < MAXSPRITES && sprite[ms].extra > 0
-            && A_CheckEnemySprite(&sprite[ms]) && (unsigned)sprite[ms].sectnum < (unsigned)numsectors)
+        if (s_botSpawnRoam[k] <= 0 && Bot_IsLiveMonsterTarget(ms)
+            && !Bot_DeadExitActive(k, sprite[ms].sectnum))
         {
             hasTgt = true;
             tgX = sprite[ms].x; tgY = sprite[ms].y; tgZ = sprite[ms].z - (8 << 8);
@@ -3539,8 +3753,8 @@ static input_t Bot_GetInput(int k)
     if (s_botPending[k] >= 0 && s_botPending[k] < MAXPLAYERS && s_botPending[k] != k)
     {
         auto const pend = g_player[s_botPending[k]].ps;
-        if (pend != NULL && (unsigned)pend->i < MAXSPRITES && sprite[pend->i].extra > 0
-            && !pend->dead_flag && (unsigned)pend->cursectnum < (unsigned)numsectors
+        if (Bot_IsLivePlayerTarget(k, s_botPending[k], ps, botTeamGame)
+            && !Bot_DeadExitActive(k, pend->cursectnum)
             && cansee(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
                       pend->pos.x, pend->pos.y, pend->pos.z, pend->cursectnum))
         {
@@ -3693,7 +3907,7 @@ static input_t Bot_GetInput(int k)
             // blip (route recompute, target skimming an edge tile) still lets
             // the bot close for ~8 tics; a SUSTAINED no-route (ledge above) it
             // holds + shoots, never grinding toward -- until the [unreach] drop.
-            if (s_botNavOn[k] || s_botUnreach[k] <= 8)
+            if (s_botNavOn[k] || s_botRouteFail[k].failedTics <= 8)
                 chaseTgt = true;
             if (!seesTarget)
                 wantAng = (wantAng + (int)(Bot_Rnd() % 129) - 64) & 2047;
@@ -3916,7 +4130,7 @@ static input_t Bot_GetInput(int k)
     // toward it -- the canHit "press"/orbit branches above would still walk the
     // bot into the wall under it. Hold ground (fwdSpd 0) and keep the strafe, so
     // it juke-and-shoots in place instead of grinding until the [unreach] drop.
-    if (hasTgt && !s_botNavOn[k] && s_botUnreach[k] > 8 && fwdSpd > 0)
+    if (hasTgt && !s_botNavOn[k] && s_botRouteFail[k].failedTics > 8 && fwdSpd > 0)
         fwdSpd = 0;
     // Remember whether we commanded a strafe this tic: next tic's flip-on-
     // blocked (above) checks it against the realized displacement.
@@ -4315,11 +4529,10 @@ static input_t Bot_GetInput(int k)
         if (movefifoplc & 1)
             in.bits |= BIT(SK_ESCAPE);
         extern int32_t g_netForensics;
-        static int32_t s_camLogPlc[MAXPLAYERS];
-        if (g_netForensics && (movefifoplc - s_camLogPlc[k] >= 260
-                               || movefifoplc < s_camLogPlc[k]))
+        if (g_netForensics && (movefifoplc - s_botCamLogPlc[k] >= 260
+                               || movefifoplc < s_botCamLogPlc[k]))
         {
-            s_camLogPlc[k] = movefifoplc;
+            s_botCamLogPlc[k] = movefifoplc;
             LOG_F(INFO, "[cam] seat=%d viewscreen lock, clearing (own=%d) plc=%d",
                   k, (int)ps->newowner, (int)movefifoplc);
         }
@@ -4344,6 +4557,17 @@ input_t Net_BotInput(void)
 extern "C" int Net_GetBotMask(void)
 {
     return g_netBotMask;
+}
+
+void Net_SetLocalBot(int on)
+{
+    on = on ? 1 : 0;
+    if (g_netLocalBot == on)
+        return;
+    g_netLocalBot = on;
+    // Enabling/disabling changes the input owner for this seat. Neither owner
+    // inherits the other's lock, route, fire latch or first-live anchor.
+    Bot_ResetSeat(myconnectindex, BOT_RESET_BODY);
 }
 
 #ifdef NETNATIVE
@@ -4373,6 +4597,14 @@ int Net_TestSeatBotsRelaunch(void)
 }
 #endif
 
+#ifdef __EMSCRIPTEN__
+extern "C" void Web_SetLocalBot(int on)
+{
+    Net_SetLocalBot(on);
+    EM_ASM({ console.log('[eng] localBot=' + $0); }, g_netLocalBot);
+}
+#endif
+
 // Seat CPU players (host, pre-launch/relaunch). `minPlayers` is the host's
 // MATCH-SIZE FLOOR: bots only fill the seats humans leave empty below it, so
 // a lobby with enough humans launches with no bots at all, and a mid-game
@@ -4386,47 +4618,11 @@ void Net_SeatBots(int minPlayers, int skill)
     g_netBotMask    = 0;
     g_netBotSkill   = clamp(skill, 0, 3);
     g_netMinPlayers = clamp(minPlayers, 1, 16);   // floor stays 1; cap = MAXPLAYERS seats
-    // Clear every seat's combat lock up front -- including myconnectindex, which
-    // the seating loop below skips. The local-bot test path (g_netLocalBot) runs
-    // the brain for the host's own seat, and the static-0 default would read as
-    // "targeting sprite 0" for a tic before the first respawn reset.
+    // Central LEVEL reset covers every seat -- including myconnectindex, which
+    // the seating loop below skips. The local-bot path can run the brain for the
+    // host's own seat, so no zero-initialized target/index may survive seating.
     for (int k = 0; k < MAXPLAYERS; k++)
-    {
-        s_botTarget[k]    = -1;
-        s_botMonTgt[k]    = -1;
-        s_botUnreach[k]   = 0;
-        s_botJetHold[k]   = 0;      // inventory/jetpack graft state: fresh match
-        s_botJetCool[k]   = 0;
-        s_botMedUses[k]   = 0;
-        s_botSterUses[k]  = 0;
-        s_botJetActs[k]   = 0;
-        s_botInvLogPlc[k] = 0;
-        s_botLtgKind[k]   = 0;      // wave-3a roaming state: fresh match
-        s_botLtgItem[k]   = -1;
-        s_botLtgUntil[k]  = 0;
-        s_botLtgFails[k]  = 0;
-        s_botLtgLocal[k]  = 0;
-        s_botGoalIsLtg[k] = 0;
-        s_botSeenValid[k] = 0;
-        Bot_ItemAvoidReset(k);
-        Bot_ClearAvoidEdges(k);
-        Bot_ClearWedgeSpots(k);
-        Bmemset(s_botRoamBm[k], 0, sizeof(s_botRoamBm[k]));
-        s_botRoamCnt[k]    = 0;
-        s_botRoamLogPlc[k] = 0;
-        s_botStillTics[k]  = 0;
-        s_botIdleTics[k]   = 0;
-        s_botTeamLogged[k] = 0;
-        // wave-3b combat/aim model: fresh match, no target history
-        s_botFireSight[k]  = 0;
-        s_botTgtVValid[k]  = 0;
-        s_botTgtVX[k]      = 0;  s_botTgtVY[k]   = 0;
-        s_botTgtSnap[k]    = 0;
-        s_botAimDegrade[k] = 0;
-        s_botViewVel[k]    = 0;
-        s_botThrWait[k]    = 0;  s_botThrShoot[k] = 0;
-        s_botStrafeTic[k]  = 0;  s_botStrafeFail[k] = 0;  s_botWantStrafe[k] = 0;
-    }
+        Bot_ResetSeat(k, BOT_RESET_LEVEL);
     if (myconnectindex != connecthead)
         return;
     // At menu time the host's OWN connected flag may still be 0 -- without
@@ -4460,6 +4656,7 @@ void Net_SeatBots(int minPlayers, int skill)
         if (k == myconnectindex || g_player[k].connected)
             continue;
         G_MaybeAllocPlayer(k);
+        Bot_ResetSeat(k, BOT_RESET_LEVEL);
         g_player[k].connected = 1;
         g_netBotMask |= (1 << k);
         Bsprintf(g_player[k].user_name, "CPU-%d", retained + seated + 1);
@@ -5003,7 +5200,7 @@ void Net_HandleInput(void)
             s_lbInit = 1;
             const char *e = getenv("NN_LOCALBOT");
             if (e && Batoi(e))
-                g_netLocalBot = 1;
+                Net_SetLocalBot(1);
         }
     }
     bool const isSlave = (numplayers > 1 && myconnectindex != connecthead);
@@ -5200,7 +5397,10 @@ void Net_HandleInput(void)
             if (g_player[myconnectindex].ps != NULL
                 && (g_player[myconnectindex].ps->gm & MODE_GAME)
                 && now - lastpackettime > NET_HOST_SILENT)
+            {
+                Net_SetLocalBot(0);
                 g_netHostGone = 1;
+            }
         }
 
         //Fix timers and buffer/jitter value
@@ -6800,7 +7000,10 @@ void Net_ReceiveFrame(int other, int /*channel*/, const uint8_t *frameData, int 
                         // consumer). A guest's abort is just that guest leaving:
                         // its transport peer-down handles the seat.
                         if ((int32_t)(uint8_t)packbuf[1] == connecthead && myconnectindex != connecthead)
+                        {
+                            Net_SetLocalBot(0);
                             g_netHostGone = 1;
+                        }
 #else
                         G_GameExit("Game aborted from menu; disconnected.");
 #endif
@@ -7141,11 +7344,6 @@ extern "C" void Web_SetForensics(int on)
 {
     g_netForensics = on;
     EM_ASM({ console.log('[eng] forensics=' + $0); }, on);
-}
-extern "C" void Web_SetLocalBot(int on)
-{
-    g_netLocalBot = on;
-    EM_ASM({ console.log('[eng] localBot=' + $0); }, on);
 }
 // The late-join snapshot is a savegame and carries NO premap spawn table. A
 // fresh-process joiner never ran premap, so g_playerSpawnCnt was 0 there and
@@ -10176,7 +10374,10 @@ void Net_PeerEvent(int peerToken, int eventType)
     }
 
     if (eventType == NET_PEER_DOWN && peerToken == connecthead && myconnectindex != connecthead)
+    {
+        Net_SetLocalBot(0);
         g_netHostGone = 1; // guest lost its host -> menus.cpp consumer exits to the main menu
+    }
 
 #if defined(__EMSCRIPTEN__) || defined(NETNATIVE)
     // A joiner died before it was seated (still queued, or mid-flow). Before
@@ -10795,6 +10996,7 @@ void Net_CheckPlayerQuit(int i)
 
     g_player[i].connected = 0;
     g_netBotMask &= ~(1 << i);   // a freed seat must never keep a bot bit
+    Bot_ResetSeat(i, BOT_RESET_LEVEL);
 
     G_CloseDemoWrite();
 
@@ -10874,6 +11076,7 @@ void Net_ExcisePlayer(int i)
     g_player[i].playerquitflag = 0;
     g_netBotMask &= ~(1 << i);   // a freed seat must never keep a bot bit
                                  // (bot yields ride this same excise path)
+    Bot_ResetSeat(i, BOT_RESET_LEVEL);
 
     G_CloseDemoWrite();
 
@@ -10953,6 +11156,7 @@ void Net_ConsumeQuitInputs(void)
         {
             // The HOST quit from its menu: graceful match teardown (menus.cpp
             // host-gone consumer), never a client-side G_GameExit.
+            Net_SetLocalBot(0);
             g_netHostGone = 1;
             continue;
         }
@@ -11006,6 +11210,7 @@ void Net_FlushPendingDrops(void)
         {
             g_player[i].connected = 0;
             g_netBotMask &= ~(1 << i);   // a freed seat must never keep a bot bit
+            Bot_ResetSeat(i, BOT_RESET_LEVEL);
             changed = 1;
             initprintf("net: flushed pending drop of player %d at barrier\n", i);
 
@@ -11260,6 +11465,7 @@ void allowtimetocorrecterrorswhenquitting(void)
 
 void Net_Disconnect(bool showScores)
 {
+    Net_SetLocalBot(0);
     allowtimetocorrecterrorswhenquitting();
     net_transport_shutdown();
 
