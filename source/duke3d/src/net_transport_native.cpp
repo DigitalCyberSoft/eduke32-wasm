@@ -68,6 +68,34 @@ extern "C" {
     // it without pulling engine headers into an -fexceptions translation unit.
     const char *Net_NativeGrpPath(void);
     void Net_SnapshotReady(int seatMask, int plc, int isJoin); // oldnet.cpp: snapshot file landed
+    int Net_GetBotMask(void); // oldnet.cpp: game-thread CPU seat reservations
+}
+
+namespace {
+
+enum { NATIVE_MAX_PLAYERS = 16 };
+
+} // namespace
+
+extern "C" int net_native_clamp_capacity(int value)
+{
+    return value < 2 ? 2 : value > NATIVE_MAX_PLAYERS ? NATIVE_MAX_PLAYERS : value;
+}
+
+extern "C" int net_native_valid_guest_slot(int slot)
+{
+    return slot >= 1 && slot < NATIVE_MAX_PLAYERS;
+}
+
+// Pure fixed-roster allocator shared by production admission and the focused
+// native unit fixture. occupiedMask includes transport humans; botMask is read
+// from the engine only on the game thread.
+extern "C" int net_native_allocate_guest_slot(uint32_t occupiedMask, uint32_t botMask)
+{
+    for (int slot = 1; slot < NATIVE_MAX_PLAYERS; slot++)
+        if (!((occupiedMask | botMask) & (1u << slot)))
+            return slot;
+    return -1;
 }
 
 namespace {
@@ -114,6 +142,13 @@ struct InboundItem
     std::vector<uint8_t> data;
 };
 
+struct JoinRequest
+{
+    std::string peer;
+    std::string name;
+    std::string grpDigest;
+};
+
 class NativeTransport
 {
 public:
@@ -128,9 +163,7 @@ public:
     bool configure()
     {
         myName_ = envOr("NN_NAME", "Player");
-        minPlayers_ = std::atoi(envOr("NN_PLAYERS", "2").c_str());
-        if (minPlayers_ < 2)
-            minPlayers_ = 2;
+        minPlayers_ = net_native_clamp_capacity(std::atoi(envOr("NN_PLAYERS", "2").c_str()));
         autoLaunch_ = (getenv("NN_AUTOLAUNCH") != nullptr) || (getenv("NN_ROLE") != nullptr);
 
         const char *relayEnv = getenv("NN_RELAY");
@@ -194,7 +227,7 @@ public:
         myConnectIndex_ = 0;
         myName_ = player.empty() ? "Host" : player;
         matchName_ = name.empty() ? "Duke Match" : name;
-        maxPlayers_ = maxPlayers < 2 ? 2 : maxPlayers;
+        maxPlayers_ = net_native_clamp_capacity(maxPlayers);
         roomKey_ = envOr("NN_KEY", "");
         if (roomKey_.empty())
             roomKey_ = base64Encode(randomBytes(32));
@@ -310,7 +343,10 @@ public:
         std::lock_guard<std::mutex> lk(mtx_);
         tokenToDevice_.clear();
         deviceToToken_.clear();
+        deviceName_.clear();
         inbound_.clear();
+        joinRequests_.clear();
+        deniedClose_.clear();
         attached_ = false;
         launched_ = false;
         inGame_ = false; // fresh match, open join gate
@@ -351,8 +387,11 @@ public:
         }
         std::lock_guard<std::mutex> lk(mtx_);
         inbound_.clear();
+        joinRequests_.clear();
+        deniedClose_.clear();
         tokenToDevice_.clear();
         deviceToToken_.clear();
+        deviceName_.clear();
     }
 
     // ── seam: outbound (game thread) ─────────────────────────────────────────
@@ -392,29 +431,78 @@ public:
             if (it == tokenToDevice_.end())
                 return;
             dev = it->second;
+            erasePeerMappingsLocked(dev);
         }
+        // Free identity/capacity before closing. A reconnect can reuse the seat;
+        // stale callbacks from the closing generation no longer resolve a token.
+        updateRoster();
         nnlog("kick: closing peer token=" + std::to_string(token));
-        pm_->close(dev);
+        // Send a courtesy control before teardown; strings stay transport control
+        // after attach. The engine already decided the deterministic removal.
+        pm_->sendControl(dev, "{\"t\":\"kick\",\"reason\":\"dropped from the match (connection)\"}");
+        closeAfterDeny(dev);
     }
 
     // ── seam: net_poll drains to the netcode (game thread) ───────────────────
     void poll()
     {
+        // Denied peers remain pre-attach until the ordered join_deny has had a
+        // short flush window, then the game thread closes them safely.
+        std::vector<std::string> denied;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto const now = std::chrono::steady_clock::now();
+            for (auto it = deniedClose_.begin(); it != deniedClose_.end();)
+                if (it->second <= now)
+                {
+                    denied.push_back(it->first);
+                    it = deniedClose_.erase(it);
+                }
+                else
+                    ++it;
+        }
+        for (auto const &peer : denied)
+            if (pm_)
+                pm_->close(peer);
+
         // Free dead peer connections (ICE timeouts, crashed tabs, abandoned
         // joins) so the pinned UDP port pool never exhausts -- the safe place
         // to destroy pcs (never from their own callbacks).
+        bool rosterChanged = false;
         if (pm_)
         {
             std::vector<std::string> reaped;
             if (pm_->reapDead(&reaped) > 0)
                 for (auto &id : reaped)
+                {
+                    int token = -1;
+                    {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        auto it = deviceToToken_.find(id);
+                        if (it != deviceToToken_.end())
+                        {
+                            token = it->second;
+                            erasePeerMappingsLocked(id);
+                            rosterChanged = true;
+                        }
+                    }
+                    if (token >= 0 && token < NATIVE_MAX_PLAYERS)
+                        Net_PeerEvent(token, NET_PEER_DOWN);
                     printf("[nnet] reaped dead peer %.8s (port freed)\n", id.c_str());
+                }
         }
+
+        // Worker callbacks only parse+queue join controls. Admission executes
+        // here, on the game thread, before reading g_netBotMask/engine occupancy.
+        std::deque<JoinRequest> joins;
         std::deque<InboundItem> batch;
         {
             std::lock_guard<std::mutex> lk(mtx_);
+            joins.swap(joinRequests_);
             batch.swap(inbound_);
         }
+        for (auto &join : joins)
+            hostHandleJoin(join.peer, join.name, join.grpDigest);
         for (auto &it : batch)
         {
             switch (it.kind)
@@ -427,6 +515,8 @@ public:
                     break;
             }
         }
+        if (rosterChanged)
+            updateRoster();
     }
 
     // ── launch readiness (host only; polled by the engine main loop) ─────────
@@ -561,6 +651,9 @@ private:
             item.data.assign(d, d + n);
             inbound_.push_back(std::move(item));
         };
+        // A Failed/Closed callback is a worker notification only. The game-thread
+        // reaper in poll() owns mapping cleanup and Net_PeerEvent delivery.
+        pm_->onConnectionChange = [this](const std::string &, bool) {};
     }
 
     void presenceLoop()
@@ -741,7 +834,20 @@ private:
             }
         }
         if (type == "join" && isHost_)
-            hostHandleJoin(peer, joinName, joinGrpDigest);
+        {
+            // Callback thread: never inspect engine seats here. Preserve request
+            // order and let poll() admit on the game thread.
+            std::lock_guard<std::mutex> lk(mtx_);
+            bool alreadyQueued = false;
+            for (auto const &join : joinRequests_)
+                if (join.peer == peer)
+                {
+                    alreadyQueued = true;
+                    break;
+                }
+            if (!alreadyQueued && !deviceToToken_.count(peer))
+                joinRequests_.push_back({ peer, joinName, joinGrpDigest });
+        }
         else if (type == "join_ok" && !isHost_)
             guestHandleJoinOk(peer, yourSlot, hostSlot, joinName); // joinName = host's name
         else if (type == "sav_end" && !isHost_)
@@ -820,14 +926,9 @@ private:
 
     void hostHandleJoin(const std::string &peer, const std::string &name, const std::string &grpDigest)
     {
-        // LATE JOIN is allowed, mirroring duke-net.ts: the joiner attaches normally
-        // and its NET_PEER_UP is QUEUED by oldnet while the host is in-game; the
-        // host then seats it at a safe frame point by relaunching the current map
-        // (menus.cpp late-join consumer). Attaching straight into the running tic
-        // loop is what used to freeze the host.
-        // GRP gate, mirroring duke-net.ts _hostHandleJoin: identical GRP sets only.
-        // Gate only when our own fingerprint exists; a fingerprint-less host stays
-        // permissive (logged) rather than denying everyone.
+        // Game-thread only (poll): this is the safe point to inspect engine CPU
+        // ownership. The host remains the sole slot authority and late joiners
+        // still enter the existing snapshot/catch-up/yield flow via NET_PEER_UP.
         if (grpFp_.valid && grpDigest != grpFp_.setDigest)
         {
             pm_->sendControl(peer, "{\"t\":\"join_deny\",\"reason\":\"grpmismatch\",\"hostGrp\":" + grpJson() + "}");
@@ -835,22 +936,26 @@ private:
                    peer.c_str(), grpDigest.empty() ? "(none)" : grpDigest.c_str(), grpFp_.setDigest.c_str());
             fflush(stdout);
             setStatus("Denied a join: different game data");
+            closeAfterDeny(peer);
             return;
         }
-        int slot;
-        bool full = false;
+
+        int slot = -1;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (deviceToToken_.count(peer))
-                return; // already joined
-            full = (int)deviceToToken_.size() + 1 >= maxPlayers_; // +1 = us
-            slot = full ? -1 : nextFreeSlot();
-            if (!full)
+                return; // duplicate join control from an already attached peer
+            uint32_t occupiedMask = 0;
+            for (auto const &entry : tokenToDevice_)
+                if (net_native_valid_guest_slot(entry.first))
+                    occupiedMask |= 1u << entry.first;
+            if ((int)deviceToToken_.size() + 1 < maxPlayers_)
+                slot = net_native_allocate_guest_slot(occupiedMask, (uint32_t)Net_GetBotMask());
+            if (slot >= 0)
             {
                 tokenToDevice_[slot] = peer;
                 deviceToToken_[peer] = slot;
                 deviceName_[peer] = name.empty() ? "Player" : name;
-                // NET_PEER_UP at connectindex==slot (drained on the game thread).
                 InboundItem up;
                 up.kind = InboundItem::PeerEvent;
                 up.peer = slot;
@@ -858,12 +963,15 @@ private:
                 inbound_.push_back(std::move(up));
             }
         }
-        if (full)
+        if (slot < 0)
         {
-            // Sent OUTSIDE mtx_: never call into libdatachannel while holding our lock.
+            // Deny before token/name/attachment mutation. Keep control mode long
+            // enough for the ordered denial to flush, then close the pre-attach pc.
             pm_->sendControl(peer, "{\"t\":\"join_deny\",\"reason\":\"full\"}");
+            closeAfterDeny(peer);
             return;
         }
+
         pm_->setAttached(peer, true);
         std::string ok = "{\"t\":\"join_ok\",\"yourSlot\":" + std::to_string(slot) +
                          ",\"hostSlot\":0,\"name\":" + jsonStr(myName_) + "}";
@@ -877,8 +985,14 @@ private:
     void guestHandleJoinOk(const std::string &peer, int yourSlot, int hostSlot,
                            const std::string &hostName)
     {
-        if (yourSlot < 0)
+        if (!net_native_valid_guest_slot(yourSlot) || hostSlot != 0)
+        {
+            printf("[nnet] guest: rejected invalid join_ok slots guest=%d host=%d\n", yourSlot, hostSlot);
+            fflush(stdout);
+            setStatus("!Join refused: host assigned an invalid player slot");
+            pm_->close(peer);
             return;
+        }
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (attached_)
@@ -910,12 +1024,21 @@ private:
         setStatus("Connected - waiting for the host to start...");
     }
 
-    int nextFreeSlot() // caller holds mtx_; host is 0, guests take the lowest free >=1
+    void erasePeerMappingsLocked(const std::string &peer)
     {
-        for (int s = 1; s < 16; s++)
-            if (!tokenToDevice_.count(s))
-                return s;
-        return 1;
+        auto dit = deviceToToken_.find(peer);
+        if (dit != deviceToToken_.end())
+        {
+            tokenToDevice_.erase(dit->second);
+            deviceToToken_.erase(dit);
+        }
+        deviceName_.erase(peer);
+    }
+
+    void closeAfterDeny(const std::string &peer)
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        deniedClose_[peer] = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
     }
 
     void ensureSignaling() // subscribe to the room + start presence (once per match)
@@ -1116,6 +1239,8 @@ private:
 
     std::mutex mtx_;
     std::deque<InboundItem> inbound_;
+    std::deque<JoinRequest> joinRequests_;
+    std::map<std::string, std::chrono::steady_clock::time_point> deniedClose_;
     std::map<int, std::string> tokenToDevice_;
     std::map<std::string, int> deviceToToken_;
     std::map<std::string, std::string> deviceName_; // peer deviceId -> display name

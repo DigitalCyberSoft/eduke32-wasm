@@ -15,7 +15,7 @@ mkdir -p "$OUT"
 
 INC="-I $ROOT/platform/native -I $ROOT/source/build/include -I $PREFIX/usr/include -I $PREFIX/include"
 LIBDIRS="-L $PREFIX/lib -L $PREFIX/usr/lib64 -L $PREFIX/lib64 -Wl,-rpath,$PREFIX/usr/lib64 -Wl,-rpath,$PREFIX/lib64"
-CXX="${CXX:-g++} -std=c++17 -O2 -Wall"
+CXX="${CXX:-g++} -std=c++17 -O2 -Wall -Wno-narrowing"
 
 echo "== build native transport test CLIs (prefix=$PREFIX) =="
 $CXX $INC "$ROOT/platform/native/test/nn_crypto_test.cpp" -o "$OUT/crypto_test" $LIBDIRS -lsecp256k1 -lcrypto
@@ -26,12 +26,13 @@ $CXX $INC "$ROOT/platform/native/test/nn_peer_test.cpp"   -o "$OUT/peer_test"   
 # seam test links the REAL net_transport_native.cpp (needs -DNETNATIVE + the engine include dir)
 $CXX -DNETNATIVE $INC -I "$ROOT/source/duke3d/src" \
      "$ROOT/platform/native/test/nn_seam_test.cpp" "$ROOT/source/duke3d/src/net_transport_native.cpp" \
-     -o "$OUT/seam_test" $LIBDIRS -ldatachannel -lcurl -lsecp256k1 -lcrypto -lpthread -lminiupnpc
-# Phase-0 RED characterization binary. Built with the real transport allocator,
-# but not run in the green regression suite until the Phase-1 production fix lands.
+     "$ROOT/source/build/src/crc32.cpp" \
+     -o "$OUT/seam_test" $LIBDIRS -ldatachannel -lsecp256k1 -lcrypto -lminiupnpc -lcurl -lpthread
+# Phase-0 allocator characterization, now expected to pass against the Phase-1 fix.
 $CXX -DNETNATIVE -DNN_TRANSPORT_TEST $INC -I "$ROOT/source/duke3d/src" \
      "$ROOT/platform/native/test/nn_bot_seat_test.cpp" "$ROOT/source/duke3d/src/net_transport_native.cpp" \
-     -o "$OUT/bot_seat_red" $LIBDIRS -ldatachannel -lsecp256k1 -lcrypto -lpthread -lcurl -lminiupnpc
+     "$ROOT/source/build/src/crc32.cpp" \
+     -o "$OUT/bot_seat_test" $LIBDIRS -ldatachannel -lsecp256k1 -lcrypto -lpthread -lcurl -lminiupnpc
 
 export LD_LIBRARY_PATH="$PREFIX/usr/lib64:$PREFIX/lib64:${LD_LIBRARY_PATH:-}"
 
@@ -47,6 +48,8 @@ echo "== WebRTC two-peer connect (presence -> offer/answer -> 3 channels) =="
 node "$ROOT/platform/native/test/peer_e2e.mjs" "$OUT/peer_test"
 echo "== seam end-to-end: join handshake + frames through net_transport.h =="
 node "$ROOT/platform/native/test/seam_e2e.mjs" "$OUT/seam_test"
+echo "== CPU-reserved seat and full-roster allocation =="
+"$OUT/bot_seat_test"
 
 echo
 echo "ALL NATIVE TRANSPORT TESTS PASSED"

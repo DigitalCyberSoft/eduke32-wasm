@@ -8,7 +8,7 @@ import { startRelay } from "../../emscripten/test/net/nip01-relay.mjs";
 import { spawn } from "node:child_process";
 
 const BIN = process.argv[2] || "/tmp/nn_seam_test";
-const LD = { ...process.env, LD_LIBRARY_PATH: "/tmp/localdev/usr/lib64" };
+const LD = { ...process.env, LD_LIBRARY_PATH: "/tmp/localdev/usr/lib64", NN_NO_UPNP: "1" };
 const KEY = btoa(String.fromCharCode(...globalThis.crypto.getRandomValues(new Uint8Array(32))));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -30,7 +30,9 @@ function launch(name, env, onLine) {
 
 // Host first; capture its device id from "[nnet] HOSTID <id>".
 let hostId = null;
-const host = launch("host", { NN_ROLE: "host", NN_KEY: KEY, NN_RELAY: url, NN_PLAYERS: "2", NN_NAME: "Host" }, (line) => {
+// Reserve seat 1 as an engine CPU. Admission runs in net_poll on the game
+// thread and must assign the joining transport human the next unique seat.
+const host = launch("host", { NN_ROLE: "host", NN_KEY: KEY, NN_RELAY: url, NN_PLAYERS: "2", NN_MAXPLAYERS: "16", NN_TEST_BOTMASK: "0x2", NN_TEST_KICK_REJOIN: "1", NN_NAME: "Host" }, (line) => {
   const m = line.match(/HOSTID (\S+)/);
   if (m) hostId = m[1];
 });
@@ -43,17 +45,23 @@ if (!hostId) {
 
 // Join with ONLY the room key (no NN_HOSTID) - the guest must discover the host via
 // its host-flagged presence, exactly like the Multiplayer menu's Join by Code.
-const guest = launch("guest", { NN_ROLE: "guest", NN_KEY: KEY, NN_RELAY: url, NN_NAME: "Guest" });
+const guest1 = launch("guest1", { NN_ROLE: "guest", NN_KEY: KEY, NN_RELAY: url, NN_NAME: "Guest1" });
+const g1 = await guest1.done();
+// Host kicked Guest1 after its first frame. A fresh device joins the same match;
+// mapping cleanup must make seat 2 reusable rather than leaking capacity.
+const guest2 = launch("guest2", { NN_ROLE: "guest", NN_KEY: KEY, NN_RELAY: url, NN_NAME: "Guest2" });
 
-const [h, g] = await Promise.all([host.done(), guest.done()]);
+const [h, g2] = await Promise.all([host.done(), guest2.done()]);
 wss.close();
 
 let fail = 0;
 const ok = (c, name) => { console.log(`${c ? "ok  " : "FAIL"} ${name}`); if (!c) fail++; };
-ok(h.code === 0 && h.out.includes("SEAM OK"), "host: peer-up + frame through seam");
-ok(g.code === 0 && g.out.includes("SEAM OK"), "guest: peer-up + frame through seam");
-ok(g.out.includes("LOCALIDX 1"), "guest assigned connectindex 1 via Net_SetLocalIndex");
-ok(h.out.includes("joined as slot 1"), "host assigned the guest slot 1");
+ok(h.code === 0 && h.out.includes("KICK-REJOIN OK"), "host: kick/rejoin and frames through seam");
+ok(g1.code !== null && g1.out.includes("SEAM OK"), "first guest joined and exchanged a frame");
+ok(g2.code === 0 && g2.out.includes("SEAM OK") && g2.out.includes("HELLO-AFTER-REJOIN"), "replacement guest exchanged a frame");
+ok(h.out.includes("ALLOCATOR OK") && g1.out.includes("ALLOCATOR OK") && g2.out.includes("ALLOCATOR OK"), "native capacity/CPU-seat allocator bounds");
+ok(g1.out.includes("LOCALIDX 2") && g2.out.includes("LOCALIDX 2"), "kick/rejoin reused connectindex 2");
+ok((h.out.match(/joined as slot 2/g) ?? []).length === 2, "host skipped CPU seat 1 and reused human seat 2");
 
 console.log(fail ? `\nSEAM E2E FAIL (${fail})` : "\nSEAM E2E OK");
 process.exit(fail ? 1 : 0);

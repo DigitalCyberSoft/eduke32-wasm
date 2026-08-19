@@ -76,6 +76,13 @@ void net_transport_shutdown(void);
 // guest), which its UI already handles. No-op for the stub.
 void net_kick(int peerToken);
 
+// [additive, NETNATIVE only] Pure fixed-roster admission helpers. Exposed so
+// the standalone native transport fixture verifies the production allocator.
+// Callers outside native tests should use the transport's admission flow.
+int net_native_clamp_capacity(int value);
+int net_native_valid_guest_slot(int slot);
+int net_native_allocate_guest_slot(uint32_t occupiedMask, uint32_t botMask);
+
 // [additive, NETNATIVE only] First-run helper: download the freely
 // distributable shareware GRP into the profile dir (CRC-pinned against
 // grpscan's entry) so a bare binary boots playable. Returns 1 on success;

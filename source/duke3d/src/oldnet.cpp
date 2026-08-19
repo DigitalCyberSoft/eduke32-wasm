@@ -4336,14 +4336,51 @@ input_t Net_BotInput(void)
     return Bot_GetInput(myconnectindex);
 }
 
+// The transport's slot allocator must NOT hand a joiner a CPU-held seat. This
+// accessor is platform-neutral: browser and native admission both call it on
+// the game thread, where engine roster state is safe to read.
+extern "C" int Net_GetBotMask(void)
+{
+    return g_netBotMask;
+}
+
+#ifdef NETNATIVE
+// Focused H01 fixture over actual engine globals. Enabled only when the native
+// executable is launched with NN_TEST_SEATBOTS=1; otherwise the helper is inert.
+int Net_TestSeatBotsRelaunch(void)
+{
+    if (getenv("NN_TEST_SEATBOTS") == NULL)
+        return 1;
+
+    for (int k = 0; k < MAXPLAYERS; k++)
+        g_player[k].connected = 0;
+    myconnectindex = connecthead = 0;
+    g_player[0].connected = g_player[1].connected = g_player[2].connected = 1;
+    Bstrcpy(g_player[1].user_name, "CPU-1");
+    Bstrcpy(g_player[2].user_name, "CPU-2");
+    g_netBotMask = (1 << 1) | (1 << 2);
+
+    Net_SeatBots(3, 2);
+    int const ok = g_netBotMask == ((1 << 1) | (1 << 2))
+                && g_player[1].connected && g_player[2].connected
+                && Bstrcmp(g_player[1].user_name, "CPU-1") == 0
+                && Bstrcmp(g_player[2].user_name, "CPU-2") == 0
+                && numplayers == 3;
+
+    return ok;
+}
+#endif
+
 // Seat CPU players (host, pre-launch/relaunch). `minPlayers` is the host's
 // MATCH-SIZE FLOOR: bots only fill the seats humans leave empty below it, so
 // a lobby with enough humans launches with no bots at all, and a mid-game
-// joiner displaces one (the yield lives at the join-flow seat point). The
-// mask is rebuilt WHOLE each call -- a stale bit on a slot later reused by a
-// human would blackhole their packets (oldnet_sendpacket skips bot slots).
+// joiner displaces one (the yield lives at the join-flow seat point). Preserve
+// CPU ownership for connected seats across Change Map/relaunch; only stale bits
+// for seats that really disconnected are discarded. This keeps connected CPU
+// seats from silently becoming pseudo-humans that no transport owns.
 void Net_SeatBots(int minPlayers, int skill)
 {
+    int32_t const priorBotMask = g_netBotMask;
     g_netBotMask    = 0;
     g_netBotSkill   = clamp(skill, 0, 3);
     g_netMinPlayers = clamp(minPlayers, 1, 16);   // floor stays 1; cap = MAXPLAYERS seats
@@ -4395,11 +4432,18 @@ void Net_SeatBots(int minPlayers, int skill)
     // the pump then fights the host's sampler over the slot-0 input column
     // (two writers -> aliased cursors -> garbage inputs -> crash at entry).
     g_player[myconnectindex].connected = 1;
-    int humans = 0;
-    for (int k = 0; k < MAXPLAYERS && k < 16; k++)
+    int occupied = 0, retained = 0;
+    for (int k = 0; k < MAXPLAYERS; k++)
         if (g_player[k].connected)
-            humans++;
-    int const want = g_netMinPlayers - humans;
+        {
+            occupied++;
+            if (priorBotMask & (1 << k))
+            {
+                g_netBotMask |= (1 << k);
+                retained++;
+            }
+        }
+    int const want = max(g_netMinPlayers - occupied, 0);
     int seated = 0;
     for (int k = 0; k < MAXPLAYERS && k < 16 && seated < want; k++)
     {
@@ -4408,7 +4452,7 @@ void Net_SeatBots(int minPlayers, int skill)
         G_MaybeAllocPlayer(k);
         g_player[k].connected = 1;
         g_netBotMask |= (1 << k);
-        Bsprintf(g_player[k].user_name, "CPU-%d", seated + 1);
+        Bsprintf(g_player[k].user_name, "CPU-%d", retained + seated + 1);
         // Team DM: split CPU seats across the two teams so the mode is playable
         // (all-team-0 + friendly-fire-off = nobody can damage anyone). Spawn
         // applies the team palette from pteam (premap.cpp). DM/Coop leave it 0.
@@ -4418,11 +4462,14 @@ void Net_SeatBots(int minPlayers, int skill)
         }
         seated++;
     }
-    if (seated)
+    // Ownership is coherent now; only then publish the connected roster/chain.
+    // Always rebuild: a relaunch that retained every CPU is just as significant as
+    // one that allocated a new CPU, and queued non-bot seats may also be present.
+    Net_SeatLateJoiners();
+    if (seated || retained)
     {
-        Net_SeatLateJoiners();   // mask 0: rebuilds chain + numplayers from connected[]
-        initprintf("net: seated %d CPU player(s), skill %d (mask %x)\n",
-                   seated, g_netBotSkill, (unsigned)g_netBotMask);
+        initprintf("net: retained %d and seated %d CPU player(s), skill %d (mask %x)\n",
+                   retained, seated, g_netBotSkill, (unsigned)g_netBotMask);
 #ifdef __EMSCRIPTEN__
         EM_ASM({ console.log('[bot] SeatBots: seated=' + $0 + ' np=' + $1 + ' mask=' + $2); },
                seated, numplayers, g_netBotMask);
@@ -6966,13 +7013,6 @@ extern "C" void Web_SetLocalBot(int on)
 {
     g_netLocalBot = on;
     EM_ASM({ console.log('[eng] localBot=' + $0); }, on);
-}
-// The transport's slot allocator must NOT hand a joiner a CPU-held seat: the
-// join driver discards seat requests for occupied slots ("stale queue entry"),
-// which strands the guest in the lobby forever (live-reported via ?join=).
-extern "C" int Net_GetBotMask(void)
-{
-    return g_netBotMask;
 }
 // The late-join snapshot is a savegame and carries NO premap spawn table. A
 // fresh-process joiner never ran premap, so g_playerSpawnCnt was 0 there and

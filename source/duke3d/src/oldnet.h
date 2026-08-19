@@ -218,10 +218,18 @@ extern int32_t g_netDesyncReporters; // host: guests whose DESYNC_REPORT named t
 int  Net_StartHealFlow(int k);    // host: begin healing seat k (0 = flow started)
 void Net_CheckHealResume(void);   // healing guest: leave watcher mode at the live edge
 extern int32_t g_netBotMask;      // CPU seats (host synthesizes their inputs)
+#ifdef __cplusplus
+extern "C" int Net_GetBotMask(void); // transport admission: engine CPU reservations
+#else
+int Net_GetBotMask(void);
+#endif
 extern int32_t g_netBotSkill;     // 0..2, host-side only
 extern int32_t g_netMinPlayers;   // bots fill to this count, yield as humans join
 extern int32_t g_netLocalBot;     // TEST MODE: own input from the bot brain
-void Net_SeatBots(int minPlayers, int skill); // host: fill seats up to the floor pre-launch
+void Net_SeatBots(int minPlayers, int skill); // host: retain/fill seats up to floor pre-launch/relaunch
+#ifdef NETNATIVE
+int Net_TestSeatBotsRelaunch(void); // deterministic H01 characterization fixture
+#endif
 input_t Net_BotInput(void);       // bot input for the LOCAL peer (test mode)
 void Net_SendStateSnap(int k);    // host: in-place RNG+player correction to one guest
 int  Net_CorrectDivergence(int k);// host: correction ladder (soft snaps -> snapshot heal)

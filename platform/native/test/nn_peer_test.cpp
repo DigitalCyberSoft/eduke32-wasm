@@ -81,7 +81,7 @@ int main(int argc, char **argv)
             if (m.type == "offer")
                 pm.handleOffer(m.from, m.sdp);
             else if (m.type == "answer")
-                pm.handleAnswer(m.from, m.sdp);
+                pm.handleAnswer(m.from, m.sdp, m.gen);
             else if (m.type == "ice")
                 pm.addIce(m.from, m.candidate, m.sdpMid);
         }
@@ -104,10 +104,11 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     // Stop the relay before closing the peer manager: relay/presence callbacks may
-    // still call pm.connect while closeAll is tearing down the pool. That race left
-    // the standalone test alive after printing PEER OK.
+    // still call pm.connect while closeAll is tearing down the pool. Then reap the
+    // closed connections outside their callbacks before rtc::Cleanup.
     client.stop();
     pm.closeAll();
+    pm.reapDead();
     sjson_destroy_context(sigCtx);
     rtc::Cleanup().wait();
     return rc;

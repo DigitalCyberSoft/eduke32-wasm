@@ -6749,6 +6749,19 @@ int app_main(int argc, char const* const* argv)
 #endif
 #endif
 
+#ifdef NETNATIVE
+    // Focused H01 fixture exits before normal boot; default-off and inaccessible
+    // to regular play unless the test environment explicitly opts in.
+    if (getenv("NN_TEST_SEATBOTS") != NULL)
+    {
+        for (int i = 0; i < MAXPLAYERS; i++)
+            G_MaybeAllocPlayer(i);
+        int const ok = Net_TestSeatBotsRelaunch();
+        fprintf(stderr, "[seatbots-test] %s\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 1;
+    }
+#endif
+
     G_ExtPreInit(argc, argv);
 
     engineSetLogFile(APPBASENAME ".log", LOG_GAME_MAX);

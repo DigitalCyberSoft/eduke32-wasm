@@ -90,6 +90,25 @@ const SWITCHTRY_KEY = "eduke32-net-switchtry";
 // it via globalThis.__DUKE_LO_MAX_MS__; that global is never set in the browser build.)
 const LOCAL_ONLY_MAX_MS = ((globalThis as Record<string, unknown>).__DUKE_LO_MAX_MS__ as number | undefined) ?? 30;
 
+// Engine and wire both use the fixed Duke roster: host seat 0 plus guest seats
+// 1..15. Keep allocation independent of a match's configured capacity; the
+// capacity gate decides whether another human may join, while this function
+// decides whether a unique engine seat actually exists.
+export const NET_MAX_PLAYERS = 16;
+export function isGuestSlot(slot: number): boolean {
+  return Number.isInteger(slot) && slot >= 1 && slot < NET_MAX_PLAYERS;
+}
+export function allocateGuestSlot(used: ReadonlySet<number>, botMask: number): number {
+  for (let slot = 1; slot < NET_MAX_PLAYERS; slot++)
+    if (!used.has(slot) && !(botMask & (1 << slot))) return slot;
+  return -1;
+}
+export function canAdmitGuest(guestCount: number, maxPlayers: number, slot: number): boolean {
+  return Number.isInteger(guestCount) && guestCount >= 0
+    && Number.isInteger(maxPlayers) && maxPlayers >= 2 && maxPlayers <= NET_MAX_PLAYERS
+    && guestCount + 1 < maxPlayers && isGuestSlot(slot);
+}
+
 export interface HostConfig {
   name: string;
   isPublic: boolean;
@@ -638,12 +657,15 @@ class DukeNet {
       m.peers.sendControl(peerId, { t: "join_deny", reason: "grpmismatch", hostGrp: hostFp } as Ctl);
       return;
     }
-    if (this.slots.size + 1 >= m.maxPlayers) {
-      console.log(`[dnet] join denied: full (${this.slots.size + 1}/${m.maxPlayers})`);
+    const slot = this._allocSlot();
+    if (!canAdmitGuest(this.slots.size, m.maxPlayers, slot)) {
+      console.log(`[dnet] join denied: full (${this.slots.size + 1}/${m.maxPlayers}, slot=${slot})`);
       m.peers.sendControl(peerId, { t: "join_deny", reason: "full" } as Ctl);
+      setTimeout(() => m.peers.close(peerId), 300); // let the deny flush before closing
       return;
     }
-    const slot = this._allocSlot();
+    // Mutation starts only after both configured capacity and fixed engine-seat
+    // capacity have passed. A denied peer never acquires token/channel identity.
     this.slots.set(peerId, slot);
     // Attach: from now on this peer's channels carry raw netcode frames, and the
     // netcode sees a NET_PEER_UP at connectindex==slot. Log each step so a freeze
@@ -661,8 +683,16 @@ class DukeNet {
   private _guestHandleJoinOk(peerId: string, msg: { yourSlot: number; hostSlot: number }): void {
     const m = this.match;
     if (!m || m.role !== "guest" || peerId !== m.hostId) return;
-    console.log(`[dnet] <- join_ok slot=${msg.yourSlot} -> entering lobby`);
-    this.myConnectIndex = msg.yourSlot | 0;
+    const yourSlot = msg.yourSlot | 0;
+    const hostSlot = msg.hostSlot | 0;
+    if (!isGuestSlot(yourSlot) || hostSlot !== 0) {
+      console.log(`[dnet] invalid join_ok slots: guest=${msg.yourSlot} host=${msg.hostSlot}`);
+      this.events.onError?.("Join refused: host assigned an invalid player slot");
+      m.peers.close(peerId);
+      return;
+    }
+    console.log(`[dnet] <- join_ok slot=${yourSlot} -> entering lobby`);
+    this.myConnectIndex = yourSlot;
     // Tell the netcode our authoritative slot (host is 0; we are a guest at
     // yourSlot). Reaches the page's Emscripten Module — ccall is exported via
     // EXPORTED_RUNTIME_METHODS, Net_SetLocalIndex via EXPORTED_FUNCTIONS. Guarded
@@ -673,7 +703,7 @@ class DukeNet {
       mod?.ccall?.("Net_SetLocalIndex", "void", ["number"], [this.myConnectIndex]);
     }
     // The host is our single peer (star). Register it and attach.
-    this.seam.registerPeer(peerId, msg.hostSlot | 0);
+    this.seam.registerPeer(peerId, hostSlot);
     m.peers.setAttached(peerId, true);
     this.seam.enqueuePeerEventByDevice(peerId, true);
     this.pendingJoinInfo = null;
@@ -1006,9 +1036,7 @@ class DukeNet {
       const mod = (window as unknown as { Module?: { ccall?: (...a: unknown[]) => unknown } }).Module;
       try { botMask = ((mod?.ccall?.("Net_GetBotMask", "number", [], []) as number) ?? 0) | 0; } catch { botMask = 0; }
     }
-    const used = new Set(this.slots.values());
-    for (let s = 1; s < 64; s++) if (!used.has(s) && !(botMask & (1 << s))) return s;
-    return this.slots.size + 1;
+    return allocateGuestSlot(new Set(this.slots.values()), botMask);
   }
 
   // ── Boot-time GRP application (called from index.html preRun) ───────────────
