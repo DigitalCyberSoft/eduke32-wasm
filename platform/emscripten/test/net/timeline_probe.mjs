@@ -3,9 +3,8 @@
 // hits and [frag]s between frames. Decides whether "blacked out" surfaces are
 // progressive shot-out state (bot wall-spray breaking lights/screens) or
 // present from the first frame (a real render/data bug).
-import pkg from '/home/user/dukenukem3d/webduke3d/node_modules/playwright/index.js';
+import { chromium } from "playwright";
 import { execSync } from 'child_process';
-const { chromium } = pkg;
 const OUT = '/tmp/claude-1000/-home-user-dukenukem3d/2702fb27-c600-4a19-8d97-aac9514061e4/scratchpad';
 const availMB = parseInt(execSync("awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo", { encoding: 'utf8' }));
 if (availMB < 6144) { console.log(JSON.stringify({ fail: 'MEM-UNSAFE', availMB })); process.exit(4); }

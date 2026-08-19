@@ -40,6 +40,8 @@ jobs:
       - name: Build multiplayer transport bundle
         working-directory: platform/emscripten
         run: npm ci && npm test && npm run build:net
+      - name: Verify bundled shareware fixture
+        run: sha256sum -c assets/shareware/SHA256SUMS
       - name: Build WASM (software renderer, NetDuke32 multiplayer)
         run: make PLATFORM=EMSCRIPTEN EM_SINGLE_FILE=0 NETDUKE32=1 -j"$(nproc)"
       - name: Assemble web bundle
@@ -85,6 +87,7 @@ jobs:
         run: |
           mkdir -p eduke32-native-linux
           cp eduke32 mapster32 eduke32-native-linux/ 2>/dev/null || true
+          sha256sum -c assets/shareware/SHA256SUMS
           cp assets/shareware/DUKE3D.GRP assets/shareware/LICENSE.TXT eduke32-native-linux/
           ls -la eduke32-native-linux/
       - uses: actions/upload-artifact@v4
@@ -138,6 +141,7 @@ jobs:
           mkdir -p eduke32-native-macos
           cp -R EDuke32.app eduke32 mapster32 eduke32-native-macos/ 2>/dev/null || true
           cp "$HOME/ldc-prefix/lib/"libdatachannel*.dylib eduke32-native-macos/ 2>/dev/null || true
+          shasum -a 256 -c assets/shareware/SHA256SUMS
           cp assets/shareware/DUKE3D.GRP assets/shareware/LICENSE.TXT eduke32-native-macos/
           ls -la eduke32-native-macos/
       - uses: actions/upload-artifact@v4
@@ -228,6 +232,7 @@ jobs:
         run: |
           mkdir -p eduke32-native-windows
           cp eduke32.exe mapster32.exe eduke32-native-windows/ 2>/dev/null || true
+          sha256sum -c assets/shareware/SHA256SUMS
           cp assets/shareware/DUKE3D.GRP assets/shareware/LICENSE.TXT eduke32-native-windows/
           cp deps-prefix/bin/*.dll eduke32-native-windows/ 2>/dev/null || true
           # mingw runtime DLLs the exe links (SDL2, openssl, curl, gcc runtime...)

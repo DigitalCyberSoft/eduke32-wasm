@@ -1,7 +1,6 @@
 // Reproduce the user's exact join path: open ?join=CODE and log every state
 // transition until in-game or timeout. One short-lived headless browser.
-import pkg from '/home/user/dukenukem3d/webduke3d/node_modules/playwright/index.js';
-const { chromium } = pkg;
+import { chromium } from "playwright";
 const CODE = process.env.CODE || 'fr8zus7dbj7z';
 const t0 = Date.now();
 const ts = () => ((Date.now() - t0) / 1000).toFixed(1).padStart(6);

@@ -502,6 +502,26 @@ public:
     }
     bool isHost() const { return isHost_; }
 
+#ifdef NN_TRANSPORT_TEST
+    // Test-only view of the REAL allocator. It deliberately supplies only the
+    // transport-owned seats: an engine CPU reservation must be learned through
+    // the production Net_GetBotMask path, not smuggled into the fixture. This
+    // hook is absent from normal builds and performs no network or engine work.
+    int testNextFreeSlot(const int *slots, int count)
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        tokenToDevice_.clear();
+        deviceToToken_.clear();
+        for (int i = 0; i < count; i++)
+        {
+            std::string const device = "fixture-" + std::to_string(i);
+            tokenToDevice_[slots[i]] = device;
+            deviceToToken_[device] = slots[i];
+        }
+        return nextFreeSlot();
+    }
+#endif
+
     // Menu pulls (game thread only; the strings are not mutated concurrently).
     const char *inviteCstr() { return invite_.c_str(); }
     const char *grpLabelCstr()
@@ -1119,6 +1139,14 @@ std::unique_ptr<NativeTransport> g_t;
 bool g_inited = false;
 
 } // namespace
+
+#ifdef NN_TRANSPORT_TEST
+extern "C" int NN_TestNativeNextFreeSlot(const int *slots, int count)
+{
+    NativeTransport transport;
+    return transport.testNextFreeSlot(slots, count);
+}
+#endif
 
 extern "C" {
 

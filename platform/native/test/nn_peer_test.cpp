@@ -48,8 +48,8 @@ int main(int argc, char **argv)
     std::mutex sigMtx;
     std::atomic<bool> gotPeerCtrl{ false };
 
-    pm.sendSdp = [&](const std::string &to, const std::string &sdp, bool isOffer) {
-        client.publishEphemeral(SIGNALING_KIND, key, buildSdpMsg(deviceId, to, sdp, isOffer));
+    pm.sendSdp = [&](const std::string &to, const std::string &sdp, bool isOffer, const std::string &gen) {
+        client.publishEphemeral(SIGNALING_KIND, key, buildSdpMsg(deviceId, to, sdp, isOffer, gen));
     };
     pm.sendIce = [&](const std::string &to, const std::string &cand, const std::string &mid) {
         client.publishEphemeral(SIGNALING_KIND, key, buildIceMsg(deviceId, to, cand, mid));
@@ -103,8 +103,11 @@ int main(int argc, char **argv)
     printf(rc == 0 ? "PEER OK (%s)\n" : "PEER FAIL (%s)\n", deviceId.c_str());
     fflush(stdout);
 
-    pm.closeAll();
+    // Stop the relay before closing the peer manager: relay/presence callbacks may
+    // still call pm.connect while closeAll is tearing down the pool. That race left
+    // the standalone test alive after printing PEER OK.
     client.stop();
+    pm.closeAll();
     sjson_destroy_context(sigCtx);
     rtc::Cleanup().wait();
     return rc;

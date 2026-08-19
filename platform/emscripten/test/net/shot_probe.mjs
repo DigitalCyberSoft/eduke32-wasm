@@ -1,8 +1,7 @@
 // Visual probe: late-join a running arena on the SERVED build, arm localbot so
 // the view moves, and screenshot the world at intervals -- hunting the user's
 // "some things are blacked out" report with my own eyes.
-import pkg from '/home/user/dukenukem3d/webduke3d/node_modules/playwright/index.js';
-const { chromium } = pkg;
+import { chromium } from "playwright";
 const CODE = process.env.CODE || '51xg3am2ks5p';
 const OUT = '/tmp/claude-1000/-home-user-dukenukem3d/2702fb27-c600-4a19-8d97-aac9514061e4/scratchpad';
 const B = await chromium.launch({ headless: true, args: ['--mute-audio', '--autoplay-policy=no-user-gesture-required',

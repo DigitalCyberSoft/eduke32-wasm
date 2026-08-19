@@ -57,6 +57,9 @@ extern "C" void Net_SetLocalIndex(int slot)
 extern "C" void NetMenu_SetStatus(const char *) {}
 extern "C" void NetMenu_SetRoster(const char *) {}
 extern "C" void NetMenu_OnJoined(int) {}
+extern "C" const char *Net_NativeGrpPath(void) { return ""; }
+extern "C" uint32_t Bcrc32(const void *, int, uint32_t crc) { return crc; }
+extern "C" void Net_SnapshotReady(int, int, int) {}
 
 int main()
 {

@@ -1,9 +1,8 @@
 // PERSISTENT bot arena: one headless host + 4 bots, private match, stays up
 // 30 minutes so the user can join and fight/watch anytime. Prints the JOIN
 // URL early and a liveness line each minute. One browser; mem-gated.
-import pkg from '/home/user/dukenukem3d/webduke3d/node_modules/playwright/index.js';
+import { chromium } from "playwright";
 import { execSync } from 'child_process';
-const { chromium } = pkg;
 const availMB = parseInt(execSync("awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo", { encoding: 'utf8' }));
 if (availMB < 6144) { console.log(JSON.stringify({ fail: 'MEM-UNSAFE', availMB })); process.exit(4); }
 

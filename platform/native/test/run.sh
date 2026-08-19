@@ -22,11 +22,16 @@ $CXX $INC "$ROOT/platform/native/test/nn_crypto_test.cpp" -o "$OUT/crypto_test" 
 $CXX $INC "$ROOT/platform/native/test/nn_nostr_test.cpp"  -o "$OUT/nostr_test"  $LIBDIRS -lsecp256k1 -lcrypto
 # relay transport now runs over libcurl (OpenSSL WebSocket), not libdatachannel.
 $CXX $INC "$ROOT/platform/native/test/nn_relay_test.cpp"  -o "$OUT/relay_test"  $LIBDIRS -lcurl -lsecp256k1 -lcrypto -lpthread
-$CXX $INC "$ROOT/platform/native/test/nn_peer_test.cpp"   -o "$OUT/peer_test"   $LIBDIRS -ldatachannel -lsecp256k1 -lcrypto -lpthread
+$CXX $INC "$ROOT/platform/native/test/nn_peer_test.cpp"   -o "$OUT/peer_test"   $LIBDIRS -ldatachannel -lcurl -lsecp256k1 -lcrypto -lpthread
 # seam test links the REAL net_transport_native.cpp (needs -DNETNATIVE + the engine include dir)
 $CXX -DNETNATIVE $INC -I "$ROOT/source/duke3d/src" \
      "$ROOT/platform/native/test/nn_seam_test.cpp" "$ROOT/source/duke3d/src/net_transport_native.cpp" \
-     -o "$OUT/seam_test" $LIBDIRS -ldatachannel -lsecp256k1 -lcrypto -lpthread
+     -o "$OUT/seam_test" $LIBDIRS -ldatachannel -lcurl -lsecp256k1 -lcrypto -lpthread -lminiupnpc
+# Phase-0 RED characterization binary. Built with the real transport allocator,
+# but not run in the green regression suite until the Phase-1 production fix lands.
+$CXX -DNETNATIVE -DNN_TRANSPORT_TEST $INC -I "$ROOT/source/duke3d/src" \
+     "$ROOT/platform/native/test/nn_bot_seat_test.cpp" "$ROOT/source/duke3d/src/net_transport_native.cpp" \
+     -o "$OUT/bot_seat_red" $LIBDIRS -ldatachannel -lsecp256k1 -lcrypto -lpthread -lcurl -lminiupnpc
 
 export LD_LIBRARY_PATH="$PREFIX/usr/lib64:$PREFIX/lib64:${LD_LIBRARY_PATH:-}"
 

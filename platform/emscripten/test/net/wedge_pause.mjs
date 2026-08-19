@@ -1,8 +1,7 @@
 // Definitive wedge localizer: keep the wasm debuggable from boot, join the
 // match, wait for the post-seat wedge, then Debugger.pause the spinning main
 // thread and print the exact wasm call stack.
-import pkg from '/home/user/dukenukem3d/webduke3d/node_modules/playwright/index.js';
-const { chromium } = pkg;
+import { chromium } from "playwright";
 const CODE = process.env.CODE || '';
 if (!CODE) { console.log('need CODE env'); process.exit(2); }
 const t0 = Date.now();

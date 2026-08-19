@@ -4,8 +4,7 @@
 // localbot hunt rerun on the served hygiene build. Expected profile from the
 // accepted baseline: ONE heal shortly post-seat (fresh joiner -> targeted
 // heal), then silence: no further desync reports, no softsnaps, sync=0.
-import pkg from '/home/user/dukenukem3d/webduke3d/node_modules/playwright/index.js';
-const { chromium } = pkg;
+import { chromium } from "playwright";
 const CODE = process.env.CODE || '';
 if (!CODE) { console.log('NO CODE'); process.exit(2); }
 const MINUTES = parseInt(process.env.MINUTES || '27', 10);

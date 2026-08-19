@@ -3,10 +3,9 @@
 // Mode latejoin: host launches SOLO, guest joins the running game (relaunch path).
 // Asserts per-peer __e32menu {game,np,idx,sync} through a 60s soak with host
 // movement, and measures guest frame-to-frame pixel deltas (screen "shake").
-import pkg from '/home/user/dukenukem3d/webduke3d/node_modules/playwright/index.js';
+import { chromium } from "playwright";
 import fs from 'fs';
 import { execSync } from 'child_process';
-const { chromium } = pkg;
 const MODE = process.argv[2] || 'normal';
 const LOG = `/tmp/sync_soak_${MODE}.log`;
 fs.writeFileSync(LOG, `=== sync soak ${MODE} ${new Date().toISOString()} ===\n`);
