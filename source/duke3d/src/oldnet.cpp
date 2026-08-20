@@ -784,6 +784,7 @@ static int16_t s_botMonTgt[MAXPLAYERS];
 static vec2_t  s_botLastPos[MAXPLAYERS];
 static int16_t s_botStuckTics[MAXPLAYERS];
 static int16_t s_botBounceHold[MAXPLAYERS];  // tics left steering to bounceAng
+static int32_t s_botParkTics[MAXPLAYERS];    // default-off [park] diagnostic: consecutive near-stationary tics
 static int16_t s_botBounceAng[MAXPLAYERS];
 static int8_t  s_botWasDead[MAXPLAYERS];
 static int16_t s_botSpawnRoam[MAXPLAYERS];   // post-respawn target-blind roam
@@ -809,6 +810,7 @@ static int16_t s_botLastSect[MAXPLAYERS];    // re-plan the route on sector cros
 static uint8_t s_botLive[MAXPLAYERS];       // body has been anchored to a live spawn
 static int32_t s_botSepPlc = -1;            // level-scoped separation telemetry
 static int32_t s_botCamLogPlc[MAXPLAYERS];  // level-scoped viewscreen telemetry
+static int32_t s_botCornerLogPlc[MAXPLAYERS]; // default-off corner-grind diagnostic throttle
 static int8_t  s_botTurnPref[MAXPLAYERS];    // wall-following handedness (+1/-1)
 static int16_t s_botTrapTics[MAXPLAYERS];    // zero-net-displacement streak (hard trap)
 static vec2_t  s_botTrapAnchor[MAXPLAYERS];
@@ -864,6 +866,8 @@ static int16_t s_botDeadSect[MAXPLAYERS][BOT_DEAD_N]; // recently-unreachable ta
 static int16_t s_botDeadCool[MAXPLAYERS][BOT_DEAD_N]; // tics of avoidance left (0 = slot free)
 static int32_t s_botGoalNear[MAXPLAYERS];    // closest we have come to the current goal
 static int16_t s_botGoalStall[MAXPLAYERS];   // tics since that closest approach improved
+static int32_t s_botItemNear[MAXPLAYERS];    // closest we have come to an ITEM goal specifically
+static int16_t s_botItemStall[MAXPLAYERS];   // tics an item approach has failed to improve (corner-park cure)
 // ── Combat / aim model (OpenArena-mined, wave 3b). Per-seat static state, no
 // heap; RESET at BOTH the Net_SeatBots init loop AND the respawn block, same as
 // every other body-state array. Concept ports of ai_dmq3.c BotAimAtEnemy /
@@ -1106,6 +1110,160 @@ static int Bot_LineWalkFrom(int16_t sect, int32_t x, int32_t y, int32_t z,
 static int Bot_LineWalkable(DukePlayer_t *ps, int32_t tx, int32_t ty)
 {
     return Bot_LineWalkFrom(ps->cursectnum, ps->pos.x, ps->pos.y, ps->pos.z, tx, ty);
+}
+
+// Swept-body clearance of a candidate heading H (BUILD angle) from the player's
+// stance: the minimum forward distance (capped at maxd) the ~164-radius body can
+// travel before wall / blocking-sprite / step-up contact.  Sampled as three
+// PARALLEL rays -- the body centre and both edges (±BOT_BODY perpendicular) --
+// plus a floor-step gate, because the zero-width centre line the router uses
+// sails past corners and sills the swept body cannot clear.  Deterministic; no
+// Bot_Rnd.  Feeds the whisker steer that rounds corners instead of ramming them.
+#define BOT_BODY   148          // just under player clipdist 164 -> real passages still pass
+static int32_t Bot_HeadingClearance(DukePlayer_t *ps, int H, int32_t maxd)
+{
+    H &= 2047;
+    int const perp = (H + 512) & 2047;
+    int32_t const fdx = sintable[(H + 512) & 2047];      // forward dir components (hitscan-scale)
+    int32_t const fdy = sintable[H & 2047];
+    int32_t const pdx = sintable[(perp + 512) & 2047];   // perpendicular unit (.14)
+    int32_t const pdy = sintable[perp & 2047];
+    int32_t clear = maxd;
+    for (int s = -BOT_BODY; s <= BOT_BODY; s += BOT_BODY)   // -148, 0, +148
+    {
+        int32_t const ox = ps->pos.x + mulscale14(s, pdx);
+        int32_t const oy = ps->pos.y + mulscale14(s, pdy);
+        int16_t osec = ps->cursectnum;
+        updatesector(ox, oy, &osec);
+        if (osec < 0) { clear = 0; break; }                // body edge already outside geometry: pressed
+        vec3_t o = { ox, oy, ps->pos.z };
+        hitdata_t h = {};
+        hitscan(&o, osec, fdx, fdy, 0, &h, CLIPMASK0);
+        int32_t const d = (h.wall >= 0 || h.sprite >= 0)
+            ? FindDistance2D(h.xyz.x - ox, h.xyz.y - oy) : maxd;
+        if (d < clear) clear = d;
+    }
+    // Floor-step gate along the centre: a step-up beyond ~autostep is a wall to
+    // the body even where the eye-level rays sailed over it (the ledge grind).
+    int16_t const cs = ps->cursectnum;
+    if ((unsigned)cs < (unsigned)numsectors)
+    {
+        int32_t const f0 = getflorzofslope(cs, ps->pos.x, ps->pos.y);
+        for (int32_t d = 128; d <= clear && d <= maxd; d += 128)
+        {
+            int32_t const sx = ps->pos.x + mulscale14(d, fdx);
+            int32_t const sy = ps->pos.y + mulscale14(d, fdy);
+            int16_t cc = cs; updatesector(sx, sy, &cc);
+            if (cc < 0) { clear = d; break; }
+            if (f0 - getflorzofslope(cc, sx, sy) > (18 << 8)) { clear = d; break; }  // step too high
+        }
+    }
+    return clear;
+}
+
+// Body-aware reachability: can the ~164-radius body actually walk the straight
+// segment pos->(tx,ty)?  The path SHORTCUTS (same-sector fast-path, string-pull
+// extension) are gated on THIS instead of the zero-width centre line, so the
+// route the bot commits to is one the body can traverse without the corner-cut
+// grind.  A rejection only ever downgrades a shortcut to finer node-by-node
+// routing -- the mandatory next route node is never gated -- so it can never
+// strand the bot.  Deterministic; no Bot_Rnd.
+static int Bot_SweptReach(DukePlayer_t *ps, int32_t tx, int32_t ty)
+{
+    static int on = -1;
+    if (on < 0) on = (getenv("NN_NOPATHFIX") != NULL) ? 0 : 1;
+    if (!on) return 1;                             // A/B kill switch: shortcut on centre line as before
+    int32_t const dx = tx - ps->pos.x, dy = ty - ps->pos.y;
+    int32_t const dist = FindDistance2D(dx, dy);
+    if (dist < BOT_BODY) return 1;                 // within a body radius: trivially reachable
+    return Bot_HeadingClearance(ps, getangle(dx, dy), dist) >= dist;
+}
+
+// Bearing to (tx,ty) from where the bot WILL be, not the ~6-tic-stale play-cursor
+// position.  The host produces bot input several tics AHEAD of the sim while
+// ps->pos is frozen, so the heading to a NEARBY door/waypoint was computed ~300u
+// behind the body and wobbled.  Project by the run-ahead depth along the engine
+// momentum (pos advances vel>>14 per tic, player.cpp:6238), clamped so it never
+// passes the target (that would flip the bearing).  Combat targets are far, so
+// this is a no-op there; it straightens the CLOSE nav headings.  NN_NOPOSPROJ=1
+// disables (A/B).
+static int Bot_ProjHeading(int k, DukePlayer_t *ps, int32_t tx, int32_t ty)
+{
+    static int on = -1;
+    if (on < 0) on = (getenv("NN_NOPOSPROJ") != NULL) ? 0 : 1;
+    int32_t px = ps->pos.x, py = ps->pos.y;
+    if (on && (unsigned)k < (unsigned)MAXPLAYERS)
+    {
+        int32_t const ra = g_player[k].movefifoend - movefifoplc;   // tics produced ahead of the sim
+        if (ra > 0)
+        {
+            int32_t dx = ra * (ps->vel.x >> 14), dy = ra * (ps->vel.y >> 14);
+            int32_t const dist = FindDistance2D(tx - px, ty - py);
+            int32_t const dmag = FindDistance2D(dx, dy);
+            int32_t const capd = dist >> 1;                          // never past halfway -> no bearing flip
+            if (dmag > capd && dmag > 0)
+            { dx = (int32_t)((int64_t)dx * capd / dmag); dy = (int32_t)((int64_t)dy * capd / dmag); }
+            px += dx; py += dy;
+        }
+    }
+    return getangle(tx - px, ty - py);
+}
+
+// DIAGNOSTIC ONLY (default-off, NN_FORENSICS) -- does NOT change steering.
+// Minimum distance from any SOLID wall vertex of sector `s` to the segment
+// (x0,y0)->(x1,y1), plus the offending wall.  The route/string-pull clearance
+// tests above are zero-width center lines; the real body is swept by clipmove
+// at the player clip radius (~164 units).  A path whose center line clears a
+// convex corner while a wall vertex sits closer than that radius is exactly the
+// "runs into corners" grind -- this MEASURES that gap so it can be confirmed
+// before any fix.
+static int32_t Bot_MinSolidVertDistToSeg(int16_t s, int32_t x0, int32_t y0,
+                                         int32_t x1, int32_t y1, int *outWall)
+{
+    if (outWall) *outWall = -1;
+    if ((unsigned)s >= (unsigned)numsectors)
+        return INT32_MAX;
+    int64_t const dx = x1 - x0, dy = y1 - y0;
+    int64_t const seglen2 = dx * dx + dy * dy;
+    int32_t best = INT32_MAX;
+    int const wend = sector[s].wallptr + sector[s].wallnum;
+    for (int w = sector[s].wallptr; w < wend; w++)
+    {
+        if (wall[w].nextsector >= 0 && !(wall[w].cstat & 1))
+            continue;                                   // passable portal, not a body blocker
+        int32_t const vx = wall[w].x, vy = wall[w].y;
+        int64_t t = seglen2 ? (((int64_t)(vx - x0) * dx + (int64_t)(vy - y0) * dy) << 8) / seglen2 : 0;
+        if (t < 0) t = 0; else if (t > 256) t = 256;    // clamp to segment (.8 fixed param)
+        int32_t const px = x0 + (int32_t)((dx * t) >> 8);
+        int32_t const py = y0 + (int32_t)((dy * t) >> 8);
+        int32_t const d = FindDistance2D(vx - px, vy - py);
+        if (d < best) { best = d; if (outWall) *outWall = w; }
+    }
+    return best;
+}
+
+// DIAGNOSTIC ONLY -- swept-vertex clearance over the current sector AND its
+// wall neighbors (a body-radius clip usually lands on a portal-neighbor corner,
+// which the single-sector scan above misses).
+static int32_t Bot_MinSolidVertDistNbr(int16_t s, int32_t x0, int32_t y0,
+                                       int32_t x1, int32_t y1, int *outWall)
+{
+    int w0 = -1, w1 = -1;
+    int32_t best = Bot_MinSolidVertDistToSeg(s, x0, y0, x1, y1, &w0);
+    if (outWall) *outWall = w0;
+    if ((unsigned)s < (unsigned)numsectors)
+    {
+        int const wend = sector[s].wallptr + sector[s].wallnum;
+        for (int w = sector[s].wallptr; w < wend; w++)
+        {
+            int const ns = wall[w].nextsector;
+            if ((unsigned)ns >= (unsigned)numsectors)
+                continue;
+            int32_t const d = Bot_MinSolidVertDistToSeg((int16_t)ns, x0, y0, x1, y1, &w1);
+            if (d < best) { best = d; if (outWall) *outWall = w1; }
+        }
+    }
+    return best;
 }
 
 // ── Bounded sparse layered navigation graph ─────────────────────────────────
@@ -2086,6 +2244,7 @@ static int Bot_Waypoint(int k, DukePlayer_t *ps, int32_t dx2, int32_t dy2, int32
     if (!s_nvgReady)
         return 0;
     if (Nvg_LineWalkSameSector(ps, dx2, dy2, dsect)
+        && Bot_SweptReach(ps, dx2, dy2)          // body-safe straight shot, not just a centre line
         && !Bot_SegNearWedgeSpot(k, ps->pos.x, ps->pos.y, ps->cursectnum,
                                  dx2, dy2, dsect)
         && !Bot_SegCrossesCrawl(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
@@ -2144,6 +2303,7 @@ static int Bot_Waypoint(int k, DukePlayer_t *ps, int32_t dx2, int32_t dy2, int32
         bool const door = (s_nvgNode[n].flags & NVG_F_DOOR) != 0;
         if (s_nvgNode[n].sector == ps->cursectnum
             && Nvg_LineWalkSameSector(ps, nx, ny, s_nvgNode[n].sector)
+            && Bot_SweptReach(ps, nx, ny)        // only shortcut to a node the body can reach
             && !Bot_SegNearWedgeSpot(k, ps->pos.x, ps->pos.y, ps->cursectnum,
                                      nx, ny, s_nvgNode[n].sector)
             && !Bot_SegCrossesCrawl(ps->pos.x, ps->pos.y, ps->pos.z, ps->cursectnum,
@@ -3940,7 +4100,8 @@ static input_t Bot_GetInput(int k)
         // the 13s timeout below; the staleness gradient would otherwise lure the
         // bot straight back to the one door it can't take.
         if (s_botGoalTics[k] == 0)
-            { s_botGoalNear[k] = goalDist; s_botGoalStall[k] = 0; s_botLtgAnchor[k] = ps->pos.xy; }
+            { s_botGoalNear[k] = goalDist; s_botGoalStall[k] = 0; s_botLtgAnchor[k] = ps->pos.xy;
+              s_botItemNear[k] = goalDist; s_botItemStall[k] = 0; }
         else if (s_botGoalIsLtg[k])
         {
             // LTG-body watch: MOVEMENT-based, both goal kinds. The approach
@@ -4061,8 +4222,28 @@ static input_t Bot_GetInput(int k)
         else if (s_botGoal[k] == 2)
         {
             int const it = s_botGoalItem[k];
-            if ((unsigned)it >= MAXSPRITES || (sprite[it].cstat & 32768)
-                || !Bot_IsPickup(sprite[it].picnum))
+            // CORNER-PARK CURE (user 2026-08-19 "bots hide in corners for no reason"):
+            // items sit against walls/in alcoves, so the bot routes to the item's cell
+            // but its 164 body radius keeps it a wall's-width short -- goalDist stops
+            // falling while the whisker circles it in place.  The movement-stall watch
+            // is DEFEATED by that circling; the APPROACH distance is not.  Not getting
+            // closer for ~120 tics on the close final leg => can't reach it: shun and
+            // move on (was ~15s of parking until the hard cap).
+            if (goalDist + 96 < s_botItemNear[k])
+                { s_botItemNear[k] = goalDist; s_botItemStall[k] = 0; }
+            else if (goalDist < 3072 && ++s_botItemStall[k] > 120)
+            {
+                s_botItemShun[k] = (int16_t)it;
+                if (s_botGoalIsLtg[k]) Bot_LtgEnd(k, "unreach");
+                extern int32_t g_netForensics;
+                if (g_netForensics)
+                    LOG_F(INFO, "[itemshun] seat=%d it=%d goalDist=%d near=%d plc=%d (unreachable corner item)",
+                          k, it, goalDist, (int)s_botItemNear[k], (int)movefifoplc);
+                s_botGoal[k] = 0;
+            }
+            if (s_botGoal[k] == 2
+                && ((unsigned)it >= MAXSPRITES || (sprite[it].cstat & 32768)
+                || !Bot_IsPickup(sprite[it].picnum)))
             {
                 // Taken (ideally by us): errand done. OBSERVED pickup is the
                 // respawn ring's refresh point -- from here the schedule knows
@@ -4076,7 +4257,7 @@ static input_t Bot_GetInput(int k)
                 }
                 s_botGoal[k] = 0;
             }
-            else if (goalDist < 512 && s_botGoalTics[k] > 60)
+            else if (s_botGoal[k] == 2 && goalDist < 512 && s_botGoalTics[k] > 60)
             {
                 // Standing ON it and nothing happened -- full health/ammo, the
                 // sim refuses. Shun it and get back to the room routine.
@@ -4304,7 +4485,7 @@ static input_t Bot_GetInput(int k)
             if (guided2)
             {
                 s_botNavSeen[k] = 1;
-                wantAng = getangle(nx2 - ps->pos.x, ny2 - ps->pos.y);
+                wantAng = Bot_ProjHeading(k, ps, nx2, ny2);
             }
             else
             {
@@ -4316,13 +4497,13 @@ static input_t Bot_GetInput(int k)
                         s_botBounceAng[k] = (int16_t)(fix16_to_int(ps->q16ang) & 2047);
                 }
                 wantAng = (s_botNavSeen[k] > 0)
-                          ? getangle(nx2 - ps->pos.x, ny2 - ps->pos.y)
+                          ? Bot_ProjHeading(k, ps, nx2, ny2)
                           : s_botBounceAng[k];
             }
         }
         else
         {
-            wantAng  = getangle(tgX - ps->pos.x, tgY - ps->pos.y);   // face it (keep shooting)
+            wantAng  = Bot_ProjHeading(k, ps, tgX, tgY);   // move heading (facing uses actual target bearing)
             // Only chase-ADVANCE a target the mesh can reach. A brief no-route
             // blip (route recompute, target skimming an edge tile) still lets
             // the bot close for ~8 tics; a SUSTAINED no-route (ledge above) it
@@ -4355,7 +4536,7 @@ static input_t Bot_GetInput(int k)
         if (guided)
         {
             s_botGoalSeen[k] = 1;
-            wantAng = getangle(sx2 - ps->pos.x, sy2 - ps->pos.y);
+            wantAng = Bot_ProjHeading(k, ps, sx2, sy2);
         }
         else
         {
@@ -4367,7 +4548,7 @@ static input_t Bot_GetInput(int k)
                     s_botBounceAng[k] = (int16_t)(fix16_to_int(ps->q16ang) & 2047);
             }
             wantAng = (s_botGoalSeen[k] > 0)
-                      ? getangle(sx2 - ps->pos.x, sy2 - ps->pos.y)
+                      ? Bot_ProjHeading(k, ps, sx2, sy2)
                       : s_botBounceAng[k];
         }
     }
@@ -4424,7 +4605,31 @@ static input_t Bot_GetInput(int k)
             aimAng = leadAng;
         }
     }
-    int diff = (((aimAng - fix16_to_int(ps->q16ang)) + 1024) & 2047) - 1024;
+    // RUN-AHEAD AIM FIX (user 2026-08-19 "face the target"): the host PRODUCES bot
+    // input several tics AHEAD of the sim (movefifoend > movefifoplc) while
+    // ps->q16ang is frozen at the play cursor.  Planning every look-ahead tic from
+    // the SAME stale angle re-commanded the same turn each tic, so the view
+    // overshot by the run-ahead depth and OSCILLATED around the target -- the
+    // spinning / "doesn't face me" (turnCap only damped the amplitude).  Aim from
+    // the PROJECTED angle: current angle plus the turns already queued but not yet
+    // played, so each produced tic converges onto the target instead of piling on.
+    // NN_NOFACEFIX=1 restores the old stale-angle aim (A/B).
+    static int s_faceFix = -1;
+    if (s_faceFix < 0) s_faceFix = (getenv("NN_NOFACEFIX") != NULL) ? 0 : 1;
+    // Applies to BOTH combat aim AND navigation steering (user 2026-08-19): during
+    // roam/goal-follow aimAng==moveAng (the heading to the waypoint/door/hall/stair),
+    // and the SAME run-ahead overshoot made that heading oscillate -- the bot wove
+    // through rooms and never pointed cleanly at a doorway.  Projecting the angle
+    // converges the steering onto the nav heading exactly as it converges combat aim.
+    fix16_t projQ16ang = ps->q16ang;
+    if (s_faceFix && (unsigned)k < (unsigned)MAXPLAYERS)
+    {
+        fix16_t projAvel = 0;
+        for (int32_t t = movefifoplc; t < g_player[k].movefifoend; ++t)
+            projAvel = fix16_sadd(projAvel, inputfifo[t & (MOVEFIFOSIZ - 1)][k].q16avel);
+        projQ16ang = fix16_sadd(ps->q16ang, projAvel);
+    }
+    int diff = (((aimAng - fix16_to_int(projQ16ang)) + 1024) & 2047) - 1024;
     // Tracking: SMALL wobble while the target is visible (the old +-48 at
     // default skill was +-8 degrees of permanent miss -- "the bots can't aim",
     // live-reported), and double the turn rate when far off so they snap on.
@@ -4470,6 +4675,22 @@ static input_t Bot_GetInput(int k)
     // contract; re-enable with proper (critical) damping if head-feel is wanted.
     s_botViewVel[k] = 0;
     in.q16avel = fix16_from_int(clamp(diff + aimErr, -cap, cap));
+    // FACING DIAGNOSTIC (default-off, NN_FORENSICS): while engaging, how far the
+    // bot's actual facing (q16ang) trails the aim -- err large & persistent means
+    // the turn cap can't keep the head on a moving target ("doesn't face me").
+    {
+        extern int32_t g_netForensics;
+        int32_t const ffend = ((unsigned)k < (unsigned)MAXPLAYERS) ? g_player[k].movefifoend : movefifoplc;
+        if (g_netForensics && (ffend & 7) == 0)   // log roam steering too (see=0), not just combat
+        {
+            int const face  = fix16_to_int(ps->q16ang) & 2047;       // stale play-cursor angle
+            int const pface = fix16_to_int(projQ16ang) & 2047;       // projected produce-tic angle
+            int const err   = klabs((((aimAng - pface) + 1024) & 2047) - 1024);
+            LOG_F(INFO, "[face] seat=%d ffend=%d ra=%d see=%d tgt=%d aimAng=%d face=%d pface=%d err=%d diff=%d cap=%d",
+                  k, (int)ffend, (int)(ffend - movefifoplc), seesTarget, (int)s_botTarget[k],
+                  aimAng, face, pface, err, diff, cap);
+        }
+    }
 
     int32_t const dist2d = hasTgt ? FindDistance2D(tgX - ps->pos.x, tgY - ps->pos.y) : INT32_MAX;
 
@@ -4481,7 +4702,7 @@ static input_t Bot_GetInput(int k)
     in.q16horz = Bot_CombatHorizonDelta(ps->q16horiz, ps->q16horizoff, aimDz,
                                          seesTarget ? dist2d : 0);
 
-    fix16_t const futureAng = fix16_sadd(ps->q16ang, in.q16avel) & 0x7ffffff;
+    fix16_t const futureAng = fix16_sadd(projQ16ang, in.q16avel) & 0x7ffffff;  // projected: matches fire-time facing
     fix16_t const futureHoriz = fix16_clamp(fix16_sadd(ps->q16horiz, in.q16horz),
                                             F16(HORIZ_MIN), F16(HORIZ_MAX));
     botshotprobe_t shotProbe = {};
@@ -4565,13 +4786,98 @@ static input_t Bot_GetInput(int k)
     // Remember whether we commanded a strafe this tic: next tic's flip-on-
     // blocked (above) checks it against the realized displacement.
     s_botWantStrafe[k] = (strSpd != 0);
+    // ── WHISKER STEER (user-chosen 2026-08-19): round corners instead of ramming
+    // them.  PURE NAVIGATION ONLY -- skipped whenever canHit, so combat weave /
+    // orbit and their facing stay exactly as tuned.  Probes the swept 164-radius
+    // body along the move heading; when it is blocked, it tries symmetric
+    // deflections and steers toward the side with real clearance, and only eases
+    // off (letting the existing stuck ladder rotate) when genuinely boxed in.
+    // Deterministic -- no Bot_Rnd, so the fixed-seed roam stream is untouched.
+    // NN_NOCORNERFIX=1 disables it (A/B kill switch for the grind-rate gate).
+    int driveAng = moveAng;
+    {
+        static int s_cornerFix = -1;
+        if (s_cornerFix < 0) s_cornerFix = (getenv("NN_NOCORNERFIX") != NULL) ? 0 : 1;
+        // Engage ONLY when the body is actually pinned THIS tic (realized step
+        // small) while commanding drive -- a bot that is moving fine (threading a
+        // doorway, crossing a room) is left completely alone, so the fix cures the
+        // grind without shrinking exploration by veering off chokepoints.
+        if (s_cornerFix && fwdSpd > 0 && !canHit && stepped < 20)
+        {
+            int32_t const PROBE = 512;
+            int32_t const straight = Bot_HeadingClearance(ps, moveAng, PROBE);
+            if (straight < PROBE)   // the committed heading would grind
+            {
+                int      bestAng   = moveAng;
+                int32_t  bestClear = straight;
+                int const side0 = (s_botTurnPref[k] >= 0) ? 1 : -1;   // per-seat bias, no dice
+                static int const kDefl[3] = { 192, 341, 512 };        // ~34, 60, 90 deg
+                for (int di = 0; di < 3; ++di)
+                {
+                    int const a1 = (moveAng + side0 * kDefl[di]) & 2047;
+                    int const a2 = (moveAng - side0 * kDefl[di]) & 2047;
+                    int32_t const c1 = Bot_HeadingClearance(ps, a1, PROBE);
+                    int32_t const c2 = Bot_HeadingClearance(ps, a2, PROBE);
+                    if (c1 > bestClear + 64) { bestClear = c1; bestAng = a1; }
+                    if (c2 > bestClear + 64) { bestClear = c2; bestAng = a2; }
+                    if (bestClear >= PROBE) break;   // took the smallest clear deflection
+                }
+                if (bestClear > straight + 64)
+                    driveAng = bestAng;                  // slide around toward the open side
+                else
+                    fwdSpd = max(fwdSpd >> 2, 12);       // boxed in: ease off, ladder rotates
+            }
+        }
+    }
+    // ── PARK DIAGNOSTIC (default-off; NN_FORENSICS). "Bots hide in corners for no
+    // reason." Detect a sustained near-stationary spell and log the DECISION state
+    // -- is fwd commanded to ~0 (the bot CHOSE to stop: hold/give-ground/eased) or
+    // is it driving but pinned? plus goal/target/recovery so we can name the cause.
+    if (stepped < 16) s_botParkTics[k]++; else s_botParkTics[k] = 0;
+    // GENERAL UN-PARK (user 2026-08-19 "bots hide in corners for no reason a lot"):
+    // a bot sat near-stationary ~90 tics (~3.5s) while NOT fighting and NOT at a door
+    // is a pointless corner park -- the whisker eases it in and the goal (or a bad
+    // wander) keeps it there. Drop any goal, shun a stuck item, STAMP the spot so the
+    // planner routes elsewhere, and bounce ~180 off the wall. Handles goal-LESS wander
+    // parks too. Deterministic (no Bot_Rnd). NN_NOUNPARK=1 disables (A/B).
+    {
+        static int s_unpark = -1;
+        if (s_unpark < 0) s_unpark = (getenv("NN_NOUNPARK") != NULL) ? 0 : 1;
+        if (s_unpark && s_botParkTics[k] >= 90
+            && s_botTarget[k] < 0 && s_botMonTgt[k] < 0 && !s_botWpDoor[k] && !s_botGoalDoor[k])
+        {
+            if (s_botGoal[k] == 2 && (unsigned)s_botGoalItem[k] < MAXSPRITES)
+                s_botItemShun[k] = s_botGoalItem[k];
+            if (s_botGoal[k] != 0 && s_botGoalIsLtg[k]) Bot_LtgEnd(k, "parked");
+            s_botGoal[k] = 0;
+            Bot_MarkWedgeSpot(k, ps->pos.x, ps->pos.y, ps->cursectnum);
+            if ((unsigned)ps->cursectnum < (unsigned)numsectors)
+                s_botVisitT[k][ps->cursectnum] = movefifoplc;
+            s_botBounceHold[k] = 30;
+            s_botBounceAng[k]  = (int16_t)((fix16_to_int(ps->q16ang) + 1024) & 2047);   // ~180 away
+            s_botParkTics[k]   = 0;
+            extern int32_t g_netForensics;
+            if (g_netForensics)
+                LOG_F(INFO, "[unpark] seat=%d pos=%d,%d cs=%d plc=%d (parked, not fighting)",
+                      k, ps->pos.x, ps->pos.y, ps->cursectnum, (int)movefifoplc);
+        }
+    }
+    {
+        extern int32_t g_netForensics;
+        if (g_netForensics && s_botParkTics[k] >= 40 && (s_botParkTics[k] % 26) == 0)
+            LOG_F(INFO, "[park] seat=%d plc=%d pos=%d,%d cs=%d parkTics=%d fwd=%d str=%d dA=%d mA=%d eng=%d tgt=%d goal=%d navOn=%d bounce=%d lane=%d stuck=%d",
+                  k, (int)movefifoplc, ps->pos.x, ps->pos.y, ps->cursectnum,
+                  (int)s_botParkTics[k], fwdSpd, strSpd, driveAng, moveAng, (int)engaging,
+                  (int)s_botTarget[k], (int)s_botGoal[k], (int)s_botNavOn[k],
+                  (int)s_botBounceHold[k], (int)s_botLaneHold[k], (int)s_botStuckTics[k]);
+    }
     if (run)        in.bits    |= BIT(SK_RUN);
     if (fwdSpd > 0) in.extbits |= BIT(EK_MOVE_FORWARD);
     if (fwdSpd < 0) in.extbits |= BIT(EK_MOVE_BACKWARD);   // engage-band back-off
     if (strSpd) in.extbits |= BIT(strSpd > 0 ? EK_STRAFE_LEFT : EK_STRAFE_RIGHT);
     if (fwdSpd || strSpd)
     {
-        int const ma = moveAng & 2047;                                   // body goes here
+        int const ma = driveAng & 2047;                                  // body goes here (whisker-deflected)
         int const sa = (aimAng + (strSpd >= 0 ? 512 : 1536)) & 2047;     // strafe ±90° off aim
         int const s  = klabs(strSpd);
         // world vx/vy at angle A, magnitude M: mulscale9(M, sin[A+2560]) / [A+2048]
@@ -4582,6 +4888,66 @@ static input_t Bot_GetInput(int k)
                          + mulscale9(s,      sintable[(sa + 2048) & 2047]);
         in.fvel = (int16_t)clamp(vx, -0x7ff0, 0x7ff0);
         in.svel = (int16_t)clamp(vy, -0x7ff0, 0x7ff0);
+    }
+
+    // ── CORNER-GRIND DIAGNOSTIC (default-off; NN_FORENSICS). Fires only while
+    // the bot COMMANDS forward drive yet the body barely displaced last tic --
+    // the "runs into corners" grind. Logs the active waypoint, whether the
+    // zero-width walk test still calls that line clear, and the min solid-vertex
+    // clearance of the intended path (compare against the ~164 clip radius).
+    // Read-only: it changes no steering state.
+    {
+        extern int32_t g_netForensics;
+        if (g_netForensics && fwdSpd > 0 && stepped < 40
+            && (movefifoplc - s_botCornerLogPlc[k] >= 6 || movefifoplc < s_botCornerLogPlc[k]))
+        {
+            s_botCornerLogPlc[k] = movefifoplc;
+            int32_t const tgx = s_botNavOn[k] ? s_botNavX[k] : s_botGoalX[k];
+            int32_t const tgy = s_botNavOn[k] ? s_botNavY[k] : s_botGoalY[k];
+            int const walk = Bot_LineWalkable(ps, tgx, tgy);
+            // What the BODY actually runs into along its real move heading: hitscan
+            // (CLIPMASK0) names wall vs sprite and near/far, plus the hit wall's
+            // neighbor sector (>=0 = a two-sided portal the body still cannot cross:
+            // step/ledge/closed door; <0 = solid masonry dead ahead).
+            int const ma = moveAng & 2047;
+            hitdata_t mh = {};
+            hitscan(&ps->pos, ps->cursectnum, sintable[(ma + 512) & 2047],
+                    sintable[ma & 2047], 0, &mh, CLIPMASK0);
+            int32_t const mDist = (mh.wall >= 0 || mh.sprite >= 0)
+                ? FindDistance2D(mh.xyz.x - ps->pos.x, mh.xyz.y - ps->pos.y) : -1;
+            int const mNS = (mh.wall >= 0) ? wall[mh.wall].nextsector : -2;
+            // Swept-radius clearance along the ACTUAL move heading (short segment),
+            // over current + neighbor sectors: mvMinV < ~150 => the body clips a
+            // corner the center-line missed.
+            int32_t const mex = ps->pos.x + (mulscale14(512, sintable[(ma + 512) & 2047]));
+            int32_t const mey = ps->pos.y + (mulscale14(512, sintable[ma & 2047]));
+            int mvw = -1;
+            int32_t const mvMinV = Bot_MinSolidVertDistNbr(ps->cursectnum,
+                                     ps->pos.x, ps->pos.y, mex, mey, &mvw);
+            // Floor-step (ledge) probe along the move heading: max step-UP the body
+            // would hit at 96/192 units ahead (z grows downward; >20<<8 = a wall to
+            // clipmove that the eye-level hitscan sails over).
+            int32_t mvStep = 0;
+            {
+                int16_t cs = ps->cursectnum;
+                int32_t const f0 = getflorzofslope(cs, ps->pos.x, ps->pos.y);
+                for (int d = 96; d <= 192; d += 96)
+                {
+                    int32_t const sx = ps->pos.x + mulscale14(d, sintable[(ma + 512) & 2047]);
+                    int32_t const sy = ps->pos.y + mulscale14(d, sintable[ma & 2047]);
+                    int16_t cc = cs; updatesector(sx, sy, &cc);
+                    if (cc < 0) { mvStep = -1; break; }
+                    int32_t const fd = getflorzofslope(cc, sx, sy);
+                    if (f0 - fd > mvStep) mvStep = f0 - fd;
+                }
+            }
+            LOG_F(INFO, "[corner] seat=%d plc=%d pos=%d,%d cs=%d navOn=%d mvA=%d fwd=%d str=%d step=%d gwalk=%d mvMinV=%d mvWall=%d mvStep=%d mDist=%d mWall=%d mSpr=%d mNS=%d stuck=%d bounce=%d lane=%d gseen=%d",
+                  k, (int)movefifoplc, ps->pos.x, ps->pos.y, ps->cursectnum,
+                  s_botNavOn[k], moveAng, fwdSpd, strSpd, stepped,
+                  walk, mvMinV, mvw, mvStep, mDist, mh.wall, mh.sprite, mNS,
+                  (int)s_botStuckTics[k], (int)s_botBounceHold[k],
+                  (int)s_botLaneHold[k], (int)s_botGoalSeen[k]);
+        }
     }
 
     // Fire discipline: the gate uses TRUE aim error (wobble is steering noise,
